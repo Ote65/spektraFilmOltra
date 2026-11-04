@@ -65,6 +65,19 @@ struct HostSmoke {
         let snapshot = host.editorSnapshot(for: photo.id)
 
         host.applyQuick("camera_exposure", 1.0)
+        let compensationWhileExposure =
+            host.currentPhoto()?.edit.enlarger.printExposureCompensation ?? true
+        host.applyQuick("camera_exposure", 0)
+        let compensationAtRest =
+            host.currentPhoto()?.edit.enlarger.printExposureCompensation ?? false
+        if compensationWhileExposure || !compensationAtRest {
+            throw NSError(domain: "smoke", code: 6, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "camera_exposure 未按参考关闭/恢复印相自动亮度补偿"
+            ])
+        }
+
+        host.applyQuick("camera_exposure", 1.0)
         host.applyQuick("tonal_contrast", 40)
         var second = 0.0
         var sawFastPreview = false
@@ -75,6 +88,17 @@ struct HostSmoke {
             second += 0.1
         }
 
+        let sweep = try runParameterSweep(rawPath: rawPath)
+        if let monotonic = sweep["compOffMonotonic"] as? Bool, !monotonic {
+            throw NSError(domain: "smoke", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "关闭补偿后拍摄曝光未单调提亮"
+            ])
+        }
+        if let delta = sweep["compOffMaxMeanDelta"] as? Double, delta > 0.02 {
+            throw NSError(domain: "smoke", code: 8, userInfo: [
+                NSLocalizedDescriptionKey: "拍摄曝光预测与精算平均亮度差过大：\(delta)"
+            ])
+        }
         host.refreshExportPreflight()
         let preflightWait = await wait(60) { host.preflightReport != nil }
 
@@ -145,6 +169,8 @@ struct HostSmoke {
             "quickAxes": snapshot.quickGroups.flatMap(\.axes).count,
             "proRows": snapshot.proPages.flatMap(\.groups).flatMap(\.rows).count,
             "renderAfterEdit": second,
+            "quickCompDuringExposure": compensationWhileExposure,
+            "quickCompAtRest": compensationAtRest,
             "fastPreviewSeen": sawFastPreview,
             "preflightWait": preflightWait,
             "realModelMax": host.preflightReport?.model.max ?? -1,
@@ -152,6 +178,7 @@ struct HostSmoke {
             "realEffectsP99": host.preflightReport?.effects.p99 ?? -1,
             "realPreflightOK": host.preflightReport?.ok ?? false,
             "realPreflightNotice": host.preflightNotice ?? "",
+            "sweep": sweep,
             "exported": exported,
             "exportWait": exportWait,
             "exportBytes": exportSize,
@@ -179,6 +206,142 @@ struct HostSmoke {
             elapsed += 0.1
         }
         return elapsed
+    }
+
+    /// 真实 RAW 上的参数扫描：预测与精算的亮度/反差/色差对比。
+    private static func runParameterSweep(rawPath: String) throws -> [String: Any] {
+        let loaded = try ImageLoader.load(url: URL(fileURLWithPath: rawPath))
+        var edit = PhotoEdit()
+        edit.io.inputColorSpace = loaded.colorSpace
+        edit.io.inputCCTFDecoding = loaded.cctfDecoding
+        let base = try edit.runtimeParams()
+        let key = PreviewLUTService.cacheKey(
+            edit: edit, inputColorSpace: loaded.colorSpace, inputCCTF: loaded.cctfDecoding
+        )
+        let service = PreviewLUTService()
+        let source = PreviewRenderer.prepared(loaded.image, maxSize: 256)
+        guard let bundle = service.bundle(for: base, key: key) else { return [:] }
+
+        func autoEV(_ params: RuntimePhotoParams) -> Double {
+            guard params.camera.autoExposure else { return 0 }
+            return PreviewLUTService.measureAutoEV(
+                source: source, colorSpace: params.io.inputColorSpace,
+                applyCCTFDecoding: params.io.inputCCTFDecoding,
+                method: params.camera.autoExposureMethod
+            )
+        }
+
+        func deterministic(_ params: RuntimePhotoParams) -> ImageRGB {
+            var p = params
+            p.debug.lutMode = false
+            p.debug.deactivateSpatialEffects = true
+            p.debug.deactivateStochasticEffects = true
+            p.settings.previewMode = false
+            p.filmRender.halation.boostEV = 0
+            p.scanner.whiteCorrection = false
+            p.scanner.blackCorrection = false
+            p.scanner.unsharpMask = [0, 0]
+            p.io.crop = false
+            p.io.upscaleFactor = 1
+            p.io.outputColorSpace = "ProPhoto RGB"
+            p.io.outputCCTFEncoding = false
+            return SimulationPipeline(params: p, keepTaps: false).process(source).rgbOut
+        }
+
+        func lumaStats(_ image: ImageRGB) -> (mean: Double, std: Double) {
+            let values = stride(from: 0, to: image.data.count, by: 3).map { i -> Double in
+                0.2126 * image.data[i] + 0.7152 * image.data[i + 1] + 0.0722 * image.data[i + 2]
+            }
+            let mean = values.reduce(0, +) / Double(max(values.count, 1))
+            let variance = values.reduce(0) { $0 + ($1 - mean) * ($1 - mean) }
+                / Double(max(values.count, 1))
+            return (mean, sqrt(max(variance, 0)))
+        }
+
+        func trueDisplay(_ params: RuntimePhotoParams, effects: Bool = true) -> ImageRGB {
+            var p = params
+            p.settings.previewMode = false
+            p.io.crop = false
+            p.io.upscaleFactor = 1
+            p.io.outputColorSpace = "sRGB"
+            p.io.outputCCTFEncoding = true
+            if !effects {
+                p.debug.deactivateSpatialEffects = true
+                p.debug.deactivateStochasticEffects = true
+                p.filmRender.halation.boostEV = 0
+                p.scanner.whiteCorrection = false
+                p.scanner.blackCorrection = false
+                p.scanner.unsharpMask = [0, 0]
+            }
+            return SimulationPipeline(params: p, keepTaps: false).process(source).rgbOut
+        }
+
+        func summarize(_ params: RuntimePhotoParams) -> [String: Double] {
+            let predicted = bundle.predict(
+                source: source, autoEV: autoEV(params),
+                exposureEV: params.camera.exposureCompensationEV,
+                printExposure: params.enlarger.printExposure,
+                compensate: params.enlarger.printExposureCompensation
+            )
+            let det = deterministic(params)
+            let stats = CIEDE2000.stats(reference: det, candidate: predicted)
+            let p = lumaStats(predicted)
+            let d = lumaStats(det)
+            let predictedDisplay = PreviewLUTService.displayImage(
+                fromLinear: predicted, params: params
+            )
+            let actualDisplay = trueDisplay(params)
+            let noFxDisplay = trueDisplay(params, effects: false)
+            let pd = lumaStats(predictedDisplay)
+            let ad = lumaStats(actualDisplay)
+            let nd = lumaStats(noFxDisplay)
+            return [
+                "modelMax": stats?.max ?? -1,
+                "modelP99": stats?.p99 ?? -1,
+                "predMean": p.mean,
+                "detMean": d.mean,
+                "predStd": p.std,
+                "detStd": d.std,
+                "meanDelta": p.mean - d.mean,
+                "dispPredMean": pd.mean,
+                "dispTrueMean": ad.mean,
+                "dispPredStd": pd.std,
+                "dispTrueStd": ad.std,
+                "dispMeanDelta": pd.mean - ad.mean,
+                "dispNoFxMean": nd.mean,
+                "dispNoFxStd": nd.std,
+            ]
+        }
+
+        var report: [String: Any] = [:]
+        report["ev0"] = summarize(base)
+        for ev in [-2.0, -1.0, 1.0, 2.0] {
+            var p = base
+            p.camera.exposureCompensationEV = ev
+            report["ev\(ev)"] = summarize(p)
+        }
+        var compOffMeans: [Double] = []
+        var compOffMaxMeanDelta = 0.0
+        for ev in [-2.0, -1.0, 0.0, 1.0, 2.0] {
+            var p = base
+            p.camera.exposureCompensationEV = ev
+            p.enlarger.printExposureCompensation = false
+            let summary = summarize(p)
+            report["compOff_ev\(ev)"] = summary
+            compOffMeans.append(summary["dispPredMean"] ?? 0)
+            compOffMaxMeanDelta = max(
+                compOffMaxMeanDelta, abs(summary["dispMeanDelta"] ?? 0)
+            )
+        }
+        report["compOffMonotonic"] = zip(compOffMeans, compOffMeans.dropFirst())
+            .allSatisfy { $0 < $1 }
+        report["compOffMaxMeanDelta"] = compOffMaxMeanDelta
+        for brightness in [0.5, 0.7, 1.4, 2.0] {
+            var p = base
+            p.enlarger.printExposure = brightness
+            report["print\(brightness)"] = summarize(p)
+        }
+        return report
     }
 
     /// LUT 预览回归：烘焙、预测 vs 精算、ΔE₀₀ 门禁与查表耗时。
@@ -254,7 +417,13 @@ struct HostSmoke {
             compensate: params.enlarger.printExposureCompensation
         )
         let predictMs = Date().timeIntervalSince(predictStart) * 1000
+        let displayStart = Date()
+        let displayed = PreviewLUTService.displayImage(
+            fromLinear: predicted, params: params
+        )
+        let displayMs = Date().timeIntervalSince(displayStart) * 1000
         let finite = predicted.data.allSatisfy(\.isFinite)
+            && displayed.data.allSatisfy(\.isFinite)
 
         let pairs: [((Double, Double, Double), (Double, Double, Double), Double)] = [
             ((50, 2.6772, -79.7751), (50, 0, -82.7485), 2.0425),
@@ -275,6 +444,7 @@ struct HostSmoke {
             "resolution": bundle.resolution,
             "bakeMs": bakeMs,
             "predictMs": predictMs,
+            "displayMs": displayMs,
             "predictedFinite": finite,
             "autoEV": autoEV,
             "modelMax": preflight.model.max,
@@ -285,7 +455,7 @@ struct HostSmoke {
             "notice": preflight.notice ?? "",
             "deltaEMaxError": deltaEError,
             "modelAbsDiff": maxAbs,
-            "compCacheKeyDiffers": compOffKey != key,
+            "compCacheKeyStable": compOffKey == key,
         ]
     }
 
