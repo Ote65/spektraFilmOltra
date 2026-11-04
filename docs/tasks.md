@@ -143,3 +143,13 @@
 
 
 
+
+## 第十一阶段（Adaptive Clarity 净化与库页双入口）
+- [x] `Sources/SpektraCore/Clarity`：sRGB/OKLab 数学、1024 分析（影调/灰雾/局部/偏色）、去雾/影调/局部/色净四个处理器、一次验证回退
+- [x] `GradeRecipe.adaptive` + `GradeEngine` 分支：曝光/白平衡 → sRGB 编码 → 净化 → 锐化 → 光学 → LUT；手动分支保持原顺序
+- [x] `EngineHost`：净化分析缓存；曝光/色温/色调变化才重算；预览 1024、导出全尺寸验证
+- [x] 调色台「智能净化」卡：开关、通透/色净滑块、一键、诊断摘要；显影后调色切 `.film`（只做局部层次）
+- [x] 主页悬停双区：上「显影台」走正常路径，下「仅调色」用 `RawDecoder` 直解线性 sRGB，跳过光谱显影；非 RAW 回退显影台
+- [x] `ClaritySmoke`：合成影调/灰雾/偏色；`HostSmoke` 增加自适应调色冒烟
+- 验收：1600×1067 分析约 210 ms、渲染约 300 ms；identity 差 0；LUT identity 差 1.11e-16；ClaritySmoke PASS
+- 未做：高级保护开关联动、完整 `ClarityPlan` 持久化、24MP 导出实测、真实 RAW 直入目视验收
