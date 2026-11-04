@@ -370,6 +370,21 @@ struct HostSmoke {
             ])
         }
 
+        // 非有限像素路径：影调查表不得因 NaN/Inf 的 Int 转换崩溃。
+        var nonFiniteSource = source
+        nonFiniteSource.data[0] = .nan
+        nonFiniteSource.data[1] = .infinity
+        let nonFiniteTone = try GradeEngine.render(
+            nonFiniteSource,
+            recipe: GradeRecipe(light: LightRecipe(shadows: 40)),
+            analyze: false
+        )
+        guard nonFiniteTone.image.data.allSatisfy(\.isFinite) else {
+            throw NSError(domain: "smoke", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "non-finite pixel escaped tone masks"
+            ])
+        }
+
         let lutURL = URL(fileURLWithPath: "/tmp/spektra_smoke_identity.cube")
         let cube = """
         LUT_3D_SIZE 2
@@ -399,6 +414,7 @@ struct HostSmoke {
             "toneWhiteDiff": whiteDiff,
             "toneBlackDiff": blackDiff,
             "toneBlackCrushDiff": blackCrushDiff,
+            "toneNonFinite": "finite",
         ]
     }
 }

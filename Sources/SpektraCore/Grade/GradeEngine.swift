@@ -279,7 +279,9 @@ enum GradeEngine {
     }
 
     private static func sampleMask(_ table: [Double], _ y: Double) -> Double {
-        guard !table.isEmpty else { return 0 }
+        // luma 传播 NaN 时 Int(position) 会直接运行时崩溃；非有限像素跳过影调即可，
+        // 最终仍由 postprocess 统一清洗。
+        guard !table.isEmpty, y.isFinite else { return 0 }
         let position = y * Double(table.count - 1)
         let low = Int(position)
         if low >= table.count - 1 { return table[table.count - 1] }
