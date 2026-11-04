@@ -128,6 +128,8 @@ struct EngineRootView: View {
             }
         }
         actions.gradeExport = { host.exportGrade($0) }
+        actions.gradePreviewScaleChanged = { host.setGradePreviewScale($0) }
+        actions.gradeReRender = { host.reRenderGrade() }
         return actions
     }
 

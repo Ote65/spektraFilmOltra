@@ -516,6 +516,45 @@ struct HostSmoke {
         let warmResult = try GradeEngine.render(source, recipe: warm, analyze: false)
         let warmFinite = warmResult.image.data.allSatisfy(\.isFinite)
 
+        // 影调分区力度回归：高光/阴影/白色/黑色必须产生可见变化，
+        // 旧实现的白色与黑色最大权重只有 0.03，滑块几乎无效。
+        func toneDiff(_ light: LightRecipe) throws -> Double {
+            let result = try GradeEngine.render(
+                source, recipe: GradeRecipe(light: light), analyze: false
+            )
+            var diff = 0.0
+            for i in 0..<data.count {
+                diff = max(diff, abs(result.image.data[i] - identity.image.data[i]))
+            }
+            return diff
+        }
+        let shadowDiff = try toneDiff(LightRecipe(shadows: 100))
+        let highlightDiff = try toneDiff(LightRecipe(highlights: 100))
+        let whiteDiff = try toneDiff(LightRecipe(whites: 100))
+        let blackDiff = try toneDiff(LightRecipe(blacks: 100))
+        let blackCrushDiff = try toneDiff(LightRecipe(blacks: -100))
+        guard shadowDiff > 0.05, highlightDiff > 0.05,
+              whiteDiff > 0.03, blackDiff > 0.05, blackCrushDiff > 0.03 else {
+            throw NSError(domain: "smoke", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "tone masks too weak: \(shadowDiff), \(highlightDiff), \(whiteDiff), \(blackDiff), \(blackCrushDiff)"
+            ])
+        }
+
+        // 非有限像素路径：影调查表不得因 NaN/Inf 的 Int 转换崩溃。
+        var nonFiniteSource = source
+        nonFiniteSource.data[0] = .nan
+        nonFiniteSource.data[1] = .infinity
+        let nonFiniteTone = try GradeEngine.render(
+            nonFiniteSource,
+            recipe: GradeRecipe(light: LightRecipe(shadows: 40)),
+            analyze: false
+        )
+        guard nonFiniteTone.image.data.allSatisfy(\.isFinite) else {
+            throw NSError(domain: "smoke", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "non-finite pixel escaped tone masks"
+            ])
+        }
+
         let lutURL = URL(fileURLWithPath: "/tmp/spektra_smoke_identity.cube")
         let cube = """
         LUT_3D_SIZE 2
@@ -540,6 +579,12 @@ struct HostSmoke {
             "identityMaxDiff": identityDiff,
             "warmFinite": warmFinite,
             "lutIdentityMaxDiff": lutDiff,
+            "toneShadowDiff": shadowDiff,
+            "toneHighlightDiff": highlightDiff,
+            "toneWhiteDiff": whiteDiff,
+            "toneBlackDiff": blackDiff,
+            "toneBlackCrushDiff": blackCrushDiff,
+            "toneNonFinite": "finite",
         ]
     }
 }
