@@ -64,8 +64,13 @@ final class EngineHost: ObservableObject {
     @Published private(set) var gradePresets: [GradePreset] = GradePresetStore.shared.all
     @Published private(set) var gradeLUTs: [GradeLUTEntry] = GradePresetStore.shared.luts()
     @Published private(set) var gradeHistogram: HistogramData?
+    @Published private(set) var gradeClarityReport: ClarityReport?
 
     private var gradeSource: ImageRGB?
+    private var gradeOrigin: GradeOrigin = .developed
+    private var gradeClarityAnalysis: ClarityAnalysis?
+    private var gradeClarityToken = 0
+    private var gradeClarityInFlight = false
     private var gradeProxyCache: [Int: ImageRGB] = [:]
     private let gradeRenderer = PreviewRenderer()
     private let gradeQueue = DispatchQueue(label: "spektra.grade", qos: .userInitiated)
@@ -892,6 +897,37 @@ final class EngineHost: ObservableObject {
         isRendering = false
         renderPhase = .idle
 
+        resetGradeState()
+        gradeOrigin = .developed
+        prepareGradeSource(for: photo)
+    }
+
+    func beginGradeDirect(photoID: String) {
+        guard let photo = photo(with: photoID) else {
+            statusMessage = "没有可调色的照片"
+            return
+        }
+        pendingRenderWork?.cancel()
+        pendingRenderWork = nil
+        renderToken += 1
+        renderer.invalidate()
+        previewRenderInFlight = false
+        isRendering = false
+        renderPhase = .idle
+
+        selectedID = photoID
+        statusMessage = photo.filename
+        resetGradeState()
+        gradeOrigin = .direct
+        prepareGradeSourceDirect(for: photo)
+    }
+
+    private func resetGradeState() {
+        gradePendingProxy?.cancel()
+        gradePendingProxy = nil
+        gradePendingSettle?.cancel()
+        gradePendingSettle = nil
+        gradePreviewInFlight = false
         gradeIsActive = true
         gradeRecipe = GradeRecipe()
         gradePresets = GradePresetStore.shared.all
@@ -899,15 +935,22 @@ final class EngineHost: ObservableObject {
         gradePreviewImage = nil
         gradeAnalysis = nil
         gradeHistogram = nil
+        gradeClarityReport = nil
+        gradeClarityAnalysis = nil
+        gradeClarityInFlight = false
+        gradeClarityToken += 1
+        gradeSource = nil
         gradeSourceReady = false
+        gradeSourceSize = ""
         gradeProxyCache = [:]
         gradeExportInFlight = false
         _ = bumpGradePreviewToken()
         _ = bumpGradeExportToken()
-        prepareGradeSource(for: photo)
     }
 
     func endGrade() {
+        gradeClarityToken += 1
+        gradeClarityInFlight = false
         gradeIsActive = false
         gradePendingProxy?.cancel()
         gradePendingProxy = nil
@@ -965,6 +1008,81 @@ final class EngineHost: ObservableObject {
                     self.gradeProxyCache = [:]
                     self.scheduleGradePreview(immediate: true)
                 }
+            }
+        }
+    }
+
+    private func prepareGradeSourceDirect(for photo: LibraryPhoto) {
+        gradeSourceToken += 1
+        let token = gradeSourceToken
+        gradeSourceReady = false
+        gradePhase = RenderPhase(
+            state: .rendering, label: "解码 RAW…", index: 0, total: 1
+        )
+        bump()
+
+        let url = store.originalURL(for: photo)
+        gradeQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                var options = RawDecoder.Options()
+                options.outputColorSpace = "sRGB"
+                options.outputCCTFEncoding = false
+                let decoded = try RawDecoder.decode(url: url, options: options)
+                let source = ClarityMath.downsampledToLongEdge(
+                    decoded, maxEdge: self.gradeFullEdge
+                )
+                Task { @MainActor [weak self] in
+                    guard let self, self.gradeSourceToken == token else { return }
+                    self.gradeSource = source
+                    self.gradeSourceReady = true
+                    self.gradeSourceSize = "\(source.width)×\(source.height)"
+                    self.gradeProxyCache = [:]
+                    self.scheduleClarityAnalysis()
+                    self.scheduleGradePreview(immediate: true)
+                }
+            } catch {
+                Task { @MainActor [weak self] in
+                    guard let self, self.gradeSourceToken == token else { return }
+                    self.gradePhase = .idle
+                    self.statusMessage = "RAW 解码失败：\(error.localizedDescription)"
+                    self.bump()
+                }
+            }
+        }
+    }
+
+    private func scheduleClarityAnalysis() {
+        guard gradeIsActive, let source = gradeSource,
+              gradeRecipe.adaptive.enabled else { return }
+        let recipe = gradeRecipe
+        gradeClarityToken += 1
+        let token = gradeClarityToken
+        gradeClarityInFlight = true
+        gradeQueue.async { [weak self] in
+            guard let self else { return }
+            let encoded = GradeEngine.encodedSource(source, recipe: recipe)
+            let analysis = try? AdaptiveClarityEngine.analyze(encoded, mode: .standalone)
+            let report = analysis.map {
+                ClarityAnalyzer.report(
+                    for: $0, mode: .standalone,
+                    controls: AdaptiveClarityEngine.suggestedControls(for: $0)
+                )
+            }
+            Task { @MainActor [weak self] in
+                guard let self, self.gradeClarityToken == token else { return }
+                self.gradeClarityInFlight = false
+                self.gradeClarityAnalysis = analysis
+                self.gradeClarityReport = report
+                if let report, self.gradeRecipe.adaptive.enabled,
+                   self.gradeRecipe.adaptive.clarity <= 0.001,
+                   self.gradeRecipe.adaptive.color <= 0.001 {
+                    var updated = self.gradeRecipe
+                    updated.adaptive.clarity = report.suggestedClarity
+                    updated.adaptive.color = report.suggestedColor
+                    self.gradeRecipe = updated
+                }
+                self.scheduleGradePreview()
             }
         }
     }
@@ -1057,6 +1175,15 @@ final class EngineHost: ObservableObject {
         )
         bump()
 
+        let clarityAnalysis = gradeClarityAnalysis
+        let clarityContext: ClarityRenderContext? = {
+            guard recipe.adaptive.enabled, let clarityAnalysis else { return nil }
+            return ClarityRenderContext(
+                analysis: clarityAnalysis, mode: .standalone,
+                workingLongEdge: min(edge, 1024), validate: false
+            )
+        }()
+
         let proxy: ImageRGB
         if let cached = gradeProxyCache[edge] {
             proxy = cached
@@ -1069,7 +1196,7 @@ final class EngineHost: ObservableObject {
             guard let self else { return }
             do {
                 let result = try GradeEngine.render(
-                    proxy, recipe: recipe,
+                    proxy, recipe: recipe, clarity: clarityContext,
                     shouldCancel: { !self.isCurrentGradeToken(token) }
                 )
                 let histogram = Self.histogram(from: result.image)
@@ -1078,6 +1205,7 @@ final class EngineHost: ObservableObject {
                     guard let self, self.isCurrentGradeToken(token) else { return }
                     self.gradePreviewImage = image
                     self.gradeAnalysis = result.analysis
+                    self.gradeClarityReport = result.clarityReport ?? self.gradeClarityReport
                     self.gradeHistogram = histogram
                     self.gradePreviewInFlight = false
                     self.gradePhase = .idle
@@ -1099,7 +1227,24 @@ final class EngineHost: ObservableObject {
 
     func setGradeRecipe(_ recipe: GradeRecipe) {
         guard gradeIsActive else { return }
+        let previous = gradeRecipe
         gradeRecipe = recipe
+        if recipe.adaptive.enabled {
+            let exposureChanged = previous.light.exposure != recipe.light.exposure
+                || previous.color.temperature != recipe.color.temperature
+                || previous.color.tint != recipe.color.tint
+            if gradeClarityAnalysis == nil || exposureChanged {
+                if !gradeClarityInFlight || exposureChanged {
+                    gradePendingProxy?.cancel()
+                    gradePendingProxy = nil
+                    gradePendingSettle?.cancel()
+                    gradePendingSettle = nil
+                    _ = bumpGradePreviewToken()
+                    scheduleClarityAnalysis()
+                }
+                return
+            }
+        }
         scheduleGradePreview()
     }
 
@@ -1181,6 +1326,7 @@ final class EngineHost: ObservableObject {
         _ = bumpGradePreviewToken()
         gradeExportInFlight = true
         let recipe = gradeRecipe
+        let origin = gradeOrigin
         let token = bumpGradeExportToken()
         gradePhase = RenderPhase(
             state: .rendering, label: "导出调色…", index: 0, total: 1
@@ -1191,27 +1337,47 @@ final class EngineHost: ObservableObject {
             guard let self else { return }
             do {
                 let sourceURL = self.store.originalURL(for: photo)
-                let loaded = try ImageLoader.load(url: sourceURL)
-                var params = try photo.makeParams()
-                params.io.inputColorSpace = loaded.colorSpace
-                params.io.inputCCTFDecoding = loaded.cctfDecoding
-                params.io.outputColorSpace = "ProPhoto RGB"
-                params.io.outputCCTFEncoding = false
+                let linear: ImageRGB
+                if origin == .direct {
+                    var options = RawDecoder.Options()
+                    options.outputColorSpace = "sRGB"
+                    options.outputCCTFEncoding = false
+                    linear = try RawDecoder.decode(url: sourceURL, options: options)
+                } else {
+                    let loaded = try ImageLoader.load(url: sourceURL)
+                    var params = try photo.makeParams()
+                    params.io.inputColorSpace = loaded.colorSpace
+                    params.io.inputCCTFDecoding = loaded.cctfDecoding
+                    params.io.outputColorSpace = "ProPhoto RGB"
+                    params.io.outputCCTFEncoding = false
 
-                let pipeline = SimulationPipeline(params: params, keepTaps: false)
-                pipeline.shouldCancel = { !self.isCurrentGradeExportToken(token) }
-                let full = pipeline.process(loaded.image, progress: { label, index, total in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.isCurrentGradeExportToken(token) else { return }
-                        self.gradePhase = RenderPhase(
-                            state: .rendering, label: "导出 · \(Self.stageLabel(label))",
-                            index: index, total: total
-                        )
-                    }
-                })
-                let linear = GradeEngine.prepareSource(full.rgbOut)
+                    let pipeline = SimulationPipeline(params: params, keepTaps: false)
+                    pipeline.shouldCancel = { !self.isCurrentGradeExportToken(token) }
+                    let full = pipeline.process(loaded.image, progress: { label, index, total in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.isCurrentGradeExportToken(token) else { return }
+                            self.gradePhase = RenderPhase(
+                                state: .rendering, label: "导出 · \(Self.stageLabel(label))",
+                                index: index, total: total
+                            )
+                        }
+                    })
+                    linear = GradeEngine.prepareSource(full.rgbOut)
+                }
+
+                var clarityContext: ClarityRenderContext?
+                if recipe.adaptive.enabled {
+                    let encoded = GradeEngine.encodedSource(linear, recipe: recipe)
+                    let analysis = try AdaptiveClarityEngine.analyze(
+                        encoded, mode: .standalone
+                    )
+                    clarityContext = ClarityRenderContext(
+                        analysis: analysis, mode: .standalone,
+                        workingLongEdge: 0, validate: true
+                    )
+                }
                 let graded = try GradeEngine.render(
-                    linear, recipe: recipe,
+                    linear, recipe: recipe, clarity: clarityContext,
                     shouldCancel: { !self.isCurrentGradeExportToken(token) }
                 )
                 var output = graded.image
@@ -1379,9 +1545,14 @@ extension EngineHost {
         let active = photo.id == selectedID && gradeIsActive
         let meta: String
         if active {
-            meta = gradeSourceReady
-                ? "\(gradeSourceSize) · 线性交接图 · sRGB 显示"
-                : "正在生成交接图…"
+            if gradeSourceReady {
+                let source = gradeOrigin == .direct
+                    ? "RAW 直入 · 线性 sRGB"
+                    : "线性交接图 · sRGB 显示"
+                meta = "\(gradeSourceSize) · \(source)"
+            } else {
+                meta = gradeOrigin == .direct ? "正在解码 RAW…" : "正在生成交接图…"
+            }
         } else {
             meta = "调色台"
         }
@@ -1397,7 +1568,9 @@ extension EngineHost {
             recipe: gradeRecipe,
             phase: active ? gradePhase : .idle,
             histogram: active ? (gradeHistogram ?? PreviewData.histogram) : PreviewData.histogram,
-            statusMessage: statusMessage
+            statusMessage: statusMessage,
+            origin: gradeOrigin,
+            clarityReport: active ? gradeClarityReport : nil
         )
     }
 

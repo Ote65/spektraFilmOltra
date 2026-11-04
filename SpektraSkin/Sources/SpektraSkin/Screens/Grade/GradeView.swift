@@ -68,8 +68,15 @@ struct GradeView: View {
 
     private var topBar: some View {
         HStack(spacing: 10) {
-            SkinButton("显影台", icon: "chevron.left", kind: .secondary, height: 28) {
-                actions.backToEditor()
+            SkinButton(
+                snapshot.origin == .direct ? "照片库" : "显影台",
+                icon: "chevron.left", kind: .secondary, height: 28
+            ) {
+                if snapshot.origin == .direct {
+                    actions.backToLibraryFromGrade()
+                } else {
+                    actions.backToEditor()
+                }
             }
 
             VStack(alignment: .leading, spacing: 1) {
@@ -278,7 +285,8 @@ struct GradeView: View {
                                     .foregroundStyle(SkinColor.text3)
                             } else {
                                 ProgressView().controlSize(.small)
-                                Text("正在生成交接图…")
+                                Text(snapshot.origin == .direct
+                                    ? "正在解码 RAW…" : "正在生成交接图…")
                                     .font(.skin(11))
                                     .foregroundStyle(SkinColor.text3)
                             }
@@ -344,34 +352,38 @@ struct GradeView: View {
                     analysisLine
 
                     if snapshot.sourceReady {
+                        adaptiveCard
+
                         if panelTab == 0 {
                             lightControls
                         } else {
                             colorControls
                         }
 
-                        fold("曲线", isOpen: $showCurve) {
-                            slider("light.curve_highlights", "高光点", -100...100, step: 1)
-                            slider("light.curve_lights", "亮部点", -100...100, step: 1)
-                            slider("light.curve_darks", "暗部点", -100...100, step: 1)
-                            slider("light.curve_shadows", "阴影点", -100...100, step: 1)
-                        }
+                        if !recipe.adaptive.enabled {
+                            fold("曲线", isOpen: $showCurve) {
+                                slider("light.curve_highlights", "高光点", -100...100, step: 1)
+                                slider("light.curve_lights", "亮部点", -100...100, step: 1)
+                                slider("light.curve_darks", "暗部点", -100...100, step: 1)
+                                slider("light.curve_shadows", "阴影点", -100...100, step: 1)
+                            }
 
-                        fold("通透", isOpen: $showTransparency) {
-                            slider("transparency.tonal", "明暗通透", 0...100, step: 1)
-                            slider("transparency.color", "颜色通透", 0...100, step: 1)
-                        }
+                            fold("通透", isOpen: $showTransparency) {
+                                slider("transparency.tonal", "明暗通透", 0...100, step: 1)
+                                slider("transparency.color", "颜色通透", 0...100, step: 1)
+                            }
 
-                        fold("画质", isOpen: $showQuality) {
-                            slider("quality.clarity", "清晰度", -100...100, step: 1)
-                            slider("quality.texture", "纹理", -100...100, step: 1)
-                            slider("quality.dehaze", "去雾", -100...100, step: 1)
-                            slider("quality.sharpen_amount", "锐化", 0...100, step: 1)
-                            slider("quality.sharpen_radius", "锐化半径", 0.5...3,
-                                   step: 0.01, decimals: 2)
-                            slider("quality.sharpen_threshold", "锐化阈值", 0...100, step: 1)
-                            slider("quality.noise_luminance", "明度降噪", 0...100, step: 1)
-                            slider("quality.noise_color", "色彩降噪", 0...100, step: 1)
+                            fold("画质", isOpen: $showQuality) {
+                                slider("quality.clarity", "清晰度", -100...100, step: 1)
+                                slider("quality.texture", "纹理", -100...100, step: 1)
+                                slider("quality.dehaze", "去雾", -100...100, step: 1)
+                                slider("quality.sharpen_amount", "锐化", 0...100, step: 1)
+                                slider("quality.sharpen_radius", "锐化半径", 0.5...3,
+                                       step: 0.01, decimals: 2)
+                                slider("quality.sharpen_threshold", "锐化阈值", 0...100, step: 1)
+                                slider("quality.noise_luminance", "明度降噪", 0...100, step: 1)
+                                slider("quality.noise_color", "色彩降噪", 0...100, step: 1)
+                            }
                         }
 
                         fold("光学", isOpen: $showOptics) {
@@ -430,13 +442,15 @@ struct GradeView: View {
     private var lightControls: some View {
         VStack(spacing: 0) {
             slider("light.exposure", "曝光", -5...5, step: 0.05, decimals: 2, suffix: " EV")
-            slider("light.contrast", "对比度", -100...100, step: 1)
-            slider("light.highlights", "高光", -100...100, step: 1)
-            slider("light.shadows", "阴影", -100...100, step: 1)
-            slider("light.whites", "白色", -100...100, step: 1)
-            slider("light.blacks", "黑色", -100...100, step: 1)
-            slider("light.midtones", "中间调", -100...100, step: 1)
-            slider("light.highlight_rolloff", "高光柔和", 0...100, step: 1)
+            if !recipe.adaptive.enabled {
+                slider("light.contrast", "对比度", -100...100, step: 1)
+                slider("light.highlights", "高光", -100...100, step: 1)
+                slider("light.shadows", "阴影", -100...100, step: 1)
+                slider("light.whites", "白色", -100...100, step: 1)
+                slider("light.blacks", "黑色", -100...100, step: 1)
+                slider("light.midtones", "中间调", -100...100, step: 1)
+                slider("light.highlight_rolloff", "高光柔和", 0...100, step: 1)
+            }
         }
     }
 
@@ -444,10 +458,89 @@ struct GradeView: View {
         VStack(spacing: 0) {
             slider("color.temperature", "色温", -100...100, step: 1)
             slider("color.tint", "色调", -100...100, step: 1)
-            slider("color.vibrance", "自然饱和度", -100...100, step: 1)
-            slider("color.saturation", "饱和度", -100...100, step: 1)
-            slider("color.hue_shift", "色相偏移", -180...180, step: 1, suffix: "°")
-            slider("color.color_density", "色彩密度", 0...100, step: 1)
+            if !recipe.adaptive.enabled {
+                slider("color.vibrance", "自然饱和度", -100...100, step: 1)
+                slider("color.saturation", "饱和度", -100...100, step: 1)
+                slider("color.hue_shift", "色相偏移", -180...180, step: 1, suffix: "°")
+                slider("color.color_density", "色彩密度", 0...100, step: 1)
+            }
+        }
+    }
+
+    // MARK: - 智能净化
+
+    private var adaptiveCard: some View {
+        SkinCard(padding: 10) {
+            VStack(spacing: 8) {
+                HStack(spacing: 7) {
+                    Image(systemName: "wand.and.stars")
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(SkinColor.accent)
+                    Text("智能净化")
+                        .font(.skin(10.5, .medium))
+                        .foregroundStyle(SkinColor.text2)
+                    Spacer(minLength: 8)
+                    SkinToggle(
+                        isOn: Binding(
+                            get: { recipe.adaptive.enabled },
+                            set: { enabled in
+                                recipe.adaptive.enabled = enabled
+                                actions.gradeRecipeChanged(recipe)
+                            }
+                        )
+                    )
+                }
+
+                if recipe.adaptive.enabled {
+                    HStack {
+                        if let report = snapshot.clarityReport {
+                            Text(report.summary)
+                                .font(.skin(9.5).monospacedDigit())
+                                .foregroundStyle(SkinColor.text3)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        } else {
+                            Text("分析中…")
+                                .font(.skin(9.5))
+                                .foregroundStyle(SkinColor.text4)
+                        }
+                        Spacer(minLength: 6)
+                    }
+
+                    adaptiveSlider("通透", value: $recipe.adaptive.clarity)
+                    adaptiveSlider("色净", value: $recipe.adaptive.color)
+
+                    HStack {
+                        Spacer(minLength: 0)
+                        SkinButton("一键", icon: "wand.and.stars",
+                                   kind: .secondary, height: 26) {
+                            guard let report = snapshot.clarityReport else { return }
+                            recipe.adaptive.enabled = true
+                            recipe.adaptive.clarity = report.suggestedClarity
+                            recipe.adaptive.color = report.suggestedColor
+                            actions.gradeRecipeChanged(recipe)
+                        }
+                        .disabled(snapshot.clarityReport == nil)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .animation(SkinMotion.state, value: recipe.adaptive.enabled)
+        }
+    }
+
+    private func adaptiveSlider(_ label: String, value: Binding<Double>) -> some View {
+        GradeValueRow(
+            label: label,
+            value: value.wrappedValue * 100,
+            defaultValue: 0,
+            range: 0...100,
+            step: 1,
+            decimals: 0,
+            suffix: ""
+        ) { newValue in
+            value.wrappedValue = newValue / 100
+            actions.gradeRecipeChanged(recipe)
         }
     }
 

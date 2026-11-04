@@ -59,7 +59,16 @@ struct EngineRootView: View {
             host.select(photoID: id)
             withAnimation(SkinMotion.page) { screen = .editor }
         }
+        actions.openGradeDirect = { id in
+            selectedID = id
+            host.beginGradeDirect(photoID: id)
+            withAnimation(SkinMotion.page) { screen = .grade }
+        }
         actions.backToLibrary = {
+            withAnimation(SkinMotion.page) { screen = .library }
+        }
+        actions.backToLibraryFromGrade = {
+            host.endGrade()
             withAnimation(SkinMotion.page) { screen = .library }
         }
         actions.openGrade = {

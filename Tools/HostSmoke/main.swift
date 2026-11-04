@@ -26,13 +26,15 @@ struct HostSmoke {
         edge.data[2] = 0
 
         let gradeReport = try runGradeSmoke()
+        let adaptiveReport = try runAdaptiveGradeSmoke()
         let lutReport = try runLUTSmoke()
 
         let args = ProcessInfo.processInfo.environment
         guard let rawPath = args["RAW_PATH"], FileManager.default.fileExists(atPath: rawPath) else {
             let data = try JSONSerialization.data(
                 withJSONObject: ["edgeCompression": "finite", "raw": "skipped",
-                                 "grade": gradeReport, "lut": lutReport],
+                                 "grade": gradeReport,
+                                 "adaptive": adaptiveReport, "lut": lutReport],
                 options: [.sortedKeys, .prettyPrinted]
             )
             print(String(data: data, encoding: .utf8) ?? "{}")
@@ -157,6 +159,7 @@ struct HostSmoke {
             "exportBytes": exportSize,
             "status": host.statusMessage,
             "grade": gradeReport,
+            "adaptive": adaptiveReport,
             "lut": lutReport,
             "gradeSourceWait": sourceWait,
             "gradeFirstPreviewWait": firstGradeWait,
@@ -182,6 +185,41 @@ struct HostSmoke {
     }
 
     /// LUT 预览回归：烘焙、预测 vs 精算、ΔE₀₀ 门禁与查表耗时。
+    private static func runAdaptiveGradeSmoke() throws -> [String: Any] {
+        let width = 64
+        let height = 64
+        var data = [Double](repeating: 0, count: width * height * 3)
+        for y in 0..<height {
+            for x in 0..<width {
+                let t = Double(x) / Double(width - 1)
+                let value = 0.03 + 0.62 * t
+                let index = (y * width + x) * 3
+                data[index] = value
+                data[index + 1] = value * 0.97
+                data[index + 2] = value * 0.92
+            }
+        }
+        let source = ImageRGB(width: width, height: height, data: data)
+        var recipe = GradeRecipe()
+        recipe.adaptive = AdaptiveRecipe(enabled: true, clarity: 0.5, color: 0.0)
+        let result = try GradeEngine.render(source, recipe: recipe, analyze: true)
+        guard let plan = result.clarityPlan, let report = result.clarityReport else {
+            throw NSError(domain: "smoke", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "adaptive grade did not return a clarity plan",
+            ])
+        }
+        let finite = result.image.data.allSatisfy(\.isFinite)
+        return [
+            "enabled": plan.clarityControl > 0,
+            "dehaze": plan.dehazeEnabled,
+            "tone": plan.toneEnabled,
+            "localContrast": plan.localContrastEnabled,
+            "color": plan.colorEnabled,
+            "finite": finite,
+            "summary": report.summary,
+        ]
+    }
+
     private static func runLUTSmoke() throws -> [String: Any] {
         let edit = PhotoEdit()
         guard let params = try? edit.runtimeParams() else {

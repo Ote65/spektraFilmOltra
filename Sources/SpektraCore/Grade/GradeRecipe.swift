@@ -388,6 +388,20 @@ struct LutRecipe: Codable, Equatable {
 
 // MARK: - 顶层
 
+struct AdaptiveRecipe: Codable, Equatable {
+    var enabled: Bool = false
+    var clarity: Double = 0
+    var color: Double = 0
+
+    init() {}
+
+    init(enabled: Bool, clarity: Double, color: Double) {
+        self.enabled = enabled
+        self.clarity = clarity
+        self.color = color
+    }
+}
+
 struct GradeRecipe: Codable, Equatable {
     var schema: Int = GradeRecipeConstants.schemaVersion
     var light = LightRecipe()
@@ -396,9 +410,10 @@ struct GradeRecipe: Codable, Equatable {
     var quality = QualityRecipe()
     var optics = OpticsRecipe()
     var lut = LutRecipe()
+    var adaptive = AdaptiveRecipe()
 
     enum CodingKeys: String, CodingKey {
-        case schema, light, color, transparency, quality, optics, lut
+        case schema, light, color, transparency, quality, optics, lut, adaptive
     }
 
     init() {}
@@ -407,7 +422,7 @@ struct GradeRecipe: Codable, Equatable {
         light: LightRecipe = LightRecipe(), color: ColorRecipe = ColorRecipe(),
         transparency: TransparencyRecipe = TransparencyRecipe(),
         quality: QualityRecipe = QualityRecipe(), optics: OpticsRecipe = OpticsRecipe(),
-        lut: LutRecipe = LutRecipe()
+        lut: LutRecipe = LutRecipe(), adaptive: AdaptiveRecipe = AdaptiveRecipe()
     ) {
         self.light = light
         self.color = color
@@ -415,6 +430,7 @@ struct GradeRecipe: Codable, Equatable {
         self.quality = quality
         self.optics = optics
         self.lut = lut
+        self.adaptive = adaptive
     }
 
     init(from decoder: Decoder) throws {
@@ -432,6 +448,8 @@ struct GradeRecipe: Codable, Equatable {
             ?? OpticsRecipe()
         lut = (try? c.decodeIfPresent(LutRecipe.self, forKey: .lut))
             ?? LutRecipe()
+        adaptive = (try? c.decodeIfPresent(AdaptiveRecipe.self, forKey: .adaptive))
+            ?? AdaptiveRecipe()
     }
 
     func value(for path: String) -> Double {
@@ -529,6 +547,7 @@ struct GradeRecipe: Codable, Equatable {
         if quality != neutral.quality { count += 1 }
         if optics != neutral.optics { count += 1 }
         if lut != neutral.lut { count += 1 }
+        if adaptive != neutral.adaptive { count += 1 }
         return count
     }
 }

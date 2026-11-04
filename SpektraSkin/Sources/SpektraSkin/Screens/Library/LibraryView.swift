@@ -449,7 +449,9 @@ private struct LibraryPhotoCard: View {
                 .frame(height: 15, alignment: .leading)
         }
         .contentShape(Rectangle())
-        .onTapGesture(perform: action)
+        .onTapGesture {
+            if !hovered { action() }
+        }
         .onHover { inside in
             hovered = inside
             withAnimation(SkinMotion.hover) {
@@ -488,6 +490,11 @@ private struct LibraryPhotoCard: View {
                         lineWidth: selected ? 1.5 : 1
                     )
             )
+            .overlay {
+                LibraryPhotoHoverActions(photo: photo, actions: actions)
+                    .opacity(hovered ? 1 : 0)
+                    .allowsHitTesting(hovered)
+            }
             .overlay(alignment: .topLeading) {
                 if photo.isGraded {
                     Text("已调色")
@@ -585,6 +592,88 @@ private struct LibraryPhotoCard: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("更多操作")
+    }
+}
+
+// MARK: - Hover actions
+
+private struct LibraryPhotoHoverActions: View {
+    let photo: PhotoItem
+    let actions: SkinActions
+    @State private var hoveredZone: Int?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            zone(
+                index: 0, title: "显影台", subtitle: "完整显影",
+                icon: "camera.aperture", iconTint: nil
+            ) {
+                actions.openPhoto(photo.id)
+            }
+
+            Rectangle()
+                .fill(Color.white.opacity(0.12))
+                .frame(height: 1)
+
+            zone(
+                index: 1, title: "仅调色", subtitle: "跳过显影",
+                icon: "slider.horizontal.3", iconTint: SkinColor.accent
+            ) {
+                actions.openGradeDirect(photo.id)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.opacity(0.28))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func zone(
+        index: Int, title: String, subtitle: String, icon: String,
+        iconTint: Color?, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(
+                        iconTint ?? (hoveredZone == index ? SkinColor.accentHover : SkinColor.text1)
+                    )
+                    .frame(width: 18, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.skin(12, .medium))
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.skin(9.5))
+                        .foregroundStyle(
+                            hoveredZone == index ? SkinColor.accentHover.opacity(0.8) : SkinColor.text4
+                        )
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+            }
+            .foregroundStyle(hoveredZone == index ? SkinColor.accentHover : SkinColor.text1)
+            .padding(.horizontal, 14)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .background(
+                hoveredZone == index
+                    ? SkinColor.accent.opacity(0.12)
+                    : Color.black.opacity(0.18)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { inside in
+            withAnimation(SkinMotion.hover) {
+                if inside {
+                    hoveredZone = index
+                } else if hoveredZone == index {
+                    hoveredZone = nil
+                }
+            }
+        }
     }
 }
 

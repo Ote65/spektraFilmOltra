@@ -287,6 +287,11 @@ struct EditorSnapshot {
     var preflightNotice: String? = nil
 }
 
+enum GradeOrigin: String, Codable {
+    case developed
+    case direct
+}
+
 struct GradeSnapshot {
     let photo: PhotoItem
     let handoffMeta: String
@@ -300,6 +305,8 @@ struct GradeSnapshot {
     var phase: RenderPhase = .idle
     var histogram: HistogramData = PreviewData.histogram
     var statusMessage: String = ""
+    var origin: GradeOrigin = .developed
+    var clarityReport: ClarityReport? = nil
 }
 
 // MARK: - 后端边界
@@ -317,7 +324,9 @@ protocol SpektraSkinDataSource {
 // Swift 引擎接管后把这里接到渲染、导出和状态存储。
 struct SkinActions {
     var openPhoto: (String) -> Void = { _ in }
+    var openGradeDirect: (String) -> Void = { _ in }
     var backToLibrary: () -> Void = {}
+    var backToLibraryFromGrade: () -> Void = {}
     var openGrade: () -> Void = {}
     var backToEditor: () -> Void = {}
     var selectFilm: (String) -> Void = { _ in }

@@ -24,9 +24,18 @@ struct ToneAnalysis: Equatable {
     )
 }
 
+struct ClarityRenderContext {
+    let analysis: ClarityAnalysis
+    let mode: ClarityMode
+    let workingLongEdge: Int
+    let validate: Bool
+}
+
 struct GradeRenderResult {
     var image: ImageRGB
     var analysis: ToneAnalysis
+    var clarityPlan: ClarityPlan?
+    var clarityReport: ClarityReport?
 }
 
 enum GradeEngine {
@@ -64,6 +73,24 @@ enum GradeEngine {
         return output
     }
 
+    /// 只执行曝光/白平衡 + sRGB 编码，供 Adaptive Clarity 分析和缓存使用。
+    static func encodedSource(_ sourceLinearSRGB: ImageRGB, recipe: GradeRecipe) -> ImageRGB {
+        var data = sourceLinearSRGB.data
+        let count = sourceLinearSRGB.width * sourceLinearSRGB.height
+        applyExposureWB(
+            &data, count: count,
+            exposure: recipe.light.exposure,
+            temperature: recipe.color.temperature,
+            tint: recipe.color.tint
+        )
+        srgbEncode(&data, count: count)
+        return ImageRGB(
+            width: sourceLinearSRGB.width,
+            height: sourceLinearSRGB.height,
+            data: data
+        )
+    }
+
     /// 线性图按长边上限降采样（与调色代理图一致）。
     static func downsampleLinear(_ image: ImageRGB, maxLongEdge: Int) -> ImageRGB {
         guard maxLongEdge > 0 else { return image }
@@ -75,6 +102,7 @@ enum GradeEngine {
         _ sourceLinearSRGB: ImageRGB,
         recipe: GradeRecipe,
         analyze: Bool = true,
+        clarity: ClarityRenderContext? = nil,
         shouldCancel: (() -> Bool)? = nil
     ) throws -> GradeRenderResult {
         guard sourceLinearSRGB.width > 0, sourceLinearSRGB.height > 0 else {
@@ -95,19 +123,68 @@ enum GradeEngine {
                         temperature: recipe.color.temperature,
                         tint: recipe.color.tint)
         srgbEncode(&data, count: count)
-        try checkCancel()
-        applyTone(&data, width: width, height: height, light: recipe.light)
-        try checkCancel()
-        applyColor(&data, count: count, color: recipe.color)
-        let analysis = analyze
-            ? analyzeTone(data, width: width, height: height)
-            : ToneAnalysis.neutral
-        try checkCancel()
-        applyTransparency(&data, count: count, recipe: recipe.transparency, analysis: analysis)
-        applyClarityStructure(&data, width: width, height: height, quality: recipe.quality)
-        try checkCancel()
-        applyDehaze(&data, width: width, height: height, amount: recipe.quality.dehaze)
-        applyNoiseReduction(&data, width: width, height: height, quality: recipe.quality)
+        var analysis = ToneAnalysis.neutral
+        var clarityPlan: ClarityPlan?
+        var clarityReport: ClarityReport?
+
+        if recipe.adaptive.enabled {
+            let encoded = ImageRGB(width: width, height: height, data: data)
+            let contextAnalysis: ClarityAnalysis
+            if let clarity {
+                contextAnalysis = clarity.analysis
+            } else {
+                contextAnalysis = try AdaptiveClarityEngine.analyze(
+                    encoded, mode: .standalone
+                )
+            }
+            analysis = analyze
+                ? ToneAnalysis(
+                    blackPoint: contextAnalysis.features.blackPoint,
+                    whitePoint: contextAnalysis.features.whitePoint,
+                    highlightRGB: Vec3(1, 1, 1),
+                    shadowRGB: Vec3(0, 0, 0),
+                    highlightCast: "中性",
+                    shadowCast: "中性",
+                    summary: "智能净化"
+                )
+                : ToneAnalysis.neutral
+            let controls = ClarityControls(
+                clarity: recipe.adaptive.clarity,
+                color: recipe.adaptive.color
+            )
+            do {
+                let result = try AdaptiveClarityEngine.process(
+                    encoded,
+                    analysis: contextAnalysis,
+                    controls: controls,
+                    mode: clarity?.mode ?? .standalone,
+                    validateResult: clarity?.validate ?? false,
+                    workingLongEdge: clarity?.workingLongEdge
+                        ?? min(max(width, height), 1024),
+                    shouldCancel: shouldCancel
+                )
+                data = result.image.data
+                clarityPlan = result.plan
+                clarityReport = result.report
+            } catch ClarityError.cancelled {
+                throw GradeCancelled.cancelled
+            }
+        } else {
+            try checkCancel()
+            applyTone(&data, width: width, height: height, light: recipe.light)
+            try checkCancel()
+            applyColor(&data, count: count, color: recipe.color)
+            analysis = analyze
+                ? analyzeTone(data, width: width, height: height)
+                : ToneAnalysis.neutral
+            try checkCancel()
+            applyTransparency(&data, count: count, recipe: recipe.transparency, analysis: analysis)
+            applyClarityStructure(&data, width: width, height: height, quality: recipe.quality)
+            try checkCancel()
+            applyDehaze(&data, width: width, height: height, amount: recipe.quality.dehaze)
+            applyNoiseReduction(&data, width: width, height: height, quality: recipe.quality)
+        }
+
         try checkCancel()
         applySharpening(&data, width: width, height: height, quality: recipe.quality)
         applyOptics(&data, width: width, height: height, optics: recipe.optics)
@@ -117,7 +194,9 @@ enum GradeEngine {
         postprocess(&data)
         return GradeRenderResult(
             image: ImageRGB(width: width, height: height, data: data),
-            analysis: analysis
+            analysis: analysis,
+            clarityPlan: clarityPlan,
+            clarityReport: clarityReport
         )
     }
 
