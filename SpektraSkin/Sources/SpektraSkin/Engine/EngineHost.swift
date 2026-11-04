@@ -371,7 +371,7 @@ final class EngineHost: ObservableObject {
                 printExposure: params.enlarger.printExposure,
                 compensate: params.enlarger.printExposureCompensation
             )
-            let display = PreviewLUTService.displayImage(fromLinear: linear)
+            let display = PreviewLUTService.displayImage(fromLinear: linear, params: params)
             let image = PreviewRenderer.nsImage(from: display)
             let histogram = Self.histogram(from: display)
             let elapsed = Date().timeIntervalSince(start)
@@ -744,22 +744,28 @@ final class EngineHost: ObservableObject {
         case "camera_exposure":
             edit.camera.exposureCompensationEV = clamp(
                 baseline.camera.exposureCompensationEV + q, -5, 5)
+            // 与 Python 快速轴一致：拖动曝光时临时关闭印相自动亮度补偿，
+            // 否则印相归一化会把它抵消成反差；回 0 时恢复基线设置。
+            edit.enlarger.printExposureCompensation = abs(q) <= 1e-9
+                ? baseline.enlarger.printExposureCompensation
+                : false
         case "print_brightness":
             let b = baseline.enlarger.printExposure
-            edit.enlarger.printExposure = clamp(b * pow(2, -q), 0.125, 8)
+            edit.enlarger.printExposure = clamp(b * pow(2, -q), 0.25, 4)
         case "tonal_contrast":
             let morph = baseline.printRender.densityCurvesMorph
-            let value = clamp(morph.gammaFactor * (1 + 0.35 * q / 100), 0.55, 1.8)
+            let value = clamp(morph.gammaFactor * (1 + 0.35 * q / 100), 0.5, 2.0)
             edit.printRender.densityCurvesMorph.gammaFactor = value
             edit.printRender.densityCurvesMorph.active = q != 0 ? true : morph.active
         case "color_density":
             let b = baseline.filmRender.dirCouplers.inhibitionInterlayer
-            edit.filmRender.dirCouplers.inhibitionInterlayer = clamp(b * (1 + 0.5 * q / 100), 0.5, 1.5)
+            edit.filmRender.dirCouplers.inhibitionInterlayer = clamp(b * (1 + 0.5 * q / 100), 0, 1.5)
             edit.filmRender.dirCouplers.active = q != 0 ? true : baseline.filmRender.dirCouplers.active
         case "grain_amount":
             let grain = baseline.filmRender.grain
-            let density = clamp(grain.densityMin[0] * (1 + 0.9 * q / 100), 0.005, 0.08)
-            edit.filmRender.grain.densityMin = [density, density, density]
+            edit.filmRender.grain.densityMin = grain.densityMin.map {
+                clamp($0 * (1 + 0.9 * q / 100), 0.005, 0.08)
+            }
             edit.filmRender.grain.uniformity = grain.uniformity.map {
                 clamp($0 - 0.06 * q / 100, 0.90, 0.995)
             }
@@ -767,11 +773,11 @@ final class EngineHost: ObservableObject {
         case "grain_size":
             let grain = baseline.filmRender.grain
             edit.filmRender.grain.particleAreaUM2 = clamp(
-                grain.particleAreaUM2 * pow(2, 0.9 * q / 100), 0.03, 1.2)
-            edit.filmRender.grain.blur = clamp(grain.blur * (1 + 0.25 * q / 100), 0.4, 1.2)
+                grain.particleAreaUM2 * pow(2, 0.9 * q / 100), 0.02, 0.8)
+            edit.filmRender.grain.blur = clamp(grain.blur * (1 + 0.25 * q / 100), 0, 1.5)
         case "halation_amount":
             let h = baseline.filmRender.halation
-            edit.filmRender.halation.halationAmount = clamp(h.halationAmount * (1 + 1.2 * q / 100), 0, 3)
+            edit.filmRender.halation.halationAmount = clamp(h.halationAmount * (1 + 1.2 * q / 100), 0, 2)
             edit.filmRender.halation.active = q <= -99 ? false : h.active
         case "halation_scale":
             let h = baseline.filmRender.halation
@@ -779,13 +785,16 @@ final class EngineHost: ObservableObject {
                 h.halationSpatialScale * pow(2, 0.6 * q / 100), 0.5, 2.5)
         case "diffusion":
             let base = baseline.camera.diffusionFilter
+            let strength: Double
             if q > 0 {
-                edit.camera.diffusionFilter.active = true
-                edit.camera.diffusionFilter.strength = clamp(0.125 + 1.375 * q / 100, 0.125, 1.5)
+                strength = base.strength + (2.0 - base.strength) * q / 100
+            } else if q < 0 {
+                strength = base.strength * (1 + q / 100)
             } else {
-                edit.camera.diffusionFilter.active = base.active
-                edit.camera.diffusionFilter.strength = base.strength
+                strength = base.strength
             }
+            edit.camera.diffusionFilter.strength = clamp(strength, 0, 2)
+            edit.camera.diffusionFilter.active = q <= -99 ? false : (base.active || q > 0)
         case "scanner_clarity":
             let scanner = baseline.scanner
             if q > 0 {
@@ -1436,8 +1445,17 @@ extension EngineHost {
         case "diffusion":
             let editFilter = edit.camera.diffusionFilter
             let base = baseline.camera.diffusionFilter
-            guard editFilter.active, !base.active else { return 0 }
-            return (editFilter.strength - 0.125) / 1.375 * 100
+            if !editFilter.active {
+                return base.active || editFilter.strength != base.strength ? -100 : 0
+            }
+            if abs(editFilter.strength - base.strength) > 1e-9 {
+                if editFilter.strength > base.strength {
+                    return (editFilter.strength - base.strength)
+                        / max(2 - base.strength, 1e-6) * 100
+                }
+                return (editFilter.strength / max(base.strength, 1e-6) - 1) * 100
+            }
+            return 0
         case "scanner_clarity":
             let bAmount = baseline.scanner.unsharpMask[1]
             let amount = edit.scanner.unsharpMask[1]
