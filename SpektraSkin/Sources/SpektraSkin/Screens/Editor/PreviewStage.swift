@@ -221,7 +221,6 @@ struct PreviewStage: View {
 
 // MARK: - Progress
 
-
 private struct RenderProgressView: View {
     let phase: RenderPhase
 

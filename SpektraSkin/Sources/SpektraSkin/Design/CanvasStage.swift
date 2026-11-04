@@ -74,7 +74,7 @@ final class CanvasEventView: NSView {
             self.lastPoint = point
             return
         }
-        onPan?(CGSize(width: point.x - lastPoint.x, height: point.y - lastPoint.y))
+        onPan?(CGSize(width: point.x - lastPoint.x, height: lastPoint.y - point.y))
         self.lastPoint = point
     }
 
