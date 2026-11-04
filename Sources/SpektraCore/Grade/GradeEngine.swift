@@ -263,26 +263,73 @@ enum GradeEngine {
         }
     }
 
+    /// 影调分区权重表。旧实现把五个区都压在中灰附近，且白/黑区权重最高只有 0.03，
+    /// 导致滑块几乎不可见；这里改为每个区各自的连续钟形权重，并把黑/白场真正落到端点。
+    private static func toneMaskTable(center: Double, width: Double, gateDark: Bool) -> [Double] {
+        let steps = 512
+        var table = [Double](repeating: 0, count: steps + 1)
+        for index in 0...steps {
+            let y = Double(index) / Double(steps)
+            let z = (y - center) / width
+            var value = exp(-0.5 * z * z)
+            if gateDark { value *= smoothstep(0.0, 0.07, y) }
+            table[index] = value
+        }
+        return table
+    }
+
+    private static func sampleMask(_ table: [Double], _ y: Double) -> Double {
+        guard !table.isEmpty else { return 0 }
+        let position = y * Double(table.count - 1)
+        let low = Int(position)
+        if low >= table.count - 1 { return table[table.count - 1] }
+        let fraction = position - Double(low)
+        return table[low] * (1 - fraction) + table[low + 1] * fraction
+    }
+
     private static func applyToneMasks(_ data: inout [Double], count: Int, light: LightRecipe) {
-        let amounts = [light.shadows, light.blacks, light.highlights, light.whites, light.midtones]
-        guard amounts.contains(where: { abs($0) > 1e-6 }) else { return }
+        let shadows = light.shadows
+        let blacks = light.blacks
+        let highlights = light.highlights
+        let whites = light.whites
+        let midtones = light.midtones
+        let hasShadows = abs(shadows) > 1e-6
+        let hasBlacks = abs(blacks) > 1e-6
+        let hasHighlights = abs(highlights) > 1e-6
+        let hasWhites = abs(whites) > 1e-6
+        let hasMidtones = abs(midtones) > 1e-6
+        guard hasShadows || hasBlacks || hasHighlights || hasWhites || hasMidtones else {
+            return
+        }
+
+        let shadowTable = hasShadows
+            ? toneMaskTable(center: 0.26, width: 0.19, gateDark: true) : []
+        let blackTable = hasBlacks
+            ? toneMaskTable(center: 0.00, width: 0.13, gateDark: false) : []
+        let highlightTable = hasHighlights
+            ? toneMaskTable(center: 0.74, width: 0.18, gateDark: false) : []
+        let whiteTable = hasWhites
+            ? toneMaskTable(center: 1.00, width: 0.16, gateDark: false) : []
+        let midtoneTable = hasMidtones
+            ? toneMaskTable(center: 0.47, width: 0.20, gateDark: false) : []
+
         for i in 0..<count {
-            let y = luma(data, i)
+            let y = min(max(luma(data, i), 0), 1)
             var delta = 0.0
-            if abs(light.shadows) > 1e-6 {
-                delta += light.shadows / 100 * 0.20 * y * pow(max(1 - y, 0), 4.5)
+            if hasShadows {
+                delta += shadows / 100 * 0.28 * sampleMask(shadowTable, y)
             }
-            if abs(light.blacks) > 1e-6 {
-                delta += light.blacks / 100 * 0.12 * y * pow(max(1 - y, 0), 12)
+            if hasBlacks {
+                delta += blacks / 100 * 0.18 * sampleMask(blackTable, y)
             }
-            if abs(light.highlights) > 1e-6 {
-                delta += light.highlights / 100 * 0.20 * (1 - y) * pow(max(y, 0), 4.5)
+            if hasHighlights {
+                delta += highlights / 100 * 0.26 * sampleMask(highlightTable, y)
             }
-            if abs(light.whites) > 1e-6 {
-                delta += light.whites / 100 * 0.12 * (1 - y) * pow(max(y, 0), 12)
+            if hasWhites {
+                delta += whites / 100 * 0.20 * sampleMask(whiteTable, y)
             }
-            if abs(light.midtones) > 1e-6 {
-                delta += light.midtones / 100 * 0.10 * 4 * y * max(1 - y, 0)
+            if hasMidtones {
+                delta += midtones / 100 * 0.16 * sampleMask(midtoneTable, y)
             }
             data[i * 3] += delta
             data[i * 3 + 1] += delta
