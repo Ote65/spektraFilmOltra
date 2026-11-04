@@ -378,6 +378,7 @@ struct SkinSegmented: View {
         }
         .padding(2)
         .frame(width: width, height: 30)
+        .frame(maxWidth: width == nil ? .infinity : nil)
         .background(
             RoundedRectangle(cornerRadius: SkinRadius.control, style: .continuous)
                 .fill(SkinColor.surface1)
