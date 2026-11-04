@@ -428,7 +428,7 @@ struct GradeView: View {
                     Text(String(format: "白场 %.2f", analysis.whitePoint))
                     Text("\(analysis.highlightCast) / \(analysis.shadowCast)")
                 }
-                .font(.skin(9.5).monospacedDigit())
+                .font(.skin(10).monospacedDigit())
                 .foregroundStyle(SkinColor.text3)
                 .lineLimit(1)
             } else {
@@ -495,25 +495,27 @@ struct GradeView: View {
                     HStack {
                         if let report = snapshot.clarityReport {
                             Text(report.summary)
-                                .font(.skin(9.5).monospacedDigit())
+                                .font(.skin(10).monospacedDigit())
                                 .foregroundStyle(SkinColor.text3)
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                         } else {
                             Text("分析中…")
-                                .font(.skin(9.5))
+                                .font(.skin(10))
                                 .foregroundStyle(SkinColor.text4)
                         }
                         Spacer(minLength: 6)
                     }
 
                     adaptiveSlider("通透", value: $recipe.adaptive.clarity)
-                    adaptiveSlider("色净", value: $recipe.adaptive.color)
+                    if snapshot.origin == .direct {
+                        adaptiveSlider("色净", value: $recipe.adaptive.color)
+                    }
 
                     HStack {
                         Spacer(minLength: 0)
                         SkinButton("一键", icon: "wand.and.stars",
-                                   kind: .secondary, height: 26) {
+                                   kind: .secondary, height: SkinMetric.smallControlHeight) {
                             guard let report = snapshot.clarityReport else { return }
                             recipe.adaptive.enabled = true
                             recipe.adaptive.clarity = report.suggestedClarity
@@ -715,7 +717,7 @@ private struct GradeProgressPill: View {
                 .lineLimit(1)
 
             Text(phase.index == 0 ? "…" : "\(phase.index)/\(max(phase.total, 1))")
-                .font(.skin(9.5).monospacedDigit())
+                .font(.skin(10).monospacedDigit())
                 .foregroundStyle(SkinColor.text3)
 
             GeometryReader { geo in

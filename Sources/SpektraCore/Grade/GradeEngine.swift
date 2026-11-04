@@ -137,17 +137,7 @@ enum GradeEngine {
                     encoded, mode: .standalone
                 )
             }
-            analysis = analyze
-                ? ToneAnalysis(
-                    blackPoint: contextAnalysis.features.blackPoint,
-                    whitePoint: contextAnalysis.features.whitePoint,
-                    highlightRGB: Vec3(1, 1, 1),
-                    shadowRGB: Vec3(0, 0, 0),
-                    highlightCast: "中性",
-                    shadowCast: "中性",
-                    summary: "智能净化"
-                )
-                : ToneAnalysis.neutral
+            analysis = analyze ? displayToneAnalysis(encoded) : ToneAnalysis.neutral
             let controls = ClarityControls(
                 clarity: recipe.adaptive.clarity,
                 color: recipe.adaptive.color
@@ -584,6 +574,11 @@ enum GradeEngine {
     }
 
     // MARK: - 通透
+
+    static func displayToneAnalysis(_ encoded: ImageRGB, maxEdge: Int = 1024) -> ToneAnalysis {
+        let small = ClarityMath.downsampledToLongEdge(encoded, maxEdge: maxEdge)
+        return analyzeTone(small.data, width: small.width, height: small.height)
+    }
 
     static func analyzeTone(_ data: [Double], width: Int, height: Int) -> ToneAnalysis {
         let count = width * height

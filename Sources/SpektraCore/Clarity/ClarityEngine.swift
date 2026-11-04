@@ -10,8 +10,15 @@ enum AdaptiveClarityEngine {
         try ClarityAnalyzer.analyze(image, mode: mode)
     }
 
-    static func suggestedControls(for analysis: ClarityAnalysis) -> ClarityControls {
-        ClarityAnalyzer.suggestedControls(for: analysis)
+    static func suggestedControls(for analysis: ClarityAnalysis,
+                                  mode: ClarityMode = .standalone) -> ClarityControls {
+        if mode == .film {
+            return ClarityControls(
+                clarity: ClarityMath.clamp(0.70 * analysis.local.mediumScore, 0, 0.85),
+                color: 0
+            )
+        }
+        return ClarityAnalyzer.suggestedControls(for: analysis)
     }
 
     static func optimize(_ image: ImageRGB, mode: ClarityMode,
@@ -19,7 +26,7 @@ enum AdaptiveClarityEngine {
                          workingLongEdge: Int = 0,
                          shouldCancel: (() -> Bool)? = nil) throws -> ClarityResult {
         let analysis = try analyze(image, mode: mode)
-        let controls = suggestedControls(for: analysis)
+        let controls = suggestedControls(for: analysis, mode: mode)
         return try process(
             image, analysis: analysis, controls: controls,
             mode: mode, validateResult: validateResult,

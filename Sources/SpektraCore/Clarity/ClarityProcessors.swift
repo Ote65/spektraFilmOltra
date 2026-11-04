@@ -249,7 +249,7 @@ enum ClarityProcessors {
         let sigmas = ClarityAnalyzer.localSigmas.map { $0 * factor }
         let gMaxBase = mode == .film ? [0.0, 0.06, 0.03] : [0.05, 0.12, 0.06]
         let budget = 1 - 0.70 * ClarityMath.clamp(hazeStrength / 0.30, 0, 1)
-        let baseGains = gMaxBase.map { $0 * scale * budget }
+        let baseGains = gMaxBase.map { $0 * controls.clarity * scale * budget }
 
         let logY = logYPlane(image)
         let pyramid = ClarityMath.buildLaplacianPyramid(

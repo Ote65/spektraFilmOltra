@@ -612,7 +612,7 @@ private struct LibraryPhotoHoverActions: View {
             }
 
             Rectangle()
-                .fill(Color.white.opacity(0.12))
+                .fill(SkinColor.hairlineStrong)
                 .frame(height: 1)
 
             zone(
@@ -623,8 +623,8 @@ private struct LibraryPhotoHoverActions: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.28))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(SkinColor.scrim.opacity(0.6))
+        .clipShape(RoundedRectangle(cornerRadius: SkinRadius.control, style: .continuous))
     }
 
     private func zone(
@@ -632,9 +632,9 @@ private struct LibraryPhotoHoverActions: View {
         iconTint: Color?, action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            HStack(spacing: 9) {
+            HStack(spacing: 8) {
                 Image(systemName: icon)
-                    .font(.system(size: 15, weight: .regular))
+                    .font(.skin(15))
                     .foregroundStyle(
                         iconTint ?? (hoveredZone == index ? SkinColor.accentHover : SkinColor.text1)
                     )
@@ -645,7 +645,7 @@ private struct LibraryPhotoHoverActions: View {
                         .font(.skin(12, .medium))
                         .lineLimit(1)
                     Text(subtitle)
-                        .font(.skin(9.5))
+                        .font(.skin(10))
                         .foregroundStyle(
                             hoveredZone == index ? SkinColor.accentHover.opacity(0.8) : SkinColor.text4
                         )
@@ -655,12 +655,12 @@ private struct LibraryPhotoHoverActions: View {
                 Spacer(minLength: 8)
             }
             .foregroundStyle(hoveredZone == index ? SkinColor.accentHover : SkinColor.text1)
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 12)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .background(
                 hoveredZone == index
                     ? SkinColor.accent.opacity(0.12)
-                    : Color.black.opacity(0.18)
+                    : SkinColor.surface3.opacity(0.45)
             )
             .contentShape(Rectangle())
         }

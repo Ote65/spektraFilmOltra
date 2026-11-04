@@ -60,6 +60,11 @@ struct EngineRootView: View {
             withAnimation(SkinMotion.page) { screen = .editor }
         }
         actions.openGradeDirect = { id in
+            let photos = host.librarySnapshot().photos
+            guard let item = photos.first(where: { $0.id == id }), item.isRaw else {
+                actions.openPhoto(id)
+                return
+            }
             selectedID = id
             host.beginGradeDirect(photoID: id)
             withAnimation(SkinMotion.page) { screen = .grade }

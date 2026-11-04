@@ -915,6 +915,10 @@ final class EngineHost: ObservableObject {
         isRendering = false
         renderPhase = .idle
 
+        guard photo.isRaw else {
+            statusMessage = "仅调色仅支持 RAW"
+            return
+        }
         selectedID = photoID
         statusMessage = photo.filename
         resetGradeState()
@@ -1056,17 +1060,20 @@ final class EngineHost: ObservableObject {
         guard gradeIsActive, let source = gradeSource,
               gradeRecipe.adaptive.enabled else { return }
         let recipe = gradeRecipe
+        let clarityMode: ClarityMode = gradeOrigin == .direct ? .standalone : .film
         gradeClarityToken += 1
         let token = gradeClarityToken
         gradeClarityInFlight = true
         gradeQueue.async { [weak self] in
             guard let self else { return }
             let encoded = GradeEngine.encodedSource(source, recipe: recipe)
-            let analysis = try? AdaptiveClarityEngine.analyze(encoded, mode: .standalone)
+            let analysis = try? AdaptiveClarityEngine.analyze(encoded, mode: clarityMode)
             let report = analysis.map {
                 ClarityAnalyzer.report(
-                    for: $0, mode: .standalone,
-                    controls: AdaptiveClarityEngine.suggestedControls(for: $0)
+                    for: $0, mode: clarityMode,
+                    controls: AdaptiveClarityEngine.suggestedControls(
+                        for: $0, mode: clarityMode
+                    )
                 )
             }
             Task { @MainActor [weak self] in
@@ -1176,10 +1183,11 @@ final class EngineHost: ObservableObject {
         bump()
 
         let clarityAnalysis = gradeClarityAnalysis
+        let clarityMode: ClarityMode = gradeOrigin == .direct ? .standalone : .film
         let clarityContext: ClarityRenderContext? = {
             guard recipe.adaptive.enabled, let clarityAnalysis else { return nil }
             return ClarityRenderContext(
-                analysis: clarityAnalysis, mode: .standalone,
+                analysis: clarityAnalysis, mode: clarityMode,
                 workingLongEdge: min(edge, 1024), validate: false
             )
         }()
@@ -1372,7 +1380,8 @@ final class EngineHost: ObservableObject {
                         encoded, mode: .standalone
                     )
                     clarityContext = ClarityRenderContext(
-                        analysis: analysis, mode: .standalone,
+                        analysis: analysis,
+                        mode: origin == .direct ? .standalone : .film,
                         workingLongEdge: 0, validate: true
                     )
                 }
