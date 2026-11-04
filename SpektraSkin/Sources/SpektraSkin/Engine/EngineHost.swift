@@ -64,6 +64,7 @@ final class EngineHost: ObservableObject {
     @Published private(set) var gradePresets: [GradePreset] = GradePresetStore.shared.all
     @Published private(set) var gradeLUTs: [GradeLUTEntry] = GradePresetStore.shared.luts()
     @Published private(set) var gradeHistogram: HistogramData?
+    @Published private(set) var gradePreviewScale: Double = 1.0
 
     private var gradeSource: ImageRGB?
     private var gradeProxyCache: [Int: ImageRGB] = [:]
@@ -78,8 +79,14 @@ final class EngineHost: ObservableObject {
     private var gradePendingProxy: DispatchWorkItem?
     private var gradePendingSettle: DispatchWorkItem?
     private var gradeIsActive = false
-    private let gradeProxyEdge = 800
-    private let gradeFullEdge = 1600
+    /// 交接图固定按 1600 长边生成；预览精度只决定从交接图降采样的代理尺寸。
+    private let gradeSourceEdge = 1600
+    private var gradeFullEdge: Int {
+        max(200, Int(Double(gradeSourceEdge) * gradePreviewScale))
+    }
+    private var gradeProxyEdge: Int {
+        max(160, min(gradeSourceEdge / 2, gradeFullEdge / 2))
+    }
 
     init(store: LibraryStore = LibraryStore()) {
         self.store = store
@@ -942,7 +949,7 @@ final class EngineHost: ObservableObject {
         gradeRenderer.render(
             params: params,
             image: image,
-            maxSize: gradeFullEdge,
+            maxSize: gradeSourceEdge,
             progress: { [weak self] label, index, total in
                 Task { @MainActor [weak self] in
                     guard let self, self.gradeSourceToken == token else { return }
@@ -1052,7 +1059,7 @@ final class EngineHost: ObservableObject {
         gradePreviewInFlight = true
         gradePhase = RenderPhase(
             state: .rendering,
-            label: edge <= gradeProxyEdge ? "调色代理…" : "调色精修…",
+            label: edge < gradeFullEdge ? "调色代理…" : "调色精修…",
             index: 0, total: 1
         )
         bump()
@@ -1101,6 +1108,21 @@ final class EngineHost: ObservableObject {
         guard gradeIsActive else { return }
         gradeRecipe = recipe
         scheduleGradePreview()
+    }
+
+    /// 预览分辨率切换：清掉旧代理缓存，按新尺寸立即重绘。
+    func setGradePreviewScale(_ value: Double) {
+        guard gradeIsActive, value != gradePreviewScale else { return }
+        gradePreviewScale = value
+        gradeProxyCache = [:]
+        _ = bumpGradePreviewToken()
+        scheduleGradePreview(immediate: true)
+        bump()
+    }
+
+    func reRenderGrade() {
+        guard gradeIsActive, gradeSourceReady else { return }
+        scheduleGradePreview(immediate: true)
     }
 
     func saveGradePreset(name: String, recipe: GradeRecipe) {
@@ -1397,7 +1419,8 @@ extension EngineHost {
             recipe: gradeRecipe,
             phase: active ? gradePhase : .idle,
             histogram: active ? (gradeHistogram ?? PreviewData.histogram) : PreviewData.histogram,
-            statusMessage: statusMessage
+            statusMessage: statusMessage,
+            previewScale: gradePreviewScale
         )
     }
 

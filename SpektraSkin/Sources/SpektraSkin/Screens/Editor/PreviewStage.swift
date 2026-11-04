@@ -158,13 +158,14 @@ struct PreviewStage: View {
                         .truncationMode(.middle)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                    PreviewToolbar(
-                        compare: $compare,
+                    SkinPreviewToolbar(
                         zoom: $zoom,
                         rotation: $rotation,
                         pan: $pan,
+                        compare: $compare,
                         previewScale: previewScale,
-                        actions: actions
+                        onScaleChanged: { actions.renderScaleChanged($0) },
+                        onReRender: { actions.reRender() }
                     )
                 }
             }
@@ -218,190 +219,8 @@ struct PreviewStage: View {
     }
 }
 
-// MARK: - Zoom / pan / scroll
+// MARK: - Progress
 
-private struct CanvasInteractionLayer: NSViewRepresentable {
-    var onZoom: (CGFloat) -> Void
-    var onPan: (CGSize) -> Void
-    var onReset: () -> Void
-
-    func makeNSView(context: Context) -> CanvasEventView {
-        let view = CanvasEventView()
-        view.onZoom = onZoom
-        view.onPan = onPan
-        view.onReset = onReset
-        return view
-    }
-
-    func updateNSView(_ view: CanvasEventView, context: Context) {
-        view.onZoom = onZoom
-        view.onPan = onPan
-        view.onReset = onReset
-    }
-}
-
-private final class CanvasEventView: NSView {
-    var onZoom: ((CGFloat) -> Void)?
-    var onPan: ((CGSize) -> Void)?
-    var onReset: (() -> Void)?
-    private var lastPoint: NSPoint?
-
-    override var acceptsFirstResponder: Bool { true }
-
-    override func scrollWheel(with event: NSEvent) {
-        let delta = event.hasPreciseScrollingDeltas
-            ? event.scrollingDeltaY
-            : event.scrollingDeltaY * 6
-        guard abs(delta) > 0 else { return }
-        onZoom?(CGFloat(exp(Double(delta) / 260.0)))
-    }
-
-    override func magnify(with event: NSEvent) {
-        onZoom?(1 + event.magnification)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 {
-            onReset?()
-            return
-        }
-        lastPoint = convert(event.locationInWindow, from: nil)
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        guard let lastPoint else {
-            self.lastPoint = point
-            return
-        }
-        onPan?(CGSize(width: point.x - lastPoint.x, height: lastPoint.y - point.y))
-        self.lastPoint = point
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        lastPoint = nil
-    }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .openHand)
-    }
-}
-
-
-private struct PreviewToolbar: View {
-    @Binding var compare: Bool
-    @Binding var zoom: CGFloat
-    @Binding var rotation: Double
-    @Binding var pan: CGSize
-    let previewScale: Double
-    let actions: SkinActions
-
-    private var renderScaleLabel: String {
-        switch previewScale {
-        case ..<0.2: return "1/8"
-        case ..<0.4: return "1/4"
-        case ..<0.8: return "1/2"
-        default: return "1/1"
-        }
-    }
-
-    private var zoomLabel: String {
-        "\(Int((zoom * 100).rounded()))%"
-    }
-
-    var body: some View {
-        HStack(spacing: 2) {
-            Menu {
-                ForEach([0.125, 0.25, 0.5, 1.0], id: \.self) { value in
-                    Button(scaleTitle(value)) {
-                        actions.renderScaleChanged(value)
-                    }
-                }
-            } label: {
-                ToolbarLabel(title: renderScaleLabel, chevron: true)
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-
-            divider
-
-            ToolbarTextButton(
-                title: "对比",
-                icon: "rectangle.split.2x1",
-                active: compare
-            ) {
-                withAnimation(SkinMotion.state) { compare.toggle() }
-            }
-            ToolbarTextButton(title: "渲染") {
-                actions.reRender()
-            }
-
-            SkinVerticalHairline(color: SkinColor.hairlineStrong, height: 14)
-                .padding(.horizontal, 3)
-
-            SkinIconButton("rotate.left", size: 12, frame: 26) {
-                withAnimation(SkinMotion.state) { rotation -= 90 }
-            }
-            SkinIconButton("rotate.right", size: 12, frame: 26) {
-                withAnimation(SkinMotion.state) { rotation += 90 }
-            }
-            SkinIconButton("arrow.up.left.and.arrow.down.right", size: 12, frame: 26) {
-                withAnimation(SkinMotion.state) {
-                    zoom = 1
-                    pan = .zero
-                }
-            }
-
-            Menu {
-                Button("适应窗口") {
-                    withAnimation(SkinMotion.state) {
-                        zoom = 1
-                        pan = .zero
-                    }
-                }
-                ForEach([0.5, 1.0, 2.0, 4.0], id: \.self) { value in
-                    Button("\(Int(value * 100))%") {
-                        withAnimation(SkinMotion.state) {
-                            zoom = CGFloat(value)
-                            pan = .zero
-                        }
-                    }
-                }
-            } label: {
-                ToolbarLabel(title: zoomLabel, chevron: true)
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-        }
-        .padding(.horizontal, 5)
-        .padding(.vertical, 2)
-        .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(SkinColor.surface1.opacity(0.94))
-                .shadow(color: .black.opacity(0.36), radius: 16, y: 7)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(SkinColor.hairlineStrong, lineWidth: 1)
-        )
-    }
-
-    private func scaleTitle(_ value: Double) -> String {
-        switch value {
-        case 0.125: return "渲染 1/8"
-        case 0.25: return "渲染 1/4"
-        case 0.5: return "渲染 1/2"
-        default: return "渲染 1/1"
-        }
-    }
-
-    private var divider: some View {
-        SkinVerticalHairline(color: SkinColor.hairlineStrong, height: 14)
-            .padding(.horizontal, 3)
-    }
-}
 
 private struct RenderProgressView: View {
     let phase: RenderPhase
@@ -453,73 +272,6 @@ private struct RenderProgressView: View {
     private var progressFraction: CGFloat {
         guard phase.index > 0, phase.total > 0 else { return 0.38 }
         return CGFloat(min(1, Double(phase.index) / Double(phase.total)))
-    }
-}
-
-private struct ToolbarLabel: View {
-    let title: String
-    var chevron: Bool = false
-    @State private var hovered = false
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Text(title)
-                .font(.skin(10.5, .medium))
-            if chevron {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .medium))
-                    .opacity(0.7)
-            }
-        }
-        .foregroundStyle(hovered ? SkinColor.text1 : SkinColor.text2)
-        .padding(.horizontal, 7)
-        .frame(height: 26)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(hovered ? SkinColor.wash : .clear)
-        )
-        .onHover { hovered = $0 }
-        .animation(SkinMotion.hover, value: hovered)
-    }
-}
-
-
-private struct ToolbarTextButton: View {
-    let title: String
-    var icon: String?
-    var chevron: Bool = false
-    var active: Bool = false
-    var action: () -> Void = {}
-
-    @State private var hovered = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 4) {
-                if let icon {
-                    Image(systemName: icon)
-                        .font(.system(size: 11.5, weight: .medium))
-                }
-                Text(title)
-                    .font(.skin(10.5, .medium))
-                if chevron {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 7, weight: .medium))
-                        .opacity(0.7)
-                }
-            }
-            .foregroundStyle(active ? SkinColor.accent : (hovered ? SkinColor.text1 : SkinColor.text2))
-            .padding(.horizontal, 7)
-            .frame(height: 26)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(active ? SkinColor.accent.opacity(0.10) : (hovered ? SkinColor.wash : .clear))
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .onHover { hovered = $0 }
-        .animation(SkinMotion.hover, value: hovered)
     }
 }
 
