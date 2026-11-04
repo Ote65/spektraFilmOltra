@@ -16,6 +16,14 @@ struct GradeView: View {
     @State private var exportOpen = false
     @State private var saveOpen = false
     @State private var saveName = ""
+    @State private var expandedLUT: String?
+
+    @State private var zoom: CGFloat = 1
+    @State private var pan: CGSize = .zero
+    @State private var rotation: Double = 0
+
+    /// 所有滑块的默认值都来自同一份中性配方，避免每次重建行时反复创建。
+    private static let neutralRecipe = GradeRecipe()
 
     init(snapshot: GradeSnapshot, actions: SkinActions) {
         self.snapshot = snapshot
@@ -123,23 +131,20 @@ struct GradeView: View {
 
     private var rail: some View {
         VStack(spacing: 0) {
-            HStack {
-                SkinSegmented(titles: ["LUT", "预设"], selection: $railTab, width: 170)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 6)
+            SkinSegmented(titles: ["LUT", "预设"], selection: $railTab, width: nil)
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+                .padding(.bottom, 8)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 7) {
                     if railTab == 0 {
                         lutList
                     } else {
                         presetList
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
             .scrollIndicators(.hidden)
@@ -148,50 +153,126 @@ struct GradeView: View {
     }
 
     private var lutList: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            railRow("无 LUT", subtitle: nil, selected: recipe.lut.path.isEmpty, icon: nil) {
-                setLUT("")
-            }
-
-            ForEach(snapshot.luts) { lut in
-                railRow(
-                    lut.name, subtitle: nil,
-                    selected: recipe.lut.path == lut.path,
-                    icon: "slider.horizontal.3"
-                ) {
-                    setLUT(lut.path)
+        VStack(alignment: .leading, spacing: 7) {
+            GradeRailCard(selected: recipe.lut.path.isEmpty) {
+                railCardHead(
+                    icon: "nosign",
+                    title: "无 LUT",
+                    subtitle: "不加载任何 LUT",
+                    selected: recipe.lut.path.isEmpty
+                )
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    expandedLUT = nil
+                    setLUT("")
                 }
             }
 
-            if !recipe.lut.path.isEmpty {
-                slider("lut.strength", "LUT 强度", 0...100, step: 1, suffix: "%")
-                    .padding(.horizontal, 4)
-                    .padding(.top, 8)
+            ForEach(snapshot.luts) { lut in
+                let selected = recipe.lut.path == lut.path
+                let expanded = selected && expandedLUT == lut.path
+                GradeRailCard(selected: selected) {
+                    VStack(spacing: 0) {
+                        railCardHead(
+                            icon: "square.stack.3d.up",
+                            title: lut.name,
+                            subtitle: "3D LUT",
+                            selected: selected
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if selected {
+                                withAnimation(SkinMotion.state) {
+                                    expandedLUT = expanded ? nil : lut.path
+                                }
+                            } else {
+                                expandedLUT = lut.path
+                                setLUT(lut.path)
+                            }
+                        }
+
+                        if expanded {
+                            VStack(spacing: 0) {
+                                SkinHairline()
+                                    .padding(.horizontal, 10)
+                                slider("lut.strength", "强度", 0...100, step: 1, suffix: "%")
+                                    .padding(.horizontal, 4)
+                                    .padding(.bottom, 6)
+                            }
+                            .transition(.opacity)
+                        }
+                    }
+                }
             }
 
-            SkinButton("导入 LUT", icon: "plus", kind: .secondary, height: 28) {
+            Button {
                 actions.gradeLUTImported()
+            } label: {
+                HStack(spacing: 10) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(SkinColor.hairlineStrong, lineWidth: 1)
+                        Image(systemName: "plus")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(SkinColor.text3)
+                    }
+                    .frame(width: 28, height: 28)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("导入 LUT")
+                            .font(.skin(11.5, .medium))
+                            .foregroundStyle(SkinColor.text1)
+                        Text("从磁盘选择 .cube 文件")
+                            .font(.skin(9.5))
+                            .foregroundStyle(SkinColor.text4)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 54)
+                .contentShape(Rectangle())
             }
-            .frame(maxWidth: .infinity)
-            .padding(.top, 10)
+            .buttonStyle(.plain)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(
+                        SkinColor.hairlineStrong,
+                        style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                    )
+            )
         }
     }
 
     private var presetList: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 7) {
+            if snapshot.presets.isEmpty {
+                Text("还没有调色预设")
+                    .font(.skin(10.5))
+                    .foregroundStyle(SkinColor.text4)
+                    .padding(.vertical, 9)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             ForEach(snapshot.presets) { preset in
-                railRow(
-                    preset.name, subtitle: preset.builtin ? "内置" : "用户",
-                    selected: activePresetID == preset.id, icon: nil
-                ) {
-                    recipe = preset.recipe
-                    activePresetID = preset.id
-                    actions.gradeRecipeChanged(recipe)
+                let selected = activePresetID == preset.id
+                GradeRailCard(selected: selected) {
+                    railCardHead(
+                        icon: preset.builtin ? "camera.filters" : "bookmark",
+                        title: preset.name,
+                        subtitle: preset.builtin ? "内置预设" : "用户预设",
+                        selected: selected
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        recipe = preset.recipe
+                        activePresetID = preset.id
+                        actions.gradeRecipeChanged(recipe)
+                    }
                 }
             }
 
             HStack(spacing: 6) {
-                SkinButton("保存当前", kind: .secondary, height: 28) {
+                SkinButton("保存当前", icon: "plus", kind: .secondary, height: 28) {
                     saveName = ""
                     saveOpen = true
                 }
@@ -205,44 +286,50 @@ struct GradeView: View {
                     }
                 }
             }
-            .padding(.top, 10)
+            .padding(.top, 4)
         }
     }
 
-    private func railRow(
-        _ title: String, subtitle: String?, selected: Bool, icon: String?,
-        action: @escaping () -> Void
+    private func railCardHead(
+        icon: String, title: String, subtitle: String, selected: Bool
     ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                if let icon {
-                    Image(systemName: icon)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(selected ? SkinColor.accent : SkinColor.text3)
-                }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(title)
-                        .font(.skin(11.5, selected ? .medium : .regular))
-                        .foregroundStyle(selected ? SkinColor.text1 : SkinColor.text2)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if let subtitle {
-                        Text(subtitle)
-                            .font(.skin(9.5))
-                            .foregroundStyle(SkinColor.text4)
-                    }
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 9)
-            .frame(height: subtitle == nil ? 30 : 40)
-            .background(
+        HStack(spacing: 10) {
+            ZStack {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(selected ? SkinColor.surface2 : .clear)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .fill(SkinColor.canvas)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(
+                        selected ? SkinColor.accent.opacity(0.4) : SkinColor.hairline,
+                        lineWidth: 1
+                    )
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(selected ? SkinColor.accent : SkinColor.text3)
+            }
+            .frame(width: 28, height: 28)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.skin(11.5, .medium))
+                    .foregroundStyle(selected ? SkinColor.accent : SkinColor.text1)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(subtitle)
+                    .font(.skin(9.5))
+                    .foregroundStyle(SkinColor.text4)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 4)
+
+            if selected {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(SkinColor.accent)
+            }
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .frame(height: 54)
     }
 
     // MARK: - 画布
@@ -261,8 +348,8 @@ struct GradeView: View {
             GeometryReader { geo in
                 let fit = SkinPrintFit.fit(
                     geo.size,
-                    horizontalInset: 110,
-                    verticalInset: 100,
+                    horizontalInset: 96,
+                    verticalInset: 92,
                     aspect: snapshot.photo.aspectRatio
                 )
 
@@ -295,42 +382,94 @@ struct GradeView: View {
                         .background(SkinColor.surface2)
                     }
                 }
+                .scaleEffect(zoom)
+                .rotationEffect(.degrees(rotation))
+                .offset(pan)
                 .position(x: geo.size.width / 2, y: geo.size.height / 2)
             }
+            .clipped()
+
+            CanvasInteractionLayer(
+                onZoom: { factor in
+                    zoom = min(max(zoom * factor, 0.25), 8)
+                },
+                onPan: { delta in
+                    pan = CGSize(
+                        width: pan.width + delta.width,
+                        height: pan.height + delta.height
+                    )
+                },
+                onReset: resetView
+            )
 
             VStack(spacing: 0) {
+                HStack {
+                    Text("调色预览")
+                        .font(.skin(10.5))
+                        .foregroundStyle(SkinColor.text2)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .fill(SkinColor.surface1.opacity(0.92))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .strokeBorder(SkinColor.hairlineStrong, lineWidth: 1)
+                        )
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+
                 Spacer(minLength: 0)
 
                 if snapshot.phase.isBusy {
                     GradeProgressPill(phase: snapshot.phase)
-                        .padding(.bottom, 12)
+                        .padding(.bottom, 10)
                 }
 
-                HStack {
+                HStack(alignment: .bottom, spacing: 12) {
                     Text(snapshot.handoffMeta)
                         .font(.skin(10).monospacedDigit())
                         .foregroundStyle(SkinColor.text3)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Spacer(minLength: 0)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    SkinPreviewToolbar(
+                        zoom: $zoom,
+                        rotation: $rotation,
+                        pan: $pan,
+                        previewScale: snapshot.previewScale,
+                        onScaleChanged: { actions.gradePreviewScaleChanged($0) },
+                        onReRender: { actions.gradeReRender() }
+                    )
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 10)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 12)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func resetView() {
+        withAnimation(SkinMotion.state) {
+            zoom = 1
+            pan = .zero
+            rotation = 0
+        }
     }
 
     // MARK: - 右栏
 
     private var panel: some View {
         VStack(spacing: 0) {
-            HStack {
-                SkinSegmented(titles: ["光影", "色彩"], selection: $panelTab, width: 168)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 48)
+            SkinSegmented(titles: ["光影", "色彩"], selection: $panelTab, width: nil)
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 6)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -474,7 +613,7 @@ struct GradeView: View {
             VStack(spacing: 8) {
                 HStack(spacing: 7) {
                     Image(systemName: "wand.and.stars")
-                        .font(.system(size: 12, weight: .regular))
+                        .font(.skin(12))
                         .foregroundStyle(SkinColor.accent)
                     Text("智能净化")
                         .font(.skin(10.5, .medium))
@@ -553,7 +692,7 @@ struct GradeView: View {
         GradeValueRow(
             label: label,
             value: recipe.value(for: path),
-            defaultValue: GradeRecipe().value(for: path),
+            defaultValue: Self.neutralRecipe.value(for: path),
             range: range,
             step: step,
             decimals: decimals,
@@ -747,5 +886,36 @@ private struct GradeProgressPill: View {
     private var fraction: CGFloat {
         guard phase.index > 0, phase.total > 0 else { return 0.38 }
         return CGFloat(min(1, Double(phase.index) / Double(phase.total)))
+    }
+}
+
+private struct GradeRailCard<Content: View>: View {
+    let selected: Bool
+    @ViewBuilder var content: Content
+
+    @State private var hovered = false
+
+    var body: some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(fill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(border, lineWidth: 1)
+            )
+            .onHover { hovered = $0 }
+            .animation(SkinMotion.hover, value: hovered)
+    }
+
+    private var fill: Color {
+        if selected { return SkinColor.surface2 }
+        return hovered ? SkinColor.surface2.opacity(0.6) : SkinColor.surface1
+    }
+
+    private var border: Color {
+        if selected { return SkinColor.accent.opacity(0.45) }
+        return hovered ? SkinColor.hairlineStrong : SkinColor.hairline
     }
 }

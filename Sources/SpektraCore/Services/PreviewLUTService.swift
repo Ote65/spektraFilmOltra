@@ -105,8 +105,13 @@ final class PreviewLUTService {
                 stage = PreviewLUTService.lookup(t1, values: scaled, width: width, height: height, shaped: false)
                 logOffset = exposureEV * log10(2.0)
             } else {
-                stage = PreviewLUTService.lookup(t1, values: source.data, width: width, height: height, shaped: true)
-                logOffset = (autoEV + exposureEV) * log10(2.0)
+                // 自动曝光在真管线的 preprocess 阶段施加，早于 rgbToFilmRaw；
+                // 因此必须挪到 t1 的 shaper 坐标上，不能放到 t1 之后。
+                stage = PreviewLUTService.lookup(
+                    t1, values: source.data, width: width, height: height,
+                    shaped: true, shapedEVOffset: autoEV
+                )
+                logOffset = exposureEV * log10(2.0)
             }
             let norm1 = PreviewLUTService.offsetNormalized(stage, offset: logOffset / span1)
 
@@ -204,12 +209,10 @@ final class PreviewLUTService {
                                      inject: .logEPrint, collect: .rgbOut)
         let t4 = Self.rawTable(o4, n: n)
 
-        var bakedFactor = 1.0
-        var compPipe: SimulationPipeline?
-        if params.enlarger.printExposureCompensation {
-            bakedFactor = pipe.previewPrintExposureFactor()
-            compPipe = SimulationPipeline(params: Self.makeCompParams(params), keepTaps: false)
-        }
+        // 补偿管线常驻：快速“拍摄曝光”会在拖动时临时关闭补偿，
+        // 同一份表必须能在补偿开/关之间切换，不能因此重烘。
+        let bakedFactor = pipe.previewPrintExposureFactor()
+        let compPipe = SimulationPipeline(params: Self.makeCompParams(params), keepTaps: false)
 
         return Bundle(
             key: key, resolution: n,
@@ -351,8 +354,8 @@ final class PreviewLUTService {
 
     /// 三线性插值；shaped 为 true 时先做 log2 shaper。
     static func lookup(_ lut: FloatLUT3D, values: [Double],
-                                   width: Int, height: Int,
-                                   shaped: Bool) -> [Double] {
+                       width: Int, height: Int,
+                       shaped: Bool, shapedEVOffset: Double = 0) -> [Double] {
         let n = lut.size
         let scale = Double(n - 1)
         let last = n - 2
@@ -375,7 +378,7 @@ final class PreviewLUTService {
                     let index: Double
                     if shaped {
                         let positive = max(value, 1e-10)
-                        index = min(max((log2(positive) - lo) / span, 0), 1)
+                        index = min(max((log2(positive) + shapedEVOffset - lo) / span, 0), 1)
                     } else {
                         index = min(max(value, 0), 1)
                     }
@@ -469,12 +472,15 @@ final class PreviewLUTService {
         ])
     }()
 
-    /// 线性 ProPhoto → sRGB 显示编码（0…1）。
-    static func displayImage(fromLinear image: ImageRGB) -> ImageRGB {
+    /// 线性 ProPhoto → 预览输出：色彩空间转换 → 镜头模糊 → CCTF。
+    /// 输出色域压缩与扫描锐化留给 D1；D0 只做能保持 <50 ms 的部分。
+    static func displayImage(fromLinear image: ImageRGB,
+                             params: RuntimePhotoParams) -> ImageRGB {
         let width = image.width
         let height = image.height
+        let target = params.io.outputColorSpace
+        let matrix = proPhotoToTarget(target)
         var output = image
-        let matrix = proPhotoToSRGB
         output.data.withUnsafeMutableBufferPointer { buffer in
             guard let base = buffer.baseAddress else { return }
             func row(_ y: Int) {
@@ -484,10 +490,10 @@ final class PreviewLUTService {
                     let r = image.data[p].isFinite ? image.data[p] : 0
                     let g = image.data[p + 1].isFinite ? image.data[p + 1] : 0
                     let b = image.data[p + 2].isFinite ? image.data[p + 2] : 0
-                    let srgb = matrix.apply(Vec3(r, g, b))
-                    base[p] = clamp(CCTF.encode(srgb.x))
-                    base[p + 1] = clamp(CCTF.encode(srgb.y))
-                    base[p + 2] = clamp(CCTF.encode(srgb.z))
+                    let converted = matrix.apply(Vec3(r, g, b))
+                    base[p] = converted.x
+                    base[p + 1] = converted.y
+                    base[p + 2] = converted.z
                 }
             }
             if width * height >= 200_000 {
@@ -496,18 +502,57 @@ final class PreviewLUTService {
                 for y in 0..<height { row(y) }
             }
         }
-        return output
+
+        // D0 不做全量输出色域压缩（CAM16 在 800×600 上约 260 ms）；
+        // 预测档只走矩阵 + CCTF，色域压缩留给 D1/导出。
+        var rgb = output
+        if params.scanner.lensBlur > 0 {
+            rgb = SpatialEffects.gaussianBlurUM(
+                rgb, sigmaUM: params.scanner.lensBlur, pixelSizeUM: 1
+            )
+        }
+        // D0 不叠扫描锐化：预测图还缺颗粒/眩光/光晕等平滑项，
+        // 单独加 USM 会把局部反差推得比真算更高，D1 会补齐。
+        guard params.io.outputCCTFEncoding else {
+            return rgb.sanitizedNonFinite()
+        }
+        let kind = ColorMath.cctfKind(for: target)
+        var encoded = rgb
+        encoded.data.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            func row(_ y: Int) {
+                let rowStart = y * width
+                for x in 0..<width {
+                    let p = (rowStart + x) * 3
+                    base[p] = clamp(ColorMath.cctfEncode(base[p], kind: kind))
+                    base[p + 1] = clamp(ColorMath.cctfEncode(base[p + 1], kind: kind))
+                    base[p + 2] = clamp(ColorMath.cctfEncode(base[p + 2], kind: kind))
+                }
+            }
+            if width * height >= 200_000 {
+                DispatchQueue.concurrentPerform(iterations: height, execute: row)
+            } else {
+                for y in 0..<height { row(y) }
+            }
+        }
+        return encoded.sanitizedNonFinite()
+    }
+
+    private static func proPhotoToTarget(_ target: String) -> Mat3 {
+        if target == "sRGB" { return proPhotoToSRGB }
+        let red = ColorMath.rgbToRGB(Vec3(1, 0, 0), from: "ProPhoto RGB", to: target)
+        let green = ColorMath.rgbToRGB(Vec3(0, 1, 0), from: "ProPhoto RGB", to: target)
+        let blue = ColorMath.rgbToRGB(Vec3(0, 0, 1), from: "ProPhoto RGB", to: target)
+        return Mat3([
+            red.x, green.x, blue.x,
+            red.y, green.y, blue.y,
+            red.z, green.z, blue.z,
+        ])
     }
 
     private static func clamp(_ value: Double) -> Double {
         guard value.isFinite else { return 0 }
         return min(max(value, 0), 1)
-    }
-
-    private enum CCTF {
-        static func encode(_ value: Double) -> Double {
-            ColorMath.cctfEncode(value, kind: .srgb)
-        }
     }
 
     // MARK: - 自动曝光与键
@@ -528,7 +573,8 @@ final class PreviewLUTService {
         e.camera.autoExposure = false
         e.camera.exposureCompensationEV = 0
         e.enlarger.printExposure = 1
-        // 印相曝光补偿决定是否需要补偿管线，不能从键里剔除（否则后开补偿会复用无管线缓存）。
+        // 补偿管线常驻，补偿开关不参与烘焙键。
+        e.enlarger.printExposureCompensation = false
         e.quickIntents = [:]
         e.io.inputColorSpace = inputColorSpace
         e.io.inputCCTFDecoding = inputCCTF

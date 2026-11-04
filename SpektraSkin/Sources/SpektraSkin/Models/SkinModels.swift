@@ -307,6 +307,7 @@ struct GradeSnapshot {
     var statusMessage: String = ""
     var origin: GradeOrigin = .developed
     var clarityReport: ClarityReport? = nil
+    var previewScale: Double = 1
 }
 
 // MARK: - 后端边界
@@ -350,6 +351,8 @@ struct SkinActions {
     var gradePresetDeleted: (String) -> Void = { _ in }
     var gradeLUTImported: () -> Void = {}
     var gradeExport: (ExportSettings) -> Void = { _ in }
+    var gradePreviewScaleChanged: (Double) -> Void = { _ in }
+    var gradeReRender: () -> Void = {}
     var renderScaleChanged: (Double) -> Void = { _ in }
     var reRender: () -> Void = {}
     var toggleFavorite: (String) -> Void = { _ in }
