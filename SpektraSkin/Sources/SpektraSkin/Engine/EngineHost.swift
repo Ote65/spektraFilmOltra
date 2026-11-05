@@ -363,7 +363,8 @@ final class EngineHost: ObservableObject {
             edit: photo.edit, inputColorSpace: loadedColorSpace, inputCCTF: loadedCCTF
         )
         let longEdge = max(image.width, image.height)
-        let maxSize = max(160, Int(Double(longEdge) * previewScale))
+        let scaledEdge = max(160, Int(Double(longEdge) * previewScale))
+        let maxSize = min(scaledEdge, PreviewLUTService.maxPredictionEdge)
         let source = PreviewRenderer.prepared(image, maxSize: maxSize)
         let service = previewLUT
         previewLUTQueue.async { [weak self] in

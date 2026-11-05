@@ -28,13 +28,25 @@ struct HostSmoke {
         let gradeReport = try runGradeSmoke()
         let adaptiveReport = try runAdaptiveGradeSmoke()
         let lutReport = try runLUTSmoke()
+        let cacheProbe = runCacheKeyProbe()
+        if let stable = cacheProbe["spatialKeyStable"] as? Bool, !stable {
+            throw NSError(domain: "smoke", code: 9, userInfo: [
+                NSLocalizedDescriptionKey: "空间参数仍会改变 LUT 烘焙键"
+            ])
+        }
+        if let changes = cacheProbe["gammaKeyChanges"] as? Bool, !changes {
+            throw NSError(domain: "smoke", code: 10, userInfo: [
+                NSLocalizedDescriptionKey: "影调参数没有改变 LUT 烘焙键"
+            ])
+        }
 
         let args = ProcessInfo.processInfo.environment
         guard let rawPath = args["RAW_PATH"], FileManager.default.fileExists(atPath: rawPath) else {
             let data = try JSONSerialization.data(
                 withJSONObject: ["edgeCompression": "finite", "raw": "skipped",
                                  "grade": gradeReport,
-                                 "adaptive": adaptiveReport, "lut": lutReport],
+                                 "adaptive": adaptiveReport, "lut": lutReport,
+                                 "cacheKey": cacheProbe],
                 options: [.sortedKeys, .prettyPrinted]
             )
             print(String(data: data, encoding: .utf8) ?? "{}")
@@ -188,6 +200,7 @@ struct HostSmoke {
             "grade": gradeReport,
             "adaptive": adaptiveReport,
             "lut": lutReport,
+            "cacheKey": cacheProbe,
             "gradeSourceWait": sourceWait,
             "gradeFirstPreviewWait": firstGradeWait,
             "gradeRecipeWait": recipeWait,
@@ -347,6 +360,47 @@ struct HostSmoke {
         return report
     }
 
+    /// 烘焙键回归：空间/随机参数不应改变键，影响 LUT 的影调参数必须改变键。
+    private static func runCacheKeyProbe() -> [String: Any] {
+        func key(_ edit: PhotoEdit) -> String {
+            PreviewLUTService.cacheKey(
+                edit: edit, inputColorSpace: "ProPhoto RGB", inputCCTF: false
+            )
+        }
+        let base = PhotoEdit()
+        let baseKey = key(base)
+
+        var spatial = base
+        spatial.camera.autoExposureMethod = "matrix"
+        spatial.camera.lensBlurUM = 5
+        spatial.camera.diffusionFilter.active = true
+        spatial.camera.diffusionFilter.strength = 1.2
+        spatial.filmRender.grain.densityMin = [0.06, 0.06, 0.06]
+        spatial.filmRender.grain.particleAreaUM2 = 0.6
+        spatial.filmRender.halation.halationAmount = 2
+        spatial.filmRender.glare.percent = 0.2
+        spatial.filmRender.dirCouplers.diffusionSizeUM = 50
+        spatial.printRender.glare.percent = 0.2
+        spatial.enlarger.lensBlur = 2
+        spatial.enlarger.diffusionFilter.active = true
+        spatial.scanner.lensBlur = 2
+        spatial.scanner.unsharpMask = [1.2, 1.2]
+        spatial.scanner.whiteCorrection = true
+        spatial.scanner.blackCorrection = true
+        spatial.settings.previewMode = true
+
+        var gamma = base
+        gamma.filmRender.densityCurveGamma = 1.15
+        var printCurve = base
+        printCurve.printRender.densityCurvesMorph.gammaFactor = 1.15
+
+        return [
+            "spatialKeyStable": key(spatial) == baseKey,
+            "gammaKeyChanges": key(gamma) != baseKey,
+            "printCurveKeyChanges": key(printCurve) != baseKey,
+        ]
+    }
+
     /// LUT 预览回归：烘焙、预测 vs 精算、ΔE₀₀ 门禁与查表耗时。
     private static func runAdaptiveGradeSmoke() throws -> [String: Any] {
         let width = 64
@@ -446,7 +500,7 @@ struct HostSmoke {
         for i in 0..<direct.data.count {
             maxAbs = max(maxAbs, abs(direct.data[i] - smallPredicted.data[i]))
         }
-        let large = makeLinearImage(800, 600)
+        let large = makeLinearImage(1000, 750)
         let predictStart = Date()
         let predicted = bundle.predict(
             source: large, autoEV: autoEV,
@@ -483,6 +537,7 @@ struct HostSmoke {
             "bakeMs": bakeMs,
             "predictMs": predictMs,
             "displayMs": displayMs,
+            "predictionTotalMs": predictMs + displayMs,
             "predictedFinite": finite,
             "autoEV": autoEV,
             "modelMax": preflight.model.max,
