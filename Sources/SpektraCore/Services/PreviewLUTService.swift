@@ -11,6 +11,8 @@ import Foundation
 final class PreviewLUTService {
     /// 45³ 在真实 RAW 上 p99 会超过 1.0；65³ 实测 max 1.22 / p99 0.86。
     static let defaultResolution = 65
+    /// D0 预测帧长边上限：高像素 1/4 预览也保持跟手，细度由 D1 补齐。
+    static let maxPredictionEdge = 1000
 
     static let shaperLowEV = -8.0
     static let shaperHighEV = 6.0
@@ -583,6 +585,29 @@ final class PreviewLUTService {
         e.io.outputColorSpace = "ProPhoto RGB"
         e.io.outputCCTFEncoding = false
         e.debug.lutMode = true
+        // 以下字段在 lutMode 下会被整段关闭或清零，不参与烘焙键；
+        // 否则调颗粒/光晕/柔光/清晰度会白白重烘约 0.8 s。
+        e.settings.previewMode = false
+        e.debug.deactivateSpatialEffects = true
+        e.debug.deactivateStochasticEffects = true
+        e.camera.autoExposureMethod = "center_weighted"
+        e.camera.lensBlurUM = 0
+        e.camera.diffusionFilter = DiffusionFilterParams()
+        e.filmRender.grain = GrainParams()
+        e.filmRender.halation = HalationParams()
+        e.filmRender.glare = GlareParams()
+        e.filmRender.dirCouplers.diffusionSizeUM = 0
+        e.filmRender.dirCouplers.diffusionTailUM = 0
+        e.filmRender.dirCouplers.diffusionTailWeight = 0
+        e.printRender.glare = GlareParams()
+        e.enlarger.lensBlur = 0
+        e.enlarger.diffusionFilter = DiffusionFilterParams()
+        e.scanner.lensBlur = 0
+        e.scanner.unsharpMask = [0, 0]
+        e.scanner.whiteCorrection = false
+        e.scanner.blackCorrection = false
+        e.scanner.whiteLevel = 0.98
+        e.scanner.blackLevel = 0.01
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = (try? encoder.encode(e)) ?? Data()
