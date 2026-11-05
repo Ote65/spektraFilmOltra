@@ -18,6 +18,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>com.spektrafilm.swift</string>
     <key>CFBundleName</key><string>Spektrafilm</string>
     <key>CFBundleDisplayName</key><string>Spektrafilm</string>
+    <key>CFBundleIconFile</key><string>Spektrafilm.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleShortVersionString</key><string>0.3.4</string>
@@ -58,6 +59,12 @@ swiftc \
   -o "$APP/Contents/MacOS/Spektrafilm"
 
 rsync -a "$CORE/Resources/Data/" "$APP/Contents/Resources/Data/"
+if [ -f "$ROOT/Resources/Spektrafilm.icns" ]; then
+  cp "$ROOT/Resources/Spektrafilm.icns" "$APP/Contents/Resources/Spektrafilm.icns"
+fi
+if [ -d "$ROOT/Resources/Licenses" ]; then
+  cp -R "$ROOT/Resources/Licenses" "$APP/Contents/Resources/Licenses"
+fi
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
 echo "Built $APP"
