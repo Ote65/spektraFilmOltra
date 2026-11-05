@@ -153,3 +153,10 @@
 - [x] `ClaritySmoke`：合成影调/灰雾/偏色；`HostSmoke` 增加自适应调色冒烟
 - 验收：1600×1067 分析约 210 ms、渲染约 300 ms；identity 差 0；LUT identity 差 1.11e-16；ClaritySmoke PASS
 - 未做：高级保护开关联动、完整 `ClarityPlan` 持久化、24MP 导出实测、真实 RAW 直入目视验收
+
+## 第十二阶段（性价比优化）
+- [x] LUT 烘焙键只保留影响 LUT 的字段：颗粒/光晕/柔光/清晰度/镜头模糊/黑白场校正/自动曝光方法不再触发重烘
+- [x] D0 预测帧长边封顶 1000 px：1000×750 查表+显示 44.5 ms，高像素拖动不再随 1/4 比例变慢
+- [x] App 图标与 Licenses 纳入 `build.sh`，重新构建不再丢图标，许可随 App 分发
+- 验收：HostSmoke `spatialKeyStable=True`、`gammaKeyChanges=True`；真实 DNG 预检 p99 0.985；
+  bake 786 ms、predict 33.9 ms、display 10.7 ms；identity 0 / 1.11e-16
