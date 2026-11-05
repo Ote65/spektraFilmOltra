@@ -70,10 +70,7 @@ private struct WindowChrome: View {
         ZStack {
             SkinColor.app
 
-            Text("SPEKTRAFILM")
-                .font(.skin(9, .medium))
-                .tracking(2.4)
-                .foregroundStyle(SkinColor.text4)
+            BrandChrome()
         }
         .frame(height: SkinMetric.chromeHeight)
     }
