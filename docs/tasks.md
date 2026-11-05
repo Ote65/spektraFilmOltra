@@ -160,3 +160,12 @@
 - [x] App 图标与 Licenses 纳入 `build.sh`，重新构建不再丢图标，许可随 App 分发
 - 验收：HostSmoke `spatialKeyStable=True`、`gammaKeyChanges=True`；真实 DNG 预检 p99 0.985；
   bake 786 ms、predict 33.9 ms、display 10.7 ms；identity 0 / 1.11e-16
+
+## 第十四阶段（SpektrafilmOltra 品牌与安装器）
+- [x] 新 logo 生成 macOS 圆角图标（16–1024）并替换 `Resources/Spektrafilm.icns`
+- [x] 顶部栏改为 16 pt 应用图标 + SPEKTRAFILM 字标
+- [x] Oltra 风格标准 DMG：暖石墨背景、黄铜箭头、产品标记、Licenses & Source、卷图标
+- [x] `Tools/package_dmg.sh` 可重跑，自动写 Finder 布局与卷图标
+- [ ] SpektrafilmOltra 独立官网（本地未找到站点；按用户要求不改 Ote.asia）
+- 验收：`./build.sh` 通过；DMG 挂载含 `.background`、`.VolumeIcon.icns`、`.DS_Store`；
+  App 与 DMG 签名校验通过；图标 16–1024 全部生成

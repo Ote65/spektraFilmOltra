@@ -8,7 +8,7 @@ ARCH="$(uname -m)"
 NAME="Spektrafilm Oltra $VERSION"
 OUT="$ROOT/build/SpektrafilmOltra-$VERSION-$ARCH.dmg"
 RW="/tmp/spektrafilmolt-rw.dmg"
-MOUNT="/tmp/spektrafilmolt-mount"
+MOUNT="/Volumes/$NAME"
 STAGE="$(mktemp -d /tmp/spektrafilmolt-stage.XXXXXX)"
 
 cleanup() {
@@ -17,25 +17,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$ROOT/build.sh"
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+  "$ROOT/build.sh"
+fi
 
 ditto "$APP" "$STAGE/Spektrafilm.app"
 ln -s /Applications "$STAGE/Applications"
-mkdir -p "$STAGE/Licenses & Source/Source"
+mkdir -p "$STAGE/Licenses & Source/Source" "$STAGE/.background"
 cp -R "$ROOT/Resources/Licenses" "$STAGE/Licenses & Source/Licenses"
+cp "$ROOT/Resources/Brand/dmg-background.png" "$STAGE/.background/background.png"
+cp "$ROOT/Resources/Spektrafilm.icns" "$STAGE/.VolumeIcon.icns"
+SetFile -a C "$STAGE/.VolumeIcon.icns"
+test -f "$STAGE/.VolumeIcon.icns"
 git -C "$ROOT" archive --format=tar.gz \
   --prefix="Spektrafilm-source-$VERSION/" HEAD \
   -o "$STAGE/Licenses & Source/Source/Spektrafilm-source-$VERSION.tar.gz"
 
 rm -f "$RW" "$OUT"
 hdiutil create -volname "$NAME" -srcfolder "$STAGE" -ov -format UDRW "$RW" >/dev/null
-mkdir -p "$MOUNT"
-hdiutil attach "$RW" -nobrowse -readwrite -mountpoint "$MOUNT" >/dev/null
+hdiutil attach "$RW" -nobrowse -readwrite >/dev/null
+sleep 1
 
-mkdir -p "$MOUNT/.background"
-cp "$ROOT/Resources/Brand/dmg-background.png" "$MOUNT/.background/background.png"
-cp "$ROOT/Resources/Spektrafilm.icns" "$MOUNT/.VolumeIcon.icns"
-SetFile -a C "$MOUNT/.VolumeIcon.icns"
 
 osascript <<APPLESCRIPT
 tell application "Finder"
@@ -61,6 +63,10 @@ tell application "Finder"
 end tell
 APPLESCRIPT
 
+# Finder 在写入布局时会移除卷图标文件，布局后再补一次。
+cp "$ROOT/Resources/Spektrafilm.icns" "$MOUNT/.VolumeIcon.icns"
+SetFile -a C "$MOUNT/.VolumeIcon.icns"
+test -f "$MOUNT/.VolumeIcon.icns"
 hdiutil detach "$MOUNT" >/dev/null
 hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$OUT" >/dev/null
 codesign --force --sign - "$OUT" >/dev/null 2>&1 || true
