@@ -17,7 +17,6 @@ final class MobileDevelopSession: ObservableObject {
     /// 导出有独立的进度文案：预览渲染和导出共用一套 phaseLabel 会互相覆盖，
     /// 导出面板上就会显示「胶片显影」这种预览阶段的字。
     @Published private(set) var exportLabel = ""
-    @Published private(set) var exportProgress: Double = 0
     @Published private(set) var errorMessage: String?
     /// 原片读取失败的用户可读原因。非 nil 且 isLoaded == false 时，界面应展示失败态与重试入口，
     /// 而不是继续显示「正在读取原片…」。
@@ -580,7 +579,6 @@ final class MobileDevelopSession: ObservableObject {
         let sourcePhotoID = photoID
         isExporting = true
         exportLabel = clampedNote
-        exportProgress = 0
         exportQueue.async { [weak self] in
             // 导出按目标长边重新解码原图：预览缓存是缩小版，不能拿它放大。
             guard let loaded = try? ImageLoader.load(
@@ -588,7 +586,6 @@ final class MobileDevelopSession: ObservableObject {
                 Task { @MainActor [weak self] in
                     self?.isExporting = false
                     self?.exportLabel = ""
-                    self?.exportProgress = 0
                     completion(.failure(MobileExportError.decodeFailed))
                 }
                 return
@@ -598,11 +595,9 @@ final class MobileDevelopSession: ObservableObject {
             exportParams.io.inputCCTFDecoding = loaded.cctfDecoding
             let pipeline = SimulationPipeline(params: exportParams, keepTaps: false)
             let prepared = PreviewRenderer.prepared(loaded.image, maxSize: requested)
-            let result = pipeline.process(prepared, progress: { label, index, total in
+            let result = pipeline.process(prepared, progress: { label, _, _ in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.exportLabel = Self.stageLabel(label)
-                    self.exportProgress = total > 0 ? Double(index) / Double(total) : 0
+                    self?.exportLabel = Self.stageLabel(label)
                 }
             })
             var output = result.rgbOut
@@ -624,7 +619,6 @@ final class MobileDevelopSession: ObservableObject {
                     guard let self else { return }
                     self.isExporting = false
                     self.exportLabel = ""
-                    self.exportProgress = 0
                     completion(.success(destination))
                 }
             } catch {
@@ -632,7 +626,6 @@ final class MobileDevelopSession: ObservableObject {
                     guard let self else { return }
                     self.isExporting = false
                     self.exportLabel = ""
-                    self.exportProgress = 0
                     completion(.failure(error))
                 }
             }
