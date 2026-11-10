@@ -188,10 +188,8 @@ struct MobileRootView: View {
 
     /// 相机拍完：RAW 入库 → 同步写入系统相册 → 直接进显影台看片。
     private func handleCapture(_ url: URL) {
-        // 入库要复制 DNG、读写库索引，别压在这一拍的视图更新里，否则快门反馈和转场会顿一下。
-        Task { @MainActor in
-            await Task.yield()
-            let report = engine.importPhotos([url])
+        // 入库要复制 DNG、读写库索引，放到后台队列，别压在快门这一拍的转场里。
+        engine.importPhotosOffMain([url]) { report in
             // 主页网格的数据源是系统相册，所以拍到的 DNG 也要写进相册才能立刻出现在列表里。
             PhotoLibraryExport.save(url) { _ in
                 try? FileManager.default.removeItem(at: url)

@@ -180,6 +180,70 @@ final class LibraryStore {
         return root.appendingPathComponent(storedPath)
     }
 
+    /// 后台入库的中间态：只含准备阶段的产物，不持有库状态。
+    struct StagedImport {
+        let id: String
+        let filename: String
+        let originalPath: String
+        let copiedFile: URL
+        let width: Int
+        let height: Int
+        let colorSpace: String
+        let cctfDecoding: Bool
+    }
+
+    /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。
+    func stageImport(from source: URL) throws -> StagedImport {
+        let ext = source.pathExtension.lowercased()
+        guard ImageLoader.rawSuffixes.contains(ext) else {
+            throw NSError(domain: "Spektrafilm.Library", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "显影台只支持 RAW，拒绝导入 \(source.lastPathComponent)"])
+        }
+        let detected = ImageLoader.detectColorSpace(url: source)
+        let dimensions = Self.pixelSize(url: source)
+        let id = UUID().uuidString
+        let copiedFile = originalsURL.appendingPathComponent("\(id).\(ext)")
+        try FileManager.default.copyItem(at: source, to: copiedFile)
+        return StagedImport(id: id,
+                            filename: source.lastPathComponent,
+                            originalPath: "Originals/\(id).\(ext)",
+                            copiedFile: copiedFile,
+                            width: dimensions.width,
+                            height: dimensions.height,
+                            colorSpace: detected.space,
+                            cctfDecoding: detected.cctfDecoding)
+    }
+
+    /// 提交 `stageImport` 的产物：查重、追加到库并落盘。必须在库的拥有线程（主线程）调用。
+    @discardableResult
+    func commitImport(_ staged: StagedImport) throws -> LibraryPhoto {
+        // 同名 + 同尺寸视为同一张：重复导入不再产生副本（相册选取与验收脚本都会重复触发）。
+        if let existing = photos.first(where: {
+            $0.filename == staged.filename
+                && $0.width == staged.width && $0.height == staged.height
+        }) {
+            try? FileManager.default.removeItem(at: staged.copiedFile)
+            return existing
+        }
+        var edit = PhotoEdit()
+        edit.io.inputColorSpace = staged.colorSpace
+        edit.io.inputCCTFDecoding = staged.cctfDecoding
+        let photo = LibraryPhoto(
+            id: staged.id,
+            filename: staged.filename,
+            originalPath: staged.originalPath,
+            thumbnailPath: nil,
+            width: staged.width,
+            height: staged.height,
+            isRaw: true,
+            edit: edit
+        )
+        photos.append(photo)
+        try save()
+        return photo
+    }
+
     @discardableResult
     func importPhoto(from source: URL) throws -> LibraryPhoto {
         let ext = source.pathExtension.lowercased()

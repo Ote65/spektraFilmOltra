@@ -38,6 +38,9 @@ final class MobileGradeSession: ObservableObject {
     private var basePreviewCG: CGImage?
     private var originalBaseCG: CGImage?
     private var borderPersistWork: DispatchWorkItem?
+    /// 片边重合成单独一条队列：滑条拖动时只保留最新一帧，主线程只做赋值。
+    private let borderQueue = DispatchQueue(label: "spektra.mobile.grade.border", qos: .userInitiated)
+    private var borderToken = 0
     private var displayRecipe = MGradeRecipe()
     private var lutPath = ""
     private var token = 0
@@ -155,18 +158,37 @@ final class MobileGradeSession: ObservableObject {
     // MARK: - 片边
 
     /// 只改片边时不必重跑调色：拿当前「无片边」帧重新合成即可。
+    /// 合成在后台队列做，拖动片边参数滑条时主线程只负责最后赋值。
     private func applyBorderToPreview() {
-        guard let base = basePreviewCG else { return }
-        let framed = MFilmBorderRenderer.preview(
-            photo: base, config: border, filmID: develop.filmID, photoID: photoID
-        ) ?? base
-        previewImage = MImage.make(cgImage: framed)
-        previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
-        if let original = originalBaseCG {
-            let framedOriginal = MFilmBorderRenderer.preview(
-                photo: original, config: border, filmID: develop.filmID, photoID: photoID
-            ) ?? original
-            originalImage = MImage.make(cgImage: framedOriginal)
+        let base = basePreviewCG
+        let original = originalBaseCG
+        guard base != nil || original != nil else { return }
+        borderToken += 1
+        let current = borderToken
+        let config = border
+        let filmID = develop.filmID
+        let identifier = photoID
+        borderQueue.async { [weak self] in
+            let framed = base.map {
+                MFilmBorderRenderer.preview(
+                    photo: $0, config: config, filmID: filmID, photoID: identifier
+                ) ?? $0
+            }
+            let framedOriginal = original.map {
+                MFilmBorderRenderer.preview(
+                    photo: $0, config: config, filmID: filmID, photoID: identifier
+                ) ?? $0
+            }
+            Task { @MainActor [weak self] in
+                guard let self, self.borderToken == current else { return }
+                if let framed {
+                    self.previewImage = MImage.make(cgImage: framed)
+                    self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
+                }
+                if let framedOriginal {
+                    self.originalImage = MImage.make(cgImage: framedOriginal)
+                }
+            }
         }
     }
 
@@ -324,9 +346,8 @@ final class MobileGradeSession: ObservableObject {
                     if self.border == borderConfig {
                         self.previewImage = MImage.make(cgImage: framed)
                         self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
-                    } else if let cgImage {
+                    } else if cgImage != nil {
                         // 渲染期间又改了片边：以最新片边重新合成，避免回退成旧边框。
-                        self.basePreviewCG = cgImage
                         self.applyBorderToPreview()
                     }
                     self.isRendering = false
