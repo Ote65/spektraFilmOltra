@@ -1,4 +1,5 @@
 import Foundation
+import Photos
 
 enum MColorLabel: String, CaseIterable, Identifiable, Hashable {
     case red, yellow, green, blue
@@ -37,6 +38,27 @@ struct MPhoto: Identifiable, Hashable {
         guard parts.count == 2, parts[1] > 0 else { return 4.0 / 3.0 }
         return CGFloat(parts[0] / parts[1])
     }
+}
+
+/// 主页网格项：一条来自系统相册的 RAW 资产。
+/// 相册里有、但还没入库的照片 `photo` 为 nil；点开时再按需取原片入库。
+struct MLibraryAsset: Identifiable, Hashable {
+    /// `PHAsset.localIdentifier`
+    let id: String
+    /// 相册里的原始文件名，用于和已入库照片对上编辑记录。
+    let filename: String
+    /// 已入库时的展示信息（含调色状态、本地缩略图）。
+    let photo: MPhoto?
+    /// 相册资产本体：未入库时靠它取相册缩略图，入库时取原片。
+    let phAsset: PHAsset?
+
+    var isImported: Bool { photo != nil }
+    var isGraded: Bool { photo?.isGraded ?? false }
+
+    static func == (lhs: MLibraryAsset, rhs: MLibraryAsset) -> Bool {
+        lhs.id == rhs.id && lhs.photo?.id == rhs.photo?.id
+    }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 struct MFilm: Identifiable, Hashable {

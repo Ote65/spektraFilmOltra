@@ -82,6 +82,8 @@ struct LibraryPhoto: Codable, Identifiable, Hashable {
     var edit = PhotoEdit()
     /// 快速控制的基线（编码后的 PhotoEdit）；缺失时以当前 edit 为准。
     var quickBaselineData: Data? = nil
+    /// 片边参数（移动端展示层配置，不参与核心显影，也不进交接图）。
+    var borderData: Data? = nil
 
     static func == (lhs: LibraryPhoto, rhs: LibraryPhoto) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }

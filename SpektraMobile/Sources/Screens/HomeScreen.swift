@@ -1,5 +1,5 @@
 import SwiftUI
-import PhotosUI
+import Photos
 import UniformTypeIdentifiers
 
 struct HomeScreen: View {
@@ -11,7 +11,7 @@ struct HomeScreen: View {
     @State private var filter: HomeFilter = .all
     @State private var sortMode: HomeSort = .recent
     @State private var actionPhoto: MPhoto?
-    @State private var pickedItems: [PhotosPickerItem] = []
+    @State private var folderPickerOpen = false
     @State private var didDebugOpen = false
     @State private var searchOpen = false
     @State private var query = ""
@@ -28,6 +28,7 @@ struct HomeScreen: View {
                         filterRow
                         sectionHead
                         photoGrid
+                        emptyHint
                     }
                     .padding(.bottom, 106)
                 }
@@ -41,11 +42,16 @@ struct HomeScreen: View {
             }
         }
         .background(MColor.app)
-        .onChange(of: pickedItems) { _, items in
-            guard !items.isEmpty else { return }
-            let batch = items
-            pickedItems = []
-            Task { await importPicked(batch) }
+        .fileImporter(
+            isPresented: $folderPickerOpen,
+            allowedContentTypes: [.folder, .rawImage, .image],
+            allowsMultipleSelection: true
+        ) { result in
+            handleFolderImport(result)
+        }
+        .task {
+            // 主页默认就是「相册里所有 RAW」，不再需要先点导入。
+            await engine.refreshAssets()
         }
         .task {
             guard !didDebugOpen else { return }
@@ -57,58 +63,6 @@ struct HomeScreen: View {
     }
 
     // MARK: - 顶部
-
-    /// 相册选择结果落到临时文件再入库：`LibraryStore` 只接受带扩展名的 RAW。
-    private func importPicked(_ items: [PhotosPickerItem]) async {
-        var urls: [URL] = []
-        for item in items {
-            guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
-            // 相册对 ProRAW 报的 UTI 不一定带 raw 族（实测同一台机器上，
-            // 13 Pro Max 的 DNG 会被报成 `public.tiff`，16 的报成 DNG）。
-            // 于是先用 UTI 取扩展名，再按文件头兜底：TIFF 家族（II*\0 / MM\0*）一律按 dng 落盘。
-            let rawType = item.supportedContentTypes.first(where: { $0.conforms(to: .rawImage) })
-            var ext = rawType?.preferredFilenameExtension
-                ?? item.supportedContentTypes.first?.preferredFilenameExtension
-                ?? "dng"
-            if rawType == nil, Self.looksLikeTIFF(data), !ImageLoader.rawSuffixes.contains(ext.lowercased()) {
-                ext = "dng"
-            }
-            NSLog("MImport types=%@ ext=%@ bytes=%d magic=%@",
-                  item.supportedContentTypes.map(\.identifier).joined(separator: ","),
-                  ext, data.count, Self.magicHex(data))
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent(UUID().uuidString)
-                .appendingPathExtension(ext)
-            do {
-                try data.write(to: url)
-                urls.append(url)
-            } catch {
-                continue
-            }
-        }
-        guard !urls.isEmpty else {
-            onToast("相册里没有可导入的 RAW")
-            return
-        }
-        let report = engine.importPhotos(urls)
-        for url in urls { try? FileManager.default.removeItem(at: url) }
-        if report.imported > 0 {
-            onToast("已导入 \(report.imported) 张")
-        } else {
-            onToast(report.reason.isEmpty ? "仅支持 RAW 文件" : report.reason)
-        }
-    }
-
-    private static func looksLikeTIFF(_ data: Data) -> Bool {
-        guard data.count >= 4 else { return false }
-        let head = Array(data.prefix(4))
-        return (head[0] == 0x49 && head[1] == 0x49 && head[2] == 0x2A && head[3] == 0x00)
-            || (head[0] == 0x4D && head[1] == 0x4D && head[2] == 0x00 && head[3] == 0x2A)
-    }
-
-    private static func magicHex(_ data: Data) -> String {
-        data.prefix(4).map { String(format: "%02X", $0) }.joined()
-    }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -192,7 +146,7 @@ struct HomeScreen: View {
             }
 
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\(visiblePhotos.count) 张照片 · \(gradedCount) 张已调色")
+                Text("\(visibleAssets.count) 张 RAW · \(gradedCount) 张已调色")
                     .mMeta(10, color: MColor.text3)
 
                 Spacer(minLength: 0)
@@ -249,7 +203,7 @@ struct HomeScreen: View {
                 .font(.mSans(11, .semibold))
                 .foregroundStyle(MColor.text2)
 
-            Text("\(visiblePhotos.count)")
+            Text("\(visibleAssets.count)")
                 .mMeta(9.5, color: MColor.text4)
 
             Spacer(minLength: 0)
@@ -288,14 +242,16 @@ struct HomeScreen: View {
             alignment: .leading,
             spacing: 18
         ) {
-            ForEach(Array(visiblePhotos.enumerated()), id: \.element.id) { item in
+            ForEach(Array(visibleAssets.enumerated()), id: \.element.id) { item in
                 MPhotoCard(
-                    photo: item.element,
+                    asset: item.element,
                     index: item.offset + 1,
-                    onOpen: { onOpenDevelop(item.element) },
+                    busy: engine.importingAssetID == item.element.id,
+                    onOpen: { open(item.element) },
                     onLongPress: {
+                        guard let photo = item.element.photo else { return }
                         MHaptic.medium()
-                        withAnimation(MMotion.drawer) { actionPhoto = item.element }
+                        withAnimation(MMotion.drawer) { actionPhoto = photo }
                     }
                 )
             }
@@ -311,7 +267,7 @@ struct HomeScreen: View {
                 Image(systemName: "square.grid.2x2")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(MColor.text3)
-                Text("全部 · \(visiblePhotos.count)")
+                Text("全部 · \(visibleAssets.count)")
                     .font(.mSans(10, .medium))
                     .foregroundStyle(MColor.text3)
             }
@@ -329,12 +285,10 @@ struct HomeScreen: View {
                 }
             }
 
-            PhotosPicker(
-                selection: $pickedItems,
-                maxSelectionCount: 12,
-                matching: .images,
-                photoLibrary: .shared()
-            ) {
+            Button {
+                MHaptic.tick()
+                folderPickerOpen = true
+            } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "plus")
                         .font(.system(size: 12, weight: .semibold))
@@ -584,24 +538,133 @@ struct HomeScreen: View {
         .frame(height: 50)
     }
 
+    /// 空态：没权限 / 没 RAW / 还在扫描，三种情况说清下一步。
+    @ViewBuilder
+    private var emptyHint: some View {
+        if visibleAssets.isEmpty {
+            VStack(spacing: 8) {
+                switch engine.assetPhase {
+                case .scanning, .idle:
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .tint(MColor.text4)
+                    Text("正在扫描相册里的 RAW…")
+                        .mMeta(10.5, color: MColor.text3)
+                case .denied:
+                    Image(systemName: "lock")
+                        .font(.system(size: 22, weight: .regular))
+                        .foregroundStyle(MColor.text4)
+                    Text("没有相册读取权限")
+                        .font(.mSans(11.5, .medium))
+                        .foregroundStyle(MColor.text2)
+                    Text("授权后主页会直接显示相册里所有 RAW")
+                        .mMeta(10, color: MColor.text4)
+                    Button {
+                        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                        UIApplication.shared.open(url)
+                    } label: {
+                        Text("打开设置")
+                            .font(.mSans(11, .semibold))
+                            .foregroundStyle(MColor.brassInk)
+                            .padding(.horizontal, 15)
+                            .frame(height: 32)
+                            .background(Capsule().fill(MColor.brass))
+                    }
+                    .buttonStyle(MPressStyle(scale: 0.94))
+                    .padding(.top, 2)
+                case .ready:
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 22, weight: .regular))
+                        .foregroundStyle(MColor.text4)
+                    Text("相册里没有 RAW 照片")
+                        .font(.mSans(11.5, .medium))
+                        .foregroundStyle(MColor.text2)
+                    Text("可以用「导入」从文件夹里挑 RAW")
+                        .mMeta(10, color: MColor.text4)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.top, 56)
+            .padding(.horizontal, MMetric.pageMargin)
+        }
+    }
+
+    // MARK: - 从文件夹导入
+
+    /// 导入按钮指向文件系统：可以选文件夹（递归取里面的 RAW），也可以直接多选 RAW 文件。
+    private func handleFolderImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure:
+            return
+        case .success(let urls):
+            guard !urls.isEmpty else { return }
+            var raws: [URL] = []
+            var scoped: [URL] = []
+            for url in urls {
+                if url.startAccessingSecurityScopedResource() { scoped.append(url) }
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                    continue
+                }
+                if isDirectory.boolValue {
+                    raws.append(contentsOf: Self.rawFiles(in: url))
+                } else if ImageLoader.rawSuffixes.contains(url.pathExtension.lowercased()) {
+                    raws.append(url)
+                }
+            }
+            defer { for url in scoped { url.stopAccessingSecurityScopedResource() } }
+            guard !raws.isEmpty else {
+                onToast("选中的位置里没有 RAW 文件")
+                return
+            }
+            let report = engine.importPhotos(raws)
+            onToast(report.imported > 0
+                    ? "已导入 \(report.imported) 张 RAW"
+                    : (report.reason.isEmpty ? "导入失败" : report.reason))
+        }
+    }
+
+    /// 递归列出目录下的 RAW 文件（跳过隐藏文件与包）。
+    private static func rawFiles(in folder: URL) -> [URL] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: folder,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [] }
+        var found: [URL] = []
+        for case let file as URL in enumerator
+        where ImageLoader.rawSuffixes.contains(file.pathExtension.lowercased()) {
+            found.append(file)
+        }
+        return found
+    }
+
     // MARK: - 数据
 
-    private var visiblePhotos: [MPhoto] {
-        var filtered = engine.photos.filter { photo in
+    /// 主页数据源：相册里所有 RAW；没有相册权限时退化为已入库照片。
+    private var visibleAssets: [MLibraryAsset] {
+        let source: [MLibraryAsset] = engine.assetPhase == .ready
+            ? engine.assets
+            : engine.photos.map {
+                MLibraryAsset(id: $0.id, filename: $0.filename, photo: $0, phAsset: nil)
+            }
+
+        var filtered = source.filter { asset in
+            let photo = asset.photo
             switch filter {
             case .all: return true
-            case .favorite: return photo.favorite
-            case .graded: return photo.isGraded
-            case .raw: return photo.isRaw
-            case .label(let label): return photo.color == label
+            case .favorite: return photo?.favorite ?? false
+            case .graded: return photo?.isGraded ?? false
+            case .raw: return true
+            case .label(let label): return photo?.color == label
             }
         }
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !keyword.isEmpty {
-            filtered = filtered.filter { photo in
-                photo.filename.lowercased().contains(keyword)
-                    || photo.film.lowercased().contains(keyword)
-                    || photo.paper.lowercased().contains(keyword)
+            filtered = filtered.filter { asset in
+                asset.filename.lowercased().contains(keyword)
+                    || (asset.photo?.film.lowercased().contains(keyword) ?? false)
+                    || (asset.photo?.paper.lowercased().contains(keyword) ?? false)
             }
         }
         switch sortMode {
@@ -615,7 +678,26 @@ struct HomeScreen: View {
     }
 
     private var gradedCount: Int {
-        engine.photos.filter(\.isGraded).count
+        engine.assets.isEmpty
+            ? engine.photos.filter(\.isGraded).count
+            : engine.assets.filter(\.isGraded).count
+    }
+
+    /// 点开一张照片：已入库直接进显影台，未入库先取回原片再进。
+    private func open(_ asset: MLibraryAsset) {
+        if let photo = asset.photo {
+            onOpenDevelop(photo)
+            return
+        }
+        guard asset.phAsset != nil else { return }
+        Task {
+            guard let photoID = await engine.importAsset(assetID: asset.id),
+                  let photo = engine.photos.first(where: { $0.id == photoID }) else {
+                onToast("这张 RAW 没能取回：可能还在 iCloud 且网络不可用")
+                return
+            }
+            onOpenDevelop(photo)
+        }
     }
 
     private func thumbnail(_ photo: MPhoto, width: CGFloat, height: CGFloat) -> some View {
@@ -638,13 +720,14 @@ struct HomeScreen: View {
 // MARK: - 照片卡
 
 private struct MPhotoCard: View {
-    let photo: MPhoto
+    let asset: MLibraryAsset
     let index: Int
+    /// 正在取回原片（iCloud 下载 / 入库）。
+    let busy: Bool
     let onOpen: () -> Void
     let onLongPress: () -> Void
 
     @State private var longPressFired = false
-    @State private var pressed = false
 
     var body: some View {
         Button {
@@ -660,6 +743,7 @@ private struct MPhotoCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .buttonStyle(MPressStyle(scale: 0.97))
+        .disabled(busy)
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.44)
                 .onEnded { _ in
@@ -677,10 +761,14 @@ private struct MPhotoCard: View {
             ZStack(alignment: .topLeading) {
                 Rectangle().fill(MColor.surface2)
 
-                if let image = MPhotoImage.load(photo) {
+                if let photo = asset.photo, let image = MPhotoImage.load(photo) {
                     image
                         .resizable()
                         .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                } else if let phAsset = asset.phAsset {
+                    MAssetThumb(asset: phAsset)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
                 }
@@ -692,18 +780,16 @@ private struct MPhotoCard: View {
                 )
 
                 HStack(alignment: .top) {
-                    if photo.isRaw {
-                        Text("RAW")
-                            .font(.mSans(7.5, .semibold))
-                            .tracking(0.8)
-                            .foregroundStyle(MColor.text1.opacity(0.9))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(
-                                RoundedRectangle(cornerRadius: 3.5, style: .continuous)
-                                    .fill(Color.black.opacity(0.52))
-                            )
-                    }
+                    Text("RAW")
+                        .font(.mSans(7.5, .semibold))
+                        .tracking(0.8)
+                        .foregroundStyle(MColor.text1.opacity(0.9))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                .fill(Color.black.opacity(0.52))
+                        )
 
                     Spacer(minLength: 0)
 
@@ -714,7 +800,34 @@ private struct MPhotoCard: View {
                 .padding(8)
 
                 HStack(spacing: 4) {
-                    if photo.isGraded {
+                    if asset.isImported {
+                        Text(asset.photo?.film ?? "")
+                            .font(.mSans(7.5, .medium))
+                            .foregroundStyle(MColor.text2)
+                            .lineLimit(1)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(
+                                RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                    .fill(Color.black.opacity(0.55))
+                            )
+                    } else {
+                        HStack(spacing: 3) {
+                            Image(systemName: "icloud.and.arrow.down")
+                                .font(.system(size: 7, weight: .semibold))
+                            Text("未导入")
+                                .font(.mSans(7.5, .medium))
+                        }
+                        .foregroundStyle(MColor.text3)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                .fill(Color.black.opacity(0.55))
+                        )
+                    }
+
+                    if asset.isGraded {
                         HStack(spacing: 3) {
                             Circle().fill(MColor.brass).frame(width: 3, height: 3)
                             Text("已调色")
@@ -732,14 +845,16 @@ private struct MPhotoCard: View {
                                 .strokeBorder(MColor.brass.opacity(0.35), lineWidth: 1)
                         )
                     }
+
                     Spacer()
-                    if photo.favorite {
+
+                    if asset.photo?.favorite == true {
                         Image(systemName: "star.fill")
                             .font(.system(size: 8, weight: .medium))
                             .foregroundStyle(MColor.brass)
                             .shadow(color: .black.opacity(0.5), radius: 2)
                     }
-                    if let color = photo.color {
+                    if let color = asset.photo?.color {
                         Circle()
                             .fill(MColor.labelTone(color))
                             .frame(width: 6, height: 6)
@@ -748,6 +863,21 @@ private struct MPhotoCard: View {
                 }
                 .padding(8)
                 .frame(maxHeight: .infinity, alignment: .bottom)
+
+                if busy {
+                    ZStack {
+                        Color.black.opacity(0.42)
+                        VStack(spacing: 5) {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .controlSize(.small)
+                                .tint(.white)
+                            Text("取回原片")
+                                .font(.mSans(8, .medium))
+                                .foregroundStyle(Color.white.opacity(0.86))
+                        }
+                    }
+                }
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
@@ -758,6 +888,44 @@ private struct MPhotoCard: View {
             RoundedRectangle(cornerRadius: MRadius.card, style: .continuous)
                 .strokeBorder(MColor.hairline, lineWidth: 1)
         )
+    }
+}
+
+/// 相册缩略图（未入库的 RAW）。
+private struct MAssetThumb: View {
+    let asset: PHAsset
+
+    @State private var image: UIImage?
+    @State private var requested = false
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(MColor.surface2)
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            }
+        }
+        .onAppear(perform: request)
+    }
+
+    private func request() {
+        guard !requested else { return }
+        requested = true
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        PHImageManager.default().requestImage(
+            for: asset,
+            targetSize: CGSize(width: 360, height: 360),
+            contentMode: .aspectFill,
+            options: options
+        ) { result, _ in
+            guard let result else { return }
+            DispatchQueue.main.async { image = result }
+        }
     }
 }
 

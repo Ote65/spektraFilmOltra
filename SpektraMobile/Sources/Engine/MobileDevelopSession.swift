@@ -34,6 +34,8 @@ final class MobileDevelopSession: ObservableObject {
     @Published private(set) var filmID: String
     @Published private(set) var paperID: String
     @Published private(set) var canUndo = false
+    /// 片边：只影响预览与导出，不进核心显影参数，也不进调色交接图。
+    @Published private(set) var border = MFilmBorderConfig()
 
     // MARK: - 标识
 
@@ -58,6 +60,8 @@ final class MobileDevelopSession: ObservableObject {
     private var baseline: PhotoEdit
     private var quickIntents: [String: Double]
     private var image: ImageRGB?
+    /// 当前预览的无片边像素。改片边参数时只重合成这一张，不重跑显影。
+    private var basePreviewCG: CGImage?
     private var inputColorSpace = "ProPhoto RGB"
     private var inputCCTF = false
 
@@ -119,6 +123,10 @@ final class MobileDevelopSession: ObservableObject {
         self.quickIntents = photo.edit.quickIntents
         self.filmID = photo.edit.filmStock
         self.paperID = photo.edit.printStock
+        if let data = photo.borderData,
+           let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
+            self.border = decoded.normalized()
+        }
         publishFromEdit()
     }
 
@@ -195,9 +203,8 @@ final class MobileDevelopSession: ObservableObject {
                     self.previewAspect = CGFloat(loaded.image.width) / CGFloat(max(1, loaded.image.height))
                     if let original {
                         self.originalImage = MImage.make(cgImage: original)
-                        if self.previewImage == nil {
-                            self.previewImage = self.originalImage
-                        }
+                        self.basePreviewCG = original
+                        self.applyBorderToPreview()
                     }
                     self.isRendering = false
                     self.phaseLabel = ""
@@ -400,6 +407,8 @@ final class MobileDevelopSession: ObservableObject {
         filmID = id
         publishFromEdit()
         persistNow()
+        // 边字默认跟随胶片：换片后先按旧帧重合成一次，精算帧回来后再替换。
+        applyBorderToPreview()
         schedulePreview()
     }
 
@@ -476,8 +485,12 @@ final class MobileDevelopSession: ObservableObject {
         // “原始”必须用库里记录的原图像素尺寸，而不是预览缓冲的 1600 长边。
         // 原始档不做静默降采样；只有 2048/4096 这类显式档位才按内存余量钳位。
         let originalEdge = originalLongEdge > 0 ? originalLongEdge : max(image.width, image.height)
+        let borderConfig = border
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
-        let requested = longEdgeIndex == 0 ? rawEdge : ExportEdge.clampToMemoryBudget(rawEdge)
+        // 片边会把成品放大一圈：开启片边时「原始」也按内存余量钳位，避免 48MP 导出被 jetsam。
+        let requested = (longEdgeIndex == 0 && !borderConfig.enabled)
+            ? rawEdge
+            : ExportEdge.clampToMemoryBudget(rawEdge)
         let clampedNote = requested < rawEdge ? "导出 · 内存上限 \(requested)" : "导出"
         var params: RuntimePhotoParams
         do {
@@ -513,6 +526,8 @@ final class MobileDevelopSession: ObservableObject {
         let destination = Self.exportURL(filename: filename, ext: ext)
         let sourceURL = originalURL
         let options = rawOptions()
+        let sourceFilmID = filmID
+        let sourcePhotoID = photoID
         isExporting = true
         exportLabel = clampedNote
         exportProgress = 0
@@ -540,10 +555,19 @@ final class MobileDevelopSession: ObservableObject {
                     self.exportProgress = total > 0 ? Double(index) / Double(total) : 0
                 }
             })
+            var output = result.rgbOut
+            if borderConfig.enabled {
+                Task { @MainActor [weak self] in self?.exportLabel = "合成片边" }
+                output = MFilmBorderRenderer.composite(
+                    image: output, config: borderConfig,
+                    filmID: sourceFilmID, photoID: sourcePhotoID,
+                    colorSpace: colorSpace, cctfEncoding: cctf
+                )
+            }
             do {
                 try FileManager.default.createDirectory(
                     at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try ImageExport.save(result.rgbOut, to: destination, bitDepth: bitDepth,
+                try ImageExport.save(output, to: destination, bitDepth: bitDepth,
                                      colorSpace: colorSpace, cctfEncoding: cctf)
                 Task { @MainActor [weak self] in
                     guard let self else { return }
@@ -706,7 +730,8 @@ final class MobileDevelopSession: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.renderToken == token else { return }
                 if let display, !outcome.cancelled {
-                    self.previewImage = MImage.make(cgImage: display)
+                    self.basePreviewCG = display
+                    self.applyBorderToPreview()
                 }
                 self.isPredicted = false
                 self.isRendering = false
@@ -782,12 +807,61 @@ final class MobileDevelopSession: ObservableObject {
     private func finishFast(token: Int, cgImage: CGImage?) {
         fastInFlight = false
         if let cgImage, token > accurateDoneFastToken {
-            previewImage = MImage.make(cgImage: cgImage)
+            basePreviewCG = cgImage
+            applyBorderToPreview()
             isPredicted = true
         }
         if fastDirty, !renderInFlight {
             startFast()
         }
+    }
+
+    // MARK: - 片边
+
+    /// 只改片边时不需要重跑显影：拿当前无片边预览帧重新合成即可。
+    private func applyBorderToPreview() {
+        guard let base = basePreviewCG else { return }
+        let composed = MFilmBorderRenderer.preview(
+            photo: base, config: border, filmID: filmID, photoID: photoID
+        ) ?? base
+        previewImage = MImage.make(cgImage: composed)
+        previewAspect = CGFloat(composed.width) / CGFloat(max(1, composed.height))
+    }
+
+    func setBorder(_ config: MFilmBorderConfig) {
+        let value = config.normalized()
+        guard value != border else { return }
+        border = value
+        persistSoon()
+        applyBorderToPreview()
+    }
+
+    /// 片边预设：快速模式的横向卡片走这里，一次性写入整套片边参数。
+    func setBorderPreset(_ preset: MFilmBorderPreset) {
+        var value = preset.config
+        value.enabled = preset.id != "none"
+        value.preset = preset.id
+        setBorder(value)
+    }
+
+    /// 专业模式手动改一项：改完就不再声称还是某个预设。
+    func updateBorder(_ mutate: (inout MFilmBorderConfig) -> Void) {
+        var value = border
+        mutate(&value)
+        value = value.normalized()
+        if !value.enabled {
+            value.preset = "none"
+        } else if let preset = MFilmBorderPreset.preset(id: value.preset),
+                  preset.id != "none", preset.config.matches(value) {
+            // 仍然与预设一致，保留预设名。
+        } else {
+            value.preset = "custom"
+        }
+        setBorder(value)
+    }
+
+    func resetBorder() {
+        setBorder(MFilmBorderConfig())
     }
 
     // MARK: - 写入
@@ -1140,6 +1214,7 @@ final class MobileDevelopSession: ObservableObject {
         guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
         edit.quickIntents = quickIntents
         photo.edit = edit
+        photo.borderData = try? JSONEncoder().encode(border)
         if quickIntents.isEmpty {
             photo.quickBaselineData = nil
         } else if photo.quickBaselineData == nil {

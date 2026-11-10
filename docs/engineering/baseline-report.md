@@ -394,3 +394,33 @@ SPEKTRA_PARITY=1 Tools/acceptance.sh "iPhone 18 Pro"
 # 只跑对拍
 Tools/parity.sh
 ```
+
+## 10. 片边功能与验收脚本加固（2026-11-10）
+
+新增片边（胶片边缘）特性：`SpektraMobile/Sources/Design/FilmBorder.swift`。
+按真实底片机械尺寸换算（135 / 半格 / 120 全系 / 4×5 / 110 / 16mm / 35mm 电影），
+齿孔按 KS / BH / CS / 单孔规格绘制，含边字、DX 码、缺口码、划痕 / 灰尘 / 漏光，
+预览与导出共用同一确定性种子纹理；导出侧片边先按 sRGB 栅格化再转到目标
+色彩空间混合，ProPhoto / ACES 导出不串色。引擎侧 `MobileDevelopSession` 只在
+片边参数变化时对当前无片边预览帧重新合成，不重跑显影；开启片边时导出「原始」
+长边按内存余量钳位。
+
+`Tools/acceptance.sh` 两处加固：
+
+1. 重装 App 后立即 `simctl privacy grant photos` 预授权相册——重装不重置 TCC，
+   但新装首启的权限框会挂在 SpringBoard 上挡住全部截图。
+2. 截图前重启 SpringBoard（`launchctl stop com.apple.SpringBoard`），清除上一次
+   运行残留的系统弹窗。
+
+验收（iPhone 18 Pro，Release）：BUILD SUCCEEDED，九张截图全部干净，
+`Cycle detected: 0 / fatalError: 0 / 文件缺失: 0`。
+
+### 悬浮化返工（同日）
+
+- 显影 / 调色参数面板脱离底部贴边：改为左右留 10pt、悬在 tab 玻璃胶囊上方
+  64pt 处的浮窗，四角全部 `MRadius.sheet` 圆角；胶囊独立成底层元素。
+  二档展开逻辑（chevron 变高）不变，预览照片从浮窗下方透出（玻璃层语义）。
+- 导出弹窗从系统底部 sheet 改为居中浮卡（scrim + 卡片）：无 grabber，
+  头部 X / 标题 / 黄铜 ✓ 确认圆钮，选项区对照 Lightroom 参考图改为
+  「文件类型 / 尺寸」下拉行（原生 `Menu`）；导出中 scrim 不可点关闭，
+  完成态标题「导出完成」+ 返回主页。水印与「更多选项」没有真实功能，未放占位。

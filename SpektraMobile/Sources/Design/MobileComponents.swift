@@ -563,6 +563,107 @@ struct MToggleRow: View {
     }
 }
 
+// MARK: - 下拉选择行
+
+struct MChoiceRow: View {
+    let label: String
+    let value: String
+    let options: [MProOption]
+    var isEnabled: Bool = true
+    let action: (String) -> Void
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.mSans(11))
+                .foregroundStyle(isEnabled ? MColor.text2 : MColor.text4)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Menu {
+                ForEach(options, id: \.value) { option in
+                    Button {
+                        MHaptic.tick()
+                        action(option.value)
+                    } label: {
+                        Text(option.label)
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(value)
+                        .font(.mSans(10.5, .medium))
+                        .foregroundStyle(isEnabled ? MColor.brass : MColor.text4)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .semibold))
+                        .foregroundStyle(MColor.text4)
+                }
+                .contentShape(Rectangle())
+            }
+            .disabled(!isEnabled)
+        }
+        .frame(height: 42)
+    }
+}
+
+// MARK: - 文本输入行
+
+struct MTextFieldRow: View {
+    let label: String
+    @Binding var text: String
+    var placeholder: String = ""
+    var limit: Int = 28
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.mSans(11))
+                .foregroundStyle(MColor.text2)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.plain)
+                .font(.mSans(10.5, .medium))
+                .foregroundStyle(MColor.text1)
+                .multilineTextAlignment(.trailing)
+                .padding(.horizontal, 8)
+                .frame(width: 150, height: 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(MColor.surface2)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(MColor.hairline, lineWidth: 1)
+                )
+                .onChange(of: text) { _, newValue in
+                    if newValue.count > limit { text = String(newValue.prefix(limit)) }
+                }
+        }
+        .frame(height: 42)
+    }
+}
+
+// MARK: - iOS 26 悬浮玻璃页签
+
+/// 底部页签的玻璃胶囊外壳：内容仍由各页面自己排，
+/// 这样显影页「调色」按钮的长按手势和调色页的三页签都不用重写。
+struct MGlassTabCapsule<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        HStack(spacing: 2) {
+            content()
+        }
+        .padding(.horizontal, 5)
+        .frame(height: 50)
+        .mGlassSurface(Capsule(), fallbackFill: MColor.surface2.opacity(0.96))
+        .overlay(Capsule().strokeBorder(MColor.hairlineStrong, lineWidth: 1))
+        .shadow(color: .black.opacity(0.42), radius: 16, y: 6)
+        .padding(.horizontal, 18)
+    }
+}
+
 
 // MARK: - 胶片 / 相纸图标
 //

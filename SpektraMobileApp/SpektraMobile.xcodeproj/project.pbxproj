@@ -34,6 +34,7 @@
 		56BDD01F0E81CDF015A16C5B /* Pipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = E837A5B6BCC4EF6247B82F1E /* Pipeline.swift */; };
 		5E4A3B27AE8A660896679EE6 /* MobileComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFEB333890C0D09618141435 /* MobileComponents.swift */; };
 		6067EE188061AFA44AE6E30E /* DevelopScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */; };
+		F1B0A0013C0DE00000000001 /* FilmBorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1B0A0013C0DE00000000002 /* FilmBorder.swift */; };
 		66D070ACC8D57BA6A57610F3 /* MPlatformImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8680D530984F0FFC3DB0DB5 /* MPlatformImage.swift */; };
 		66F8559ED2256B7A1577CB73 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A54F78C0361C2A53D3A662EE /* Assets.xcassets */; };
 		681EEE5D1A70C4EB8E02039E /* PrintingStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 184511334DF68051A980B842 /* PrintingStage.swift */; };
@@ -147,6 +148,7 @@
 		FA5E884E31AEC9550F9F2DE6 /* PreviewLUTService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLUTService.swift; sourceTree = "<group>"; };
 		FC0E0B7CF1C19335D215739A /* ParamsDigest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParamsDigest.swift; sourceTree = "<group>"; };
 		FFEB333890C0D09618141435 /* MobileComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileComponents.swift; sourceTree = "<group>"; };
+		F1B0A0013C0DE00000000002 /* FilmBorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilmBorder.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -336,6 +338,7 @@
 			children = (
 				E7000FDC6B607084B4E41031 /* MHousing.swift */,
 				FFEB333890C0D09618141435 /* MobileComponents.swift */,
+				F1B0A0013C0DE00000000002 /* FilmBorder.swift */,
 				265EB484360204C1157F1B7D /* MobileTokens.swift */,
 				F8680D530984F0FFC3DB0DB5 /* MPlatformImage.swift */,
 			);
@@ -506,6 +509,7 @@
 				66D070ACC8D57BA6A57610F3 /* MPlatformImage.swift in Sources */,
 				D7E0D191AA1C984B7EDC2993 /* MobileCatalog.swift in Sources */,
 				5E4A3B27AE8A660896679EE6 /* MobileComponents.swift in Sources */,
+				F1B0A0013C0DE00000000001 /* FilmBorder.swift in Sources */,
 				FAEC0537770F0FDE1AD82B2B /* MobileDevelopSession.swift in Sources */,
 				5EEDAA0000000000000000B2 /* PhotoLibraryExport.swift in Sources */,
 				54A36A910D1B727D9BDA0A2A /* MobileEngine.swift in Sources */,

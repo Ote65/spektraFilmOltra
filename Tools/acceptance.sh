@@ -28,8 +28,13 @@ open -a Simulator >/dev/null 2>&1 || true
 xcrun simctl bootstatus "$DEVICE" -b >/dev/null 2>&1 || true
 
 echo "== 3/5 安装 + 播种 =="
+# 重启 SpringBoard 清掉上一次运行残留的系统弹窗（权限框等会一直挂在屏幕上挡截图）。
+xcrun simctl spawn "$DEVICE" launchctl stop com.apple.SpringBoard 2>/dev/null || true
+sleep 6
 xcrun simctl terminate "$DEVICE" "$BUNDLE" 2>/dev/null || true
 xcrun simctl install "$DEVICE" "$APP"
+# 重装会重置权限；相册权限弹窗会挡住后面的截图，装完立刻预授权。
+xcrun simctl privacy "$DEVICE" grant photos "$BUNDLE" 2>/dev/null || true
 CONTAINER=$(xcrun simctl get_app_container "$DEVICE" "$BUNDLE" data)
 mkdir -p "$CONTAINER/Documents"
 # 清空照片库，保证截图可复现（否则每次验收都会多一份导入）。

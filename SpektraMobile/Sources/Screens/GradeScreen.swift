@@ -44,6 +44,7 @@ struct GradeScreen: View {
         CGPoint(x: 1.0, y: 1.0),
     ]
     @State private var curveChannel = "RGB"
+    @Namespace private var toolPill
 
     private var availableHeight: CGFloat { insets.contentHeight }
 
@@ -75,33 +76,38 @@ struct GradeScreen: View {
             .padding(.top, insets.top)
 
             drawer
-                .frame(height: drawerHeight + insets.bottom)
+                .padding(.horizontal, 10)
+                .frame(height: drawerHeight)
+                .padding(.bottom, 64 + insets.bottom)
+
+            toolbar
 
             MBackSwipe(action: onBack)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .padding(.top, insets.top)
         }
         .background(MColor.app)
-        .sheet(isPresented: $exportOpen) {
-            MExportSheet(
-                filename: session.filename,
-                isExporting: session.isExporting,
-                phaseLabel: session.exportLabel,
-                originalLongEdge: session.exportOriginalEdge,
-                canExport: session.sourceReady,
-                onClose: { exportOpen = false },
-                onReturnHome: {
-                    exportOpen = false
-                    onGoHome()
-                },
-                onNote: onToast,
-                onExport: { format, edge, done in
-                    session.export(format: format, longEdgeIndex: edge) { result in
-                        if case .failure = result { onToast("导出失败") }
-                        done(result)
+        .overlay {
+            if exportOpen {
+                MExportSheet(
+                    filename: session.filename,
+                    phaseLabel: session.exportLabel,
+                    originalLongEdge: session.exportOriginalEdge,
+                    canExport: session.sourceReady,
+                    onClose: { withAnimation(MMotion.pill) { exportOpen = false } },
+                    onReturnHome: {
+                        exportOpen = false
+                        onGoHome()
+                    },
+                    onNote: onToast,
+                    onExport: { format, edge, done in
+                        session.export(format: format, longEdgeIndex: edge) { result in
+                            if case .failure = result { onToast("导出失败") }
+                            done(result)
+                        }
                     }
-                }
-            )
+                )
+            }
         }
         .overlay(alignment: .top) {
             MHousingAura(
@@ -529,28 +535,20 @@ struct GradeScreen: View {
                 }
             )
             .clipped()
-
-            toolbar
         }
-        // 抽屉是玻璃层：放大后的照片会从下面透出来，而不是被整块实色盖住。
+        // 抽屉是悬浮玻璃层：放大后的照片会从下面透出来，而不是被整块实色盖住。
         .background(
             ZStack {
                 drawerShape.fill(.ultraThinMaterial)
                 drawerShape.fill(Color.black.opacity(0.30))
             }
         )
-        .overlay(alignment: .top) {
-            UnevenRoundedRectangle(
-                topLeadingRadius: MRadius.sheet,
-                bottomLeadingRadius: 0,
-                bottomTrailingRadius: 0,
-                topTrailingRadius: MRadius.sheet,
-                style: .continuous
-            )
-            .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
-            .allowsHitTesting(false)
+        .overlay {
+            drawerShape
+                .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
+                .allowsHitTesting(false)
         }
-        .shadow(color: .black.opacity(0.55), radius: 20, y: -6)
+        .shadow(color: .black.opacity(0.55), radius: 20, y: 8)
         .onPreferenceChange(MPanelHeightKey.self) { height in
             panelContentHeight = height
             syncDrawerToContent()
@@ -962,31 +960,34 @@ struct GradeScreen: View {
     // MARK: - 工具条
 
     private var toolbar: some View {
-        HStack(spacing: 0) {
+        MGlassTabCapsule {
             ForEach(Array(toolItems.enumerated()), id: \.offset) { item in
                 Button {
                     MHaptic.tick()
                     selectTab(item.offset)
                 } label: {
                     VStack(spacing: 3) {
-                        ZStack {
-                            if tabIndex == item.offset {
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(MColor.brassWash)
-                                    .frame(width: 34, height: 22)
-                            }
-                            Image(systemName: item.element.icon)
-                                .font(.system(size: 12.5, weight: .medium))
-                                .foregroundStyle(tabIndex == item.offset ? MColor.brass : MColor.text3)
-                        }
-                        .frame(height: 22)
+                        Image(systemName: item.element.icon)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(tabIndex == item.offset ? MColor.brass : MColor.text3)
+                            .frame(height: 21)
 
                         Text(item.element.title)
                             .font(.mSans(8.5, .medium))
                             .foregroundStyle(tabIndex == item.offset ? MColor.brass : MColor.text4)
+                            .lineLimit(1)
                     }
                     .frame(maxWidth: .infinity)
-                    .frame(height: 46)
+                    .frame(height: 42)
+                    .background {
+                        if tabIndex == item.offset {
+                            Capsule()
+                                .fill(MColor.brassWash)
+                                .overlay(Capsule().strokeBorder(MColor.brass.opacity(0.20), lineWidth: 1))
+                                .padding(.vertical, 3)
+                                .matchedGeometryEffect(id: "glass-tool", in: toolPill)
+                        }
+                    }
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -994,18 +995,14 @@ struct GradeScreen: View {
                 .accessibilityAddTraits(tabIndex == item.offset ? [.isSelected] : [])
             }
         }
-        .padding(.horizontal, 8)
-        // 与显影页一致：图标+文字整体在「分隔线→屏幕底」的完整栏高内垂直居中
-        //（内容高 46 = 图标区 22 + 间距 3 + 文字行 ~11 + 上下留白；栏高 46 + 底部安全区）
-        .frame(height: 46 + insets.bottom, alignment: .center)
-        .overlay(alignment: .top) { MHairline() }
+        .padding(.bottom, 8 + insets.bottom)
     }
 
     private var drawerShape: UnevenRoundedRectangle {
         UnevenRoundedRectangle(
             topLeadingRadius: MRadius.sheet,
-            bottomLeadingRadius: 0,
-            bottomTrailingRadius: 0,
+            bottomLeadingRadius: MRadius.sheet,
+            bottomTrailingRadius: MRadius.sheet,
             topTrailingRadius: MRadius.sheet,
             style: .continuous
         )
