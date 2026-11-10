@@ -29,6 +29,7 @@ enum ImageExport {
 
     static func save(_ image: ImageRGB, to url: URL, bitDepth: Int = 16,
                      colorSpace: String, cctfEncoding: Bool = true,
+                     jpegQuality: Double = 0.95,
                      metadata: ExportMetadata = ExportMetadata()) throws {
         let ext = url.pathExtension.lowercased()
         switch ext {
@@ -45,7 +46,8 @@ enum ImageExport {
         case "jpg", "jpeg":
             // 导出侧支持 JPEG；导入侧仍按硬约束只收 RAW。
             try writeViaImageIO(image: image, to: url, ext: "jpg",
-                                colorSpace: colorSpace, metadata: metadata)
+                                colorSpace: colorSpace, jpegQuality: jpegQuality,
+                                metadata: metadata)
         default:
             throw ExportError.unsupportedFormat(ext)
         }
@@ -90,7 +92,9 @@ enum ImageExport {
     // MARK: - PNG / JPEG
 
     static func writeViaImageIO(image: ImageRGB, to url: URL, ext: String,
-                                colorSpace: String, metadata: ExportMetadata) throws {
+                                colorSpace: String,
+                                jpegQuality: Double = 0.95,
+                                metadata: ExportMetadata) throws {
         let width = image.width
         let height = image.height
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
@@ -128,7 +132,8 @@ enum ImageExport {
         }
         var properties = exifProperties(metadata)
         if ext == "jpg" || ext == "jpeg" {
-            properties[kCGImageDestinationLossyCompressionQuality as String] = 0.95
+            properties[kCGImageDestinationLossyCompressionQuality as String]
+                = min(max(jpegQuality, 0), 1)
         }
         CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else {

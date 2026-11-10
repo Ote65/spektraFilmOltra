@@ -160,50 +160,6 @@ struct MBrassPill: View {
     }
 }
 
-// MARK: - 导出进度
-
-/// 导出要十几秒：给「现在到哪一段 + 百分比 + 细进度条」，比禁用态胶囊上的转圈有用。
-struct MExportProgressRow: View {
-    let label: String
-    let progress: Double
-    var height: CGFloat = 46
-
-    private var clamped: Double { min(max(progress, 0), 1) }
-
-    var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Text(label.isEmpty ? "导出中" : label)
-                    .font(.mSans(11.5, .semibold))
-                    .foregroundStyle(MColor.text1)
-                Spacer(minLength: 0)
-                Text("\(Int((clamped * 100).rounded()))%")
-                    .font(.mSans(10.5, .medium).monospacedDigit())
-                    .foregroundStyle(MColor.text3)
-            }
-            Capsule()
-                .fill(MColor.surface3)
-                .frame(height: 3)
-                .overlay(alignment: .leading) {
-                    GeometryReader { geo in
-                        Capsule()
-                            .fill(MColor.brass)
-                            .frame(width: geo.size.width * clamped)
-                            .animation(MMotion.state, value: clamped)
-                    }
-                }
-        }
-        .padding(.horizontal, 16)
-        .frame(height: height)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous).fill(MColor.surface2)
-        )
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("导出进度")
-        .accessibilityValue("\(Int((clamped * 100).rounded()))%，\(label.isEmpty ? "导出中" : label)")
-    }
-}
-
 // MARK: - 筛选片
 
 struct MFilterChip: View {
@@ -656,7 +612,7 @@ struct MGlassTabCapsule<Content: View>: View {
             content()
         }
         .padding(.horizontal, 5)
-        .frame(height: 50)
+        .frame(height: MMetric.tabCapsuleHeight)
         .mGlassSurface(Capsule(), fallbackFill: MColor.surface2.opacity(0.96))
         .overlay(Capsule().strokeBorder(MColor.hairlineStrong, lineWidth: 1))
         .shadow(color: .black.opacity(0.42), radius: 16, y: 6)
@@ -931,6 +887,8 @@ struct MHScrollRail<Content: View>: View {
     let itemCount: Int
     var itemWidth: CGFloat = 58
     var spacing: CGFloat = 5
+    /// 首项左内边距：滚动行铺满面板时，用它把第一项对齐到标题。
+    var leading: CGFloat = 0
     var trailing: CGFloat = 20
     var itemHeight: CGFloat = 52
     var fadeColor: Color = MColor.surface1
@@ -941,7 +899,8 @@ struct MHScrollRail<Content: View>: View {
 
     var body: some View {
         GeometryReader { geo in
-            let contentWidth = CGFloat(itemCount) * itemWidth
+            let contentWidth = leading
+                + CGFloat(itemCount) * itemWidth
                 + CGFloat(max(0, itemCount - 1)) * spacing
                 + trailing
             let maxOffset = max(0, contentWidth - geo.size.width)
@@ -950,6 +909,7 @@ struct MHScrollRail<Content: View>: View {
                 HStack(spacing: spacing) {
                     content()
                 }
+                .padding(.leading, leading)
                 .padding(.trailing, trailing)
                 .fixedSize(horizontal: true, vertical: false)
                 .offset(x: offset)

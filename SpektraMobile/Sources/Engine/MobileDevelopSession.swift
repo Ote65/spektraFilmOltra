@@ -19,6 +19,9 @@ final class MobileDevelopSession: ObservableObject {
     @Published private(set) var exportLabel = ""
     @Published private(set) var exportProgress: Double = 0
     @Published private(set) var errorMessage: String?
+    /// 原片读取失败的用户可读原因。非 nil 且 isLoaded == false 时，界面应展示失败态与重试入口，
+    /// 而不是继续显示「正在读取原片…」。
+    @Published private(set) var loadFailure: String?
     @Published private(set) var isLoaded = false
     @Published private(set) var isExporting = false
     @Published private(set) var previewAspect: CGFloat = 4.0 / 3.0
@@ -81,6 +84,10 @@ final class MobileDevelopSession: ObservableObject {
     private var pendingHandoffs: [(Int, (ImageRGB?) -> Void)] = []
     /// 白平衡/镜头校正变化后重新解码原图的防抖任务；拖动过程中合并成一次。
     private var pendingRawReload: DispatchWorkItem?
+    /// 原片解码看门狗：CIRAWFilter 在部分 RAW 上可能长时间不返回，超时后让界面进入失败态，
+    /// 用户仍可重试；迟到的解码结果会因 loadToken 不变而正常收尾。
+    private var loadTimeoutWork: DispatchWorkItem?
+    private static let loadTimeout: TimeInterval = 25
 
     /// 原图长边（导入时写入库里的真实像素尺寸）。预览比例与导出「原始」都基于它，
     /// 不能用预览缓冲的 1600 长边，否则 12 MP 原图会被当成 1600 长边导出。
@@ -143,6 +150,8 @@ final class MobileDevelopSession: ObservableObject {
         pendingSettle?.cancel()
         pendingRawReload?.cancel()
         pendingRawReload = nil
+        loadTimeoutWork?.cancel()
+        loadTimeoutWork = nil
         persistWork?.cancel()
         fastDirty = false
         renderer.invalidate()
@@ -168,11 +177,16 @@ final class MobileDevelopSession: ObservableObject {
     /// 按指定长边重新解码原图并刷新预览缓冲。调大渲染比例时复用同一入口。
     private func loadOriginal(maxSize: Int) {
         guard let photo = store.photos.first(where: { $0.id == photoID }) else {
+            isRendering = false
+            phaseLabel = ""
             errorMessage = "照片不在库中"
+            loadFailure = "照片不在库中，请回到首页重新导入。"
             return
         }
         let originalURL = store.originalURL(for: photo)
         self.originalURL = originalURL
+        loadFailure = nil
+        errorMessage = nil
         loadToken += 1
         let token = loadToken
         // 比例切换时丢弃仍在途的旧尺寸精算帧，避免旧图覆盖新解码缓冲。
@@ -183,6 +197,7 @@ final class MobileDevelopSession: ObservableObject {
         phaseProgress = 0
         // 解码参数在主线程取好，后台队列只做像素工作。
         let options = rawOptions()
+        armLoadTimeout(token: token)
         loadQueue.async { [weak self] in
             do {
                 let loaded = try ImageLoader.load(
@@ -193,6 +208,10 @@ final class MobileDevelopSession: ObservableObject {
                 let original = PreviewRenderer.cgImage(from: display)
                 Task { @MainActor [weak self] in
                     guard let self, self.loadToken == token else { return }
+                    self.loadTimeoutWork?.cancel()
+                    self.loadTimeoutWork = nil
+                    self.loadFailure = nil
+                    self.errorMessage = nil
                     self.image = loaded.image
                     self.loadedEdge = max(loaded.image.width, loaded.image.height)
                     // 库里的宽高缺失时才退回解码缓冲的长边（此时至少能保证导出不被预览尺寸误缩）。
@@ -215,13 +234,42 @@ final class MobileDevelopSession: ObservableObject {
             } catch {
                 Task { @MainActor [weak self] in
                     guard let self, self.loadToken == token else { return }
+                    self.loadTimeoutWork?.cancel()
+                    self.loadTimeoutWork = nil
                     self.isRendering = false
                     self.phaseLabel = ""
                     self.errorMessage = String(describing: error)
+                    self.loadFailure = Self.loadFailureText(for: error)
                     self.flushHandoffs()
                 }
             }
         }
+    }
+
+    /// 读取失败后的手动重试。保留当前预览比例；旧的在途解码会因 loadToken 变化被丢弃。
+    func retryLoad() {
+        guard !isLoaded else { return }
+        loadOriginal(maxSize: max(1600, previewEdge))
+    }
+
+    /// 启动解码看门狗。CIRAWFilter 对个别 RAW 可能长时间不返回，
+    /// 超时后先让界面进入可重试的失败态，而不是永远停在「正在读取原片…」。
+    private func armLoadTimeout(token: Int) {
+        loadTimeoutWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.loadToken == token, !self.isLoaded else { return }
+            self.isRendering = false
+            self.phaseLabel = ""
+            self.errorMessage = "读取超时"
+            self.loadFailure = "读取原片超时，可能是当前系统不支持该 RAW 格式。"
+            self.flushHandoffs()
+        }
+        loadTimeoutWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.loadTimeout, execute: work)
+    }
+
+    private static func loadFailureText(for error: Error) -> String {
+        "无法解码这张原片，可能是当前系统不支持该 RAW 格式。"
     }
 
     // MARK: - 渲染比例
@@ -477,7 +525,9 @@ final class MobileDevelopSession: ObservableObject {
     // MARK: - 导出
 
     /// 导出请求：`format` 0 sRGB TIFF16、1 ProPhoto 线性 TIFF16、2 ACES 线性 EXR、3 JPEG。
-    func export(format: Int, longEdgeIndex: Int, completion: @escaping (Result<URL, Error>) -> Void) {
+    /// `jpegQuality` 仅在 JPEG 档生效，取值 0…1。
+    func export(format: Int, longEdgeIndex: Int, jpegQuality: Double = 0.95,
+                completion: @escaping (Result<URL, Error>) -> Void) {
         guard !isExporting, let image else {
             completion(.failure(MobileExportError.busy))
             return
@@ -568,7 +618,8 @@ final class MobileDevelopSession: ObservableObject {
                 try FileManager.default.createDirectory(
                     at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try ImageExport.save(output, to: destination, bitDepth: bitDepth,
-                                     colorSpace: colorSpace, cctfEncoding: cctf)
+                                     colorSpace: colorSpace, cctfEncoding: cctf,
+                                     jpegQuality: jpegQuality)
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.isExporting = false

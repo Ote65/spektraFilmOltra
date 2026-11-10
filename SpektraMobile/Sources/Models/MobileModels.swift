@@ -148,12 +148,13 @@ struct MLUT: Identifiable, Hashable {
 }
 
 enum MGradeTab: String, CaseIterable, Identifiable {
-    case presets, adjust, curve
+    case presets, light, color, curve
     var id: String { rawValue }
     var title: String {
         switch self {
         case .presets: return "预设"
-        case .adjust: return "调整"
+        case .light: return "光影"
+        case .color: return "色调"
         case .curve: return "曲线"
         }
     }

@@ -18,7 +18,7 @@ struct GradeScreen: View {
     @State private var panelContentHeight: CGFloat = 0
     @State private var panelViewportHeight: CGFloat = 0
     @State private var drawerChrome: CGFloat = 0
-    @State private var pendingCurveExpand = DebugLaunch.gradeTab == 2
+    @State private var pendingCurveExpand = DebugLaunch.gradeTab == 3
     @State private var exportOpen = DebugLaunch.exportOpen
     @State private var showLUTImporter = false
     @State private var stageSize: CGSize = .zero
@@ -75,10 +75,12 @@ struct GradeScreen: View {
             }
             .padding(.top, insets.top)
 
+            // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
             drawer
-                .padding(.horizontal, 10)
+                .padding(.horizontal, MMetric.floatingPanelInset)
                 .frame(height: drawerHeight)
-                .padding(.bottom, 64 + insets.bottom)
+                .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
+                    + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
 
             toolbar
 
@@ -94,14 +96,16 @@ struct GradeScreen: View {
                     phaseLabel: session.exportLabel,
                     originalLongEdge: session.exportOriginalEdge,
                     canExport: session.sourceReady,
+                    readFailed: session.sourceFailure != nil,
                     onClose: { withAnimation(MMotion.pill) { exportOpen = false } },
                     onReturnHome: {
                         exportOpen = false
                         onGoHome()
                     },
                     onNote: onToast,
-                    onExport: { format, edge, done in
-                        session.export(format: format, longEdgeIndex: edge) { result in
+                    onExport: { format, edge, quality, done in
+                        session.export(format: format, longEdgeIndex: edge,
+                                       jpegQuality: quality) { result in
                             if case .failure = result { onToast("导出失败") }
                             done(result)
                         }
@@ -327,6 +331,12 @@ struct GradeScreen: View {
                 }
             }, perform: {})
 
+            if let failure = session.sourceFailure, !session.sourceReady {
+                sourceFailureCard(failure)
+                    .zIndex(3)
+                    .transition(.opacity)
+            }
+
             VStack {
                 Spacer(minLength: 0)
 
@@ -410,6 +420,42 @@ struct GradeScreen: View {
             }
         }
         .overlay(alignment: .bottom) { MHairline(color: MColor.hairlineFaint) }
+    }
+
+    /// 交接图失败时替代空白画布的失败卡：说明原因并给出重试入口。
+    private func sourceFailureCard(_ message: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 22, weight: .light))
+                .foregroundStyle(MColor.brassHigh)
+            Text("交接图生成失败")
+                .font(.mSans(12, .semibold))
+                .foregroundStyle(MColor.text1)
+            Text(message)
+                .font(.mSans(10, .regular))
+                .foregroundStyle(MColor.text3)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                MHaptic.light()
+                session.retrySource()
+            } label: {
+                Text("重试")
+                    .font(.mSans(11, .semibold))
+                    .foregroundStyle(MColor.brassInk)
+                    .padding(.horizontal, 20)
+                    .frame(height: 32)
+                    .background(Capsule().fill(MColor.brass))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 18)
+        .frame(maxWidth: 270)
+        .mGlassSurface(
+            RoundedRectangle(cornerRadius: 18, style: .continuous),
+            fallbackFill: MColor.surface2.opacity(0.96)
+        )
     }
 
     /// 调色台预览渲染比例菜单：1/8、1/4、1/2、1/1（相对 1600 交接图）。
@@ -506,12 +552,11 @@ struct GradeScreen: View {
                 toggleDrawer()
             }
 
-            MHairline(color: MColor.hairlineFaint)
-
             Group {
-                switch MGradeTab.allCases[min(tabIndex, 2)] {
+                switch MGradeTab.allCases[min(tabIndex, 3)] {
                 case .presets: presetPanel
-                case .adjust: adjustPanel
+                case .light: lightPanel
+                case .color: colorPanel
                 case .curve: curvePanel
                 }
             }
@@ -536,19 +581,16 @@ struct GradeScreen: View {
             )
             .clipped()
         }
-        // 抽屉是悬浮玻璃层：放大后的照片会从下面透出来，而不是被整块实色盖住。
-        .background(
-            ZStack {
-                drawerShape.fill(.ultraThinMaterial)
-                drawerShape.fill(Color.black.opacity(0.30))
-            }
-        )
+        // 抽屉和底部页签胶囊共用同一套原生液态玻璃材质，色调保持一致。
+        .mGlassSurface(drawerShape, fallbackFill: MColor.surface2.opacity(0.96))
         .overlay {
             drawerShape
                 .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
                 .allowsHitTesting(false)
         }
-        .shadow(color: .black.opacity(0.55), radius: 20, y: 8)
+        // 阴影分两层：近处极淡、远处大半径，让边界是渐隐而不是一圈硬黑边。
+        .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
+        .shadow(color: .black.opacity(0.22), radius: 30, y: 12)
         .onPreferenceChange(MPanelHeightKey.self) { height in
             panelContentHeight = height
             syncDrawerToContent()
@@ -605,7 +647,7 @@ struct GradeScreen: View {
     /// 点击 chevron 切换档位；曲线页由 `selectTab` 自动展开，这里只做手动两档。
     private func toggleDrawer() {
         guard !isLockedTab else { return }
-        if tabIndex == 2 { pendingCurveExpand = false }
+        if tabIndex == 3 { pendingCurveExpand = false }
         let target = isDrawerExpanded ? minDrawerHeight : fitDrawerHeight
         withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
             drawerHeight = target
@@ -615,9 +657,9 @@ struct GradeScreen: View {
     /// 切到曲线时自动升到刚好容纳曲线内容的高度；切回其他页时恢复到进入曲线前的高度。
     /// 横向换页与高度变化放在同一次动画里，保证面板和内容一起横移、一起下移。
     private func selectTab(_ index: Int) {
-        guard index != tabIndex, index < 3 else { return }
-        let wasCurve = tabIndex == 2
-        let willCurve = index == 2
+        guard index != tabIndex, index < 4 else { return }
+        let wasCurve = tabIndex == 3
+        let willCurve = index == 3
         var target = drawerHeight
         if willCurve, !wasCurve {
             drawerBeforeCurve = drawerHeight
@@ -800,13 +842,11 @@ struct GradeScreen: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - 调整
+    // MARK: - 光影
 
-    private var adjustPanel: some View {
+    private var lightPanel: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 0) {
-                MSectionHead(title: "光调", trailing: "\(gradeDirtyCount) 项已调").padding(.top, 12)
-
                 MParamSlider(label: "曝光", value: $recipe.exposure, base: 0, range: -5...5, step: 0.05, decimals: 2, suffix: " EV", compact: true)
                 MParamSlider(label: "对比度", value: $recipe.contrast, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
                 MParamSlider(label: "高光", value: $recipe.highlights, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
@@ -815,8 +855,23 @@ struct GradeScreen: View {
                 MParamSlider(label: "黑色", value: $recipe.blacks, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
                 MParamSlider(label: "中间调", value: $recipe.midtones, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
                 MParamSlider(label: "高光柔和", value: $recipe.highlightRolloff, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+            }
+            // 顶部不再放分组标题，滑条直接从抽屉上沿开始。
+            .padding(.top, 4)
+            .padding(.horizontal, MMetric.pageMargin)
+            .padding(.bottom, 14)
+            .background(MPanelHeightReporter())
+        }
+        .scrollIndicators(.never)
+        .defaultScrollAnchor(DebugLaunch.gradePanelBottom ? .bottom : .top)
+    }
 
-                MSectionHead(title: "白平衡").padding(.top, 8)
+    // MARK: - 色调
+
+    private var colorPanel: some View {
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 0) {
+                MSectionHead(title: "白平衡").padding(.top, 4)
 
                 MParamSlider(label: "色温", value: $recipe.temperature, base: 0, range: -100...100, step: 1, decimals: 0, suffix: " CC", compact: true)
                 MParamSlider(label: "色调", value: $recipe.tint, base: 0, range: -100...100, step: 1, decimals: 0, suffix: " CC", compact: true)
@@ -830,52 +885,27 @@ struct GradeScreen: View {
                 MParamSlider(label: "暗角", value: $recipe.vignette, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
                 MParamSlider(label: "颗粒", value: $recipe.grain, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
 
-                HStack(spacing: 8) {
-                    Button {
-                        MHaptic.medium()
-                        withAnimation(MMotion.state) { recipe = MGradeRecipe() }
-                        onToast("调色参数已重置")
-                    } label: {
-                        Text("重置调色")
-                            .font(.mSans(11, .medium))
-                            .foregroundStyle(MColor.text2)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 32)
-                            .background(
-                                RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                                    .fill(MColor.surface2)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                                    .strokeBorder(MColor.hairline, lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        MHaptic.light()
-                        selectTab(2)
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "waveform.path")
-                                .font(.system(size: 10, weight: .medium))
-                            Text("曲线")
-                                .font(.mSans(11, .medium))
-                        }
-                        .foregroundStyle(MColor.brass)
-                        .frame(width: 88)
+                // 曲线已经独立成一个页签，这里不再放重复入口。
+                Button {
+                    MHaptic.medium()
+                    withAnimation(MMotion.state) { recipe = MGradeRecipe() }
+                    onToast("调色参数已重置")
+                } label: {
+                    Text("重置调色")
+                        .font(.mSans(11, .medium))
+                        .foregroundStyle(MColor.text2)
+                        .frame(maxWidth: .infinity)
                         .frame(height: 32)
                         .background(
                             RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                                .fill(MColor.brassWash)
+                                .fill(MColor.surface2)
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                                .strokeBorder(MColor.brass.opacity(0.28), lineWidth: 1)
+                                .strokeBorder(MColor.hairline, lineWidth: 1)
                         )
-                    }
-                    .buttonStyle(.plain)
                 }
+                .buttonStyle(.plain)
                 .padding(.top, 10)
             }
             .padding(.horizontal, MMetric.pageMargin)
@@ -1008,32 +1038,14 @@ struct GradeScreen: View {
         )
     }
 
-    /// 底部只放三个分页；导出由顶栏承担，避免同一动作出现两个入口。
+    /// 底部四个分页：光影 / 色调 取代原来的「调整」合并页。导出由顶栏承担，避免同一动作出现两个入口。
     private var toolItems: [(title: String, icon: String)] {
         [
             ("预设", "rectangle.stack"),
-            ("调整", "slider.horizontal.3"),
+            ("光影", "sun.max"),
+            ("色调", "paintpalette"),
             ("曲线", "waveform.path"),
         ]
-    }
-
-    private var gradeDirtyCount: Int {
-        var count = 0
-        if abs(recipe.exposure) > 1e-9 { count += 1 }
-        if abs(recipe.contrast) > 1e-9 { count += 1 }
-        if abs(recipe.highlights) > 1e-9 { count += 1 }
-        if abs(recipe.shadows) > 1e-9 { count += 1 }
-        if abs(recipe.whites) > 1e-9 { count += 1 }
-        if abs(recipe.blacks) > 1e-9 { count += 1 }
-        if abs(recipe.midtones) > 1e-9 { count += 1 }
-        if abs(recipe.highlightRolloff) > 1e-9 { count += 1 }
-        if abs(recipe.temperature) > 1e-9 { count += 1 }
-        if abs(recipe.tint) > 1e-9 { count += 1 }
-        if abs(recipe.saturation) > 1e-9 { count += 1 }
-        if abs(recipe.vignette) > 1e-9 { count += 1 }
-        if recipe.grain > 1e-9 { count += 1 }
-        if recipe.lutName != "无 LUT" { count += 1 }
-        return count
     }
 
     /// 把拖动后的点曲线折算成引擎已有的四段曲线量（阴影 / 暗部 / 亮部 / 高光）。

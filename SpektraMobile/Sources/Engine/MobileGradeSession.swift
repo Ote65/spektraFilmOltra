@@ -20,6 +20,8 @@ final class MobileGradeSession: ObservableObject {
     /// 导出独立文案，避免被「调色代理 / 调色精修」这类预览阶段覆盖。
     @Published private(set) var exportLabel = ""
     @Published private(set) var errorMessage: String?
+    /// 交接图生成失败的用户可读原因；非 nil 且 sourceReady == false 时界面展示失败态与重试。
+    @Published private(set) var sourceFailure: String?
     @Published private(set) var presets: [GradePreset] = []
     @Published private(set) var luts: [GradeLUTEntry] = []
     @Published private(set) var isExporting = false
@@ -67,6 +69,8 @@ final class MobileGradeSession: ObservableObject {
         isRendering = true
         phaseLabel = "生成交接图"
         phaseProgress = 0
+        sourceFailure = nil
+        errorMessage = nil
         develop.prepareHandoff(maxEdge: sourceEdge) { [weak self] image in
             guard let self else { return }
             guard let image else {
@@ -74,6 +78,7 @@ final class MobileGradeSession: ObservableObject {
                     self.isRendering = false
                     self.phaseLabel = ""
                     self.errorMessage = "交接图生成失败"
+                    self.sourceFailure = "无法生成调色用的交接图，请重试。若仍失败，请返回显影台检查原片。"
                 }
                 return
             }
@@ -85,6 +90,8 @@ final class MobileGradeSession: ObservableObject {
             Task { @MainActor in
                 self.source = linear
                 self.sourceReady = true
+                self.sourceFailure = nil
+                self.errorMessage = nil
                 self.isRendering = false
                 self.phaseLabel = ""
                 self.previewAspect = CGFloat(image.width) / CGFloat(max(1, image.height))
@@ -94,6 +101,12 @@ final class MobileGradeSession: ObservableObject {
                 self.schedule(immediate: true)
             }
         }
+    }
+
+    /// 交接图失败后的手动重试。
+    func retrySource() {
+        guard !sourceReady, !isExporting else { return }
+        start()
     }
 
     func cancel() {
@@ -233,7 +246,9 @@ final class MobileGradeSession: ObservableObject {
 
     // MARK: - 导出
 
-    func export(format: Int, longEdgeIndex: Int, completion: @escaping (Result<URL, Error>) -> Void) {
+    /// `jpegQuality` 仅在 JPEG 档生效，取值 0…1。
+    func export(format: Int, longEdgeIndex: Int, jpegQuality: Double = 0.95,
+                completion: @escaping (Result<URL, Error>) -> Void) {
         guard !isExporting, sourceReady else {
             completion(.failure(MobileExportError.busy))
             return
@@ -282,7 +297,8 @@ final class MobileGradeSession: ObservableObject {
                     try FileManager.default.createDirectory(
                         at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                     try ImageExport.save(output, to: destination, bitDepth: bitDepth,
-                                         colorSpace: targetSpace, cctfEncoding: targetCCTF)
+                                         colorSpace: targetSpace, cctfEncoding: targetCCTF,
+                                         jpegQuality: jpegQuality)
                     Task { @MainActor in
                         guard self.exportToken == current else { return }
                         self.isExporting = false

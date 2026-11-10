@@ -80,6 +80,13 @@ enum MMetric {
     static let navHeight: CGFloat = 44
     static let tabsHeight: CGFloat = 42
     static let touch: CGFloat = 44
+    /// 底部液态玻璃页签胶囊的固定高度与离屏距离。
+    static let tabCapsuleHeight: CGFloat = 50
+    static let tabCapsuleBottom: CGFloat = 8
+    /// 参数面板悬浮在胶囊上方时留出的呼吸间距：面板底边与胶囊顶边之间保持 14pt。
+    static let floatingPanelGap: CGFloat = 14
+    /// 参数面板左右留边：比胶囊略宽，读起来是「浮在胶囊上的窗口」而不是贴边抽屉。
+    static let floatingPanelInset: CGFloat = 12
     static let drawerMin: CGFloat = 234
     static let drawerMid: CGFloat = 468
     static let drawerMax: CGFloat = 560
@@ -243,7 +250,8 @@ enum DebugLaunch {
         guard let index = args.firstIndex(of: "--tab"), args.indices.contains(index + 1) else { return 1 }
         switch args[index + 1] {
         case "presets": return 0
-        case "curve": return 2
+        case "color": return 2
+        case "curve": return 3
         default: return 1
         }
     }

@@ -67,10 +67,12 @@ struct DevelopScreen: View {
             }
             .padding(.top, insets.top)
 
+            // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
             drawer
-                .padding(.horizontal, 10)
+                .padding(.horizontal, MMetric.floatingPanelInset)
                 .frame(height: drawerHeight)
-                .padding(.bottom, 64 + insets.bottom)
+                .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
+                    + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
 
             tabBar
 
@@ -84,17 +86,18 @@ struct DevelopScreen: View {
                 MExportSheet(
                     filename: session.filename,
                     phaseLabel: session.exportLabel,
-                    phaseProgress: session.isExporting ? session.exportProgress : nil,
                     originalLongEdge: session.exportOriginalEdge,
                     canExport: session.isLoaded,
+                    readFailed: session.loadFailure != nil,
                     onClose: { withAnimation(MMotion.pill) { exportOpen = false } },
                     onReturnHome: {
                         exportOpen = false
                         onBack()
                     },
                     onNote: onToast,
-                    onExport: { format, edge, done in
-                        session.export(format: format, longEdgeIndex: edge) { result in
+                    onExport: { format, edge, quality, done in
+                        session.export(format: format, longEdgeIndex: edge,
+                                       jpegQuality: quality) { result in
                             if case .failure = result { onToast("导出失败") }
                             done(result)
                         }
@@ -288,6 +291,12 @@ struct DevelopScreen: View {
                 }
             }, perform: {})
 
+            if let failure = session.loadFailure, !session.isLoaded {
+                loadFailureCard(failure)
+                    .zIndex(3)
+                    .transition(.opacity)
+            }
+
             cropMarks
                 .zIndex(2)
 
@@ -314,6 +323,42 @@ struct DevelopScreen: View {
         .overlay(alignment: .bottom) {
             MHairline(color: MColor.hairlineFaint)
         }
+    }
+
+    /// 原片读取失败时替代空白画布的失败卡：说明原因并给出重试入口。
+    private func loadFailureCard(_ message: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 22, weight: .light))
+                .foregroundStyle(MColor.brassHigh)
+            Text("原片读取失败")
+                .font(.mSans(12, .semibold))
+                .foregroundStyle(MColor.text1)
+            Text(message)
+                .font(.mSans(10, .regular))
+                .foregroundStyle(MColor.text3)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                MHaptic.light()
+                session.retryLoad()
+            } label: {
+                Text("重试")
+                    .font(.mSans(11, .semibold))
+                    .foregroundStyle(MColor.brassInk)
+                    .padding(.horizontal, 20)
+                    .frame(height: 32)
+                    .background(Capsule().fill(MColor.brass))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 18)
+        .frame(maxWidth: 270)
+        .mGlassSurface(
+            RoundedRectangle(cornerRadius: 18, style: .continuous),
+            fallbackFill: MColor.surface2.opacity(0.96)
+        )
     }
 
     private var previewMeta: some View {
@@ -486,19 +531,16 @@ struct DevelopScreen: View {
             .animation(MMotion.state, value: mode)
             .frame(maxHeight: .infinity)
         }
-        // 抽屉是悬浮玻璃层：放大后的照片会从下面透出来，而不是被整块实色盖住。
-        .background(
-            ZStack {
-                drawerShape.fill(.ultraThinMaterial)
-                drawerShape.fill(Color.black.opacity(0.30))
-            }
-        )
+        // 抽屉和底部页签胶囊共用同一套原生液态玻璃材质，色调保持一致。
+        .mGlassSurface(drawerShape, fallbackFill: MColor.surface2.opacity(0.96))
         .overlay {
             drawerShape
                 .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
                 .allowsHitTesting(false)
         }
-        .shadow(color: .black.opacity(0.55), radius: 20, y: 8)
+        // 阴影分两层：近处极淡、远处大半径，让边界是渐隐而不是一圈硬黑边。
+        .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
+        .shadow(color: .black.opacity(0.22), radius: 30, y: 12)
         .overlay(alignment: .topTrailing) {
             MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
                 session.undo()
@@ -620,7 +662,9 @@ struct DevelopScreen: View {
         VStack(alignment: .leading, spacing: 8) {
             railTitle("胶片")
 
-            MHScrollRail(itemCount: MobileCatalog.films.count, itemHeight: 52) {
+            MHScrollRail(itemCount: MobileCatalog.films.count,
+                         leading: MMetric.pageMargin, itemHeight: 52,
+                         fadeColor: .clear) {
                 ForEach(MobileCatalog.films) { film in
                     MFilmRailItem(film: film, selected: film.id == session.filmID) {
                         MHaptic.tick()
@@ -629,6 +673,8 @@ struct DevelopScreen: View {
                 }
             }
             .frame(height: 52)
+            // 滚动行铺满 sheet 宽度：只保留首项对齐标题的左边距，两侧不再有渐隐边框。
+            .padding(.horizontal, -MMetric.pageMargin)
         }
     }
 
@@ -636,7 +682,9 @@ struct DevelopScreen: View {
         VStack(alignment: .leading, spacing: 8) {
             railTitle("相纸")
 
-            MHScrollRail(itemCount: MobileCatalog.papers.count, itemHeight: 52) {
+            MHScrollRail(itemCount: MobileCatalog.papers.count,
+                         leading: MMetric.pageMargin, itemHeight: 52,
+                         fadeColor: .clear) {
                 ForEach(MobileCatalog.papers) { paper in
                     MPaperRailItem(paper: paper, selected: paper.id == session.paperID) {
                         MHaptic.tick()
@@ -645,6 +693,7 @@ struct DevelopScreen: View {
                 }
             }
             .frame(height: 52)
+            .padding(.horizontal, -MMetric.pageMargin)
         }
     }
 
@@ -666,7 +715,8 @@ struct DevelopScreen: View {
             }
 
             MHScrollRail(itemCount: MFilmBorderPreset.all.count, itemWidth: 86,
-                         spacing: 8, trailing: 22, itemHeight: 84) {
+                         spacing: 8, leading: MMetric.pageMargin, trailing: 22,
+                         itemHeight: 84, fadeColor: .clear) {
                 ForEach(MFilmBorderPreset.all) { preset in
                     MFilmBorderPresetCard(
                         preset: preset,
@@ -678,6 +728,7 @@ struct DevelopScreen: View {
                 }
             }
             .frame(height: 84)
+            .padding(.horizontal, -MMetric.pageMargin)
         }
     }
 
@@ -1363,25 +1414,33 @@ struct DevelopScreen: View {
 
 // MARK: - 导出面板
 
+/// 导出面板：居中浮卡、四个圆角、无顶部横条。
+/// 选项按参考图排成「标签 + 下拉行」；保存动画只走「转圈 → 对勾」两拍，不显示进度条。
 struct MExportSheet: View {
     let filename: String
     let phaseLabel: String
-    /// 0…1 的导出进度；只有在调用方发布进度时才传，否则退回转圈。
-    var phaseProgress: Double? = nil
-    /// 原图真实长边，用于把「原始」档显示成「原始 4032」，避免用户猜导出尺寸。
+    /// 原图真实长边，用于「最大可用尺寸」的具体像素数。
     var originalLongEdge: Int = 0
-    /// 原片还没读完时不能导出：`session.export` 会以 `.busy` 立刻失败，面板会闪回 idle。
+    /// 原片还没读完时不能导出：`session.export` 会以 `.busy` 立刻失败。
     var canExport: Bool = true
+    /// 读取已经失败（而不是仍在读取），副标题需要给出失败提示而不是「正在读取原片…」。
+    var readFailed: Bool = false
     let onClose: () -> Void
     let onReturnHome: () -> Void
     /// 相册写入是后台静默的，失败时用调用方的 toast 说明「文件已在 App 内」。
     var onNote: (String) -> Void = { _ in }
-    let onExport: (Int, Int, @escaping (Result<URL, Error>) -> Void) -> Void
+    let onExport: (Int, Int, Double, @escaping (Result<URL, Error>) -> Void) -> Void
 
-    @State private var format = 0
-    /// 默认导出必须是原图全分辨率；2048/4096 只在用户主动选择时才缩小。
-    @State private var longEdge = 0
+    /// 指针指向 `formats` 的下标；默认 JPEG，和参考图一致。
+    @State private var formatIndex = 0
+    /// 0 最大可用尺寸、1 2048、2 4096。
+    @State private var edgeIndex = 0
+    /// 0 100%、1 95%、2 90%、3 80%。
+    @State private var qualityIndex = 1
+    @State private var showMore = false
     @State private var phase: MExportPhase = .idle
+    /// 完成对勾的入场动画开关。
+    @State private var donePop = false
     @Environment(\.mSafeInsets) private var insets
 
     private enum MExportPhase {
@@ -1390,24 +1449,35 @@ struct MExportSheet: View {
         case done
     }
 
-    private let formats: [(title: String, meta: String)] = [
-        ("TIFF 16-bit", "sRGB · 可逆"),
-        ("TIFF 16-bit", "ProPhoto 线性"),
-        ("EXR half", "ACES 线性"),
-        ("JPEG 95%", "快速分享"),
-    ]
-    private let edges = ["原始", "2048", "4096"]
+    private struct Format {
+        /// 引擎档位：0 sRGB TIFF16、1 ProPhoto TIFF16、2 ACES EXR、3 JPEG。
+        let id: Int
+        let title: String
+        let space: String
+        let bitDepth: String
+    }
 
-    /// 居中浮卡：宽度贴屏幕留边，超宽机型封顶。
-    private var cardWidth: CGFloat { min(insets.size.width - 36, 520) }
+    private let formats: [Format] = [
+        Format(id: 3, title: "JPEG", space: "sRGB", bitDepth: "8-bit"),
+        Format(id: 0, title: "TIFF · sRGB 16-bit", space: "sRGB", bitDepth: "16-bit"),
+        Format(id: 1, title: "TIFF · ProPhoto 16-bit", space: "ProPhoto RGB", bitDepth: "16-bit 线性"),
+        Format(id: 2, title: "EXR · ACES half", space: "ACES2065-1", bitDepth: "16-bit half"),
+    ]
+    private let qualityValues = [100, 95, 90, 80]
+
+    private var format: Format { formats[min(formatIndex, formats.count - 1)] }
+    private var isJPEG: Bool { format.id == 3 }
+
+    /// 居中浮卡：收窄成小窗，左右留白更足。
+    private var cardWidth: CGFloat { min(insets.size.width - 64, 330) }
 
     var body: some View {
         ZStack {
             // scrim：导出进行中不允许点空白关闭，防止半途丢上下文。
-            Color.black.opacity(0.55)
+            Color.black.opacity(0.62)
                 .ignoresSafeArea()
                 .onTapGesture {
-                    guard phase == .idle else { return }
+                    guard phase != .exporting else { return }
                     withAnimation(MMotion.pill) { onClose() }
                 }
                 .transition(.opacity)
@@ -1415,8 +1485,6 @@ struct MExportSheet: View {
             card
                 .transition(.scale(0.94).combined(with: .opacity))
         }
-        .onChange(of: format) { _, _ in resetPhaseAfterOptionChange() }
-        .onChange(of: longEdge) { _, _ in resetPhaseAfterOptionChange() }
         // 截图验收：等原片读完再自动开跑导出（原片没读完时 export 会以 .busy 立刻失败）
         .onChange(of: canExport) { _, ready in
             guard ready, DebugLaunch.exportAutoStart, phase == .idle else { return }
@@ -1431,57 +1499,71 @@ struct MExportSheet: View {
 
     private var card: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                MCircleIconButton(icon: "xmark", size: 11, frame: 34, action: {
-                    withAnimation(MMotion.pill) { onClose() }
-                })
-                Spacer()
-                Text(phase == .done ? "导出完成" : "导出设置")
-                    .font(.mSans(15, .semibold))
-                    .foregroundStyle(MColor.text1)
-                    .dynamicTypeSize(...DynamicTypeSize.accessibility1)
-                Spacer()
-                confirmButton
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 18)
+            header
 
             Text(subtitle)
-                .mMeta(9.5, color: MColor.text3)
-                .padding(.top, 12)
+                .font(.mSans(12, .medium))
+                .foregroundStyle(phase == .done ? MColor.brass : MColor.text3)
+                .multilineTextAlignment(.center)
+                .padding(.top, 8)
+                .padding(.horizontal, 20)
 
             switch phase {
             case .idle:
                 optionRows
-            case .exporting:
-                exportingBlock
-            case .done:
-                doneBlock
+            case .exporting, .done:
+                statusBlock
             }
         }
-        .padding(.bottom, 18)
+        .padding(.bottom, 14)
         .frame(width: cardWidth)
-        .background(
+        .background {
             ZStack {
                 RoundedRectangle(cornerRadius: MRadius.sheet, style: .continuous)
                     .fill(.ultraThinMaterial)
                 RoundedRectangle(cornerRadius: MRadius.sheet, style: .continuous)
-                    .fill(MColor.surface1.opacity(0.88))
+                    .fill(MColor.surface1.opacity(0.92))
             }
-        )
+        }
         .overlay {
             RoundedRectangle(cornerRadius: MRadius.sheet, style: .continuous)
                 .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.5), radius: 28, y: 10)
+        .shadow(color: .black.opacity(0.55), radius: 26, y: 10)
     }
 
-    private var subtitle: String {
-        switch phase {
-        case .idle: return "\(filename) · 副本将保存到设备"
-        case .exporting: return phaseLabel.isEmpty ? "正在印相…" : phaseLabel
-        case .done: return "副本已保存到设备"
+    private var header: some View {
+        HStack(spacing: 10) {
+            Button {
+                guard phase != .exporting else { return }
+                MHaptic.light()
+                withAnimation(MMotion.pill) { onClose() }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(MColor.text2)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(MColor.surface3))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(phase == .exporting)
+            .opacity(phase == .exporting ? 0.35 : 1)
+            .accessibilityLabel("关闭")
+
+            Spacer(minLength: 0)
+
+            Text(phaseTitle)
+                .font(.mSans(15, .semibold))
+                .foregroundStyle(MColor.text1)
+                .lineLimit(1)
+
+            Spacer(minLength: 0)
+
+            confirmButton
         }
+        .padding(.horizontal, 14)
+        .padding(.top, 14)
     }
 
     private var confirmButton: some View {
@@ -1497,153 +1579,319 @@ struct MExportSheet: View {
         } label: {
             ZStack {
                 Circle()
-                    .fill(phase == .exporting ? MColor.surface2 : MColor.brass)
-                if phase == .exporting {
-                    ProgressView()
-                        .tint(MColor.text1)
-                } else {
+                    .fill(phase == .exporting ? MColor.surface3 : MColor.brass)
+                switch phase {
+                case .exporting:
+                    // 进行中的转圈只留在卡片中央，右上角退成禁用态，避免两个转圈抢视线。
                     Image(systemName: "checkmark")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(phase == .idle && !canExport ? MColor.text4 : MColor.text1)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(MColor.text4)
+                case .idle:
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(canExport ? MColor.brassInk : MColor.text4)
+                case .done:
+                    Image(systemName: "house.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(MColor.brassInk)
                 }
             }
-            .frame(width: 34, height: 34)
-            .opacity(phase == .idle && !canExport ? 0.4 : 1)
+            .frame(width: 32, height: 32)
+            .opacity(phase == .idle && !canExport ? 0.35 : 1)
         }
         .buttonStyle(.plain)
         .disabled(phase == .exporting || (phase == .idle && !canExport))
         .accessibilityLabel(phase == .done ? "完成并返回" : "确认导出")
     }
 
-    // MARK: - 选项区（对照参考图：标签 + 下拉行）
+    private var phaseTitle: String {
+        switch phase {
+        case .idle: return "导出设置"
+        case .exporting: return "正在导出"
+        case .done: return "导出完成"
+        }
+    }
+
+    private var subtitle: String {
+        switch phase {
+        case .idle:
+            if canExport { return "副本将保存到设备" }
+            return readFailed ? "原片读取失败，请返回重试" : "正在读取原片…"
+        case .exporting:
+            return phaseLabel.isEmpty ? "正在印相…" : phaseLabel
+        case .done:
+            return "副本已保存到设备"
+        }
+    }
+
+    // MARK: 选项
 
     private var optionRows: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            menuRow(label: "文件类型", value: formats[format].title, meta: formats[format].meta) {
-                ForEach(Array(formats.enumerated()), id: \.offset) { item in
-                    Button("\(item.element.title) · \(item.element.meta)") {
-                        MHaptic.tick()
-                        withAnimation(MMotion.state) { format = item.offset }
-                    }
-                }
-            }
+        VStack(alignment: .leading, spacing: 10) {
+            field("文件类型") { formatField }
+            field("尺寸") { edgeField }
+            field("图像品质") { qualityField }
 
-            menuRow(label: "尺寸", value: edgeTitle(longEdge), meta: "长边 · 像素") {
-                ForEach(Array(edges.enumerated()), id: \.offset) { item in
-                    Button(edgeTitle(item.offset)) {
-                        MHaptic.tick()
-                        withAnimation(MMotion.state) { longEdge = item.offset }
-                    }
-                }
-            }
+            hairline
 
-            MBrassPill(
-                title: canExport ? "导出 \(formats[format].title)" : "正在读取原片",
-                icon: canExport ? "square.and.arrow.up" : nil,
-                height: 46,
-                fullWidth: true,
-                disabled: !canExport
-            ) {
-                beginExport()
-            }
+            moreOptions
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 18)
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 2)
     }
 
-    private var exportingBlock: some View {
-        VStack(spacing: 14) {
-            if let phaseProgress {
-                MExportProgressRow(label: phaseLabel, progress: phaseProgress, height: 46)
-            } else {
-                MBrassPill(title: phaseLabel.isEmpty ? "导出中" : phaseLabel,
-                           height: 46, fullWidth: true, disabled: true, loading: true) {}
-            }
-        }
-        .padding(.horizontal, 18)
-        .padding(.top, 18)
-    }
-
-    private var doneBlock: some View {
-        VStack(spacing: 14) {
-            MBrassPill(
-                title: "返回主页",
-                icon: "house",
-                height: 46,
-                fullWidth: true
-            ) {
-                withAnimation(MMotion.pill) { onReturnHome() }
-            }
-        }
-        .padding(.horizontal, 18)
-        .padding(.top, 18)
-    }
-
-    /// 参考图样式的下拉行：左侧固定标签，右侧当前值 + 下拉箭头，点按弹原生 Menu。
-    private func menuRow<Content: View>(
-        label: String, value: String, meta: String,
-        @ViewBuilder items: () -> Content
-    ) -> some View {
+    private var formatField: some View {
         Menu {
-            items()
-        } label: {
-            HStack(spacing: 10) {
-                Text(label)
-                    .font(.mSans(12, .medium))
-                    .foregroundStyle(MColor.text2)
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(value)
-                        .font(.mSans(12, .medium).monospacedDigit())
-                        .foregroundStyle(MColor.text1)
-                        .lineLimit(1)
-                    Text(meta)
-                        .mMeta(8.5, color: MColor.text3)
-                        .lineLimit(1)
+            ForEach(Array(formats.enumerated()), id: \.offset) { item in
+                Button {
+                    MHaptic.tick()
+                    withAnimation(MMotion.state) { formatIndex = item.offset }
+                } label: {
+                    if item.offset == formatIndex {
+                        Label(item.element.title, systemImage: "checkmark")
+                    } else {
+                        Text(item.element.title)
+                    }
                 }
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(MColor.text3)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 54)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(MColor.surface2.opacity(0.6))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(MColor.hairline, lineWidth: 1)
-            )
-            .contentShape(Rectangle())
+        } label: {
+            fieldChrome {
+                Text(format.title)
+                    .font(.mSans(13.5, .medium))
+                    .foregroundStyle(MColor.text1)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
         }
         .menuStyle(.button)
         .menuIndicator(.hidden)
-        .accessibilityLabel(label)
-        .accessibilityValue(value)
+        .accessibilityLabel("文件类型")
+        .accessibilityValue(format.title)
     }
 
-    /// 导出完成后再改格式/长边：按钮回到「导出」，避免用户以为已经按新参数导过。
-    private func resetPhaseAfterOptionChange() {
-        guard phase == .done else { return }
-        withAnimation(MMotion.state) { phase = .idle }
+    private var edgeField: some View {
+        Menu {
+            ForEach(0..<3, id: \.self) { index in
+                Button {
+                    MHaptic.tick()
+                    withAnimation(MMotion.state) { edgeIndex = index }
+                } label: {
+                    if index == edgeIndex {
+                        Label(edgeTitle(index), systemImage: "checkmark")
+                    } else {
+                        Text(edgeTitle(index))
+                    }
+                }
+            }
+        } label: {
+            fieldChrome {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(edgeTitle(edgeIndex))
+                        .font(.mSans(13.5, .medium))
+                        .foregroundStyle(MColor.text1)
+                        .lineLimit(1)
+                    Text(edgeMeta)
+                        .mMeta(9, color: MColor.text3)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .accessibilityLabel("尺寸")
+        .accessibilityValue(edgeTitle(edgeIndex))
     }
+
+    @ViewBuilder
+    private var qualityField: some View {
+        if isJPEG {
+            Menu {
+                ForEach(Array(qualityValues.enumerated()), id: \.offset) { item in
+                    Button {
+                        MHaptic.tick()
+                        withAnimation(MMotion.state) { qualityIndex = item.offset }
+                    } label: {
+                        if item.offset == qualityIndex {
+                            Label("\(item.element)%", systemImage: "checkmark")
+                        } else {
+                            Text("\(item.element)%")
+                        }
+                    }
+                }
+            } label: {
+                fieldChrome {
+                    Text("\(qualityValues[min(qualityIndex, qualityValues.count - 1)])%")
+                        .font(.mSans(13.5, .medium).monospacedDigit())
+                        .foregroundStyle(MColor.text1)
+                }
+            }
+            .menuStyle(.button)
+            .menuIndicator(.hidden)
+            .accessibilityLabel("图像品质")
+        } else {
+            fieldChrome(chevron: false) {
+                HStack(spacing: 7) {
+                    Text("无损")
+                        .font(.mSans(13.5, .medium))
+                        .foregroundStyle(MColor.text2)
+                    Text("· \(format.bitDepth)")
+                        .mMeta(9.5, color: MColor.text3)
+                }
+            }
+            .accessibilityLabel("图像品质")
+            .accessibilityValue("无损")
+        }
+    }
+
+    private var moreOptions: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                MHaptic.tick()
+                withAnimation(MMotion.state) { showMore.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    Text("更多选项")
+                        .font(.mSans(12.5, .medium))
+                        .foregroundStyle(MColor.text2)
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(MColor.text3)
+                        .rotationEffect(.degrees(showMore ? 90 : 0))
+                }
+                .frame(height: 28)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showMore {
+                VStack(spacing: 8) {
+                    infoRow("文件名", filename)
+                    infoRow("色彩空间", format.space)
+                    infoRow("位深", format.bitDepth)
+                    infoRow("输出长边", edgeMeta)
+                    infoRow("保存位置", "相册 · 文件 App")
+                }
+                .padding(.top, 6)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+
+    /// 保存动画只走两拍：转圈 → 对勾。不放进度条，也不再展开选项行。
+    private var statusBlock: some View {
+        Group {
+            switch phase {
+            case .exporting:
+                ProgressView()
+                    .tint(MColor.text2)
+                    .scaleEffect(1.15)
+                    .transition(.opacity.combined(with: .scale(0.7)))
+            case .done:
+                Image(systemName: "checkmark")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(MColor.brassInk)
+                    .frame(width: 52, height: 52)
+                    .background(Circle().fill(MColor.brass))
+                    .scaleEffect(donePop ? 1 : 0.55)
+                    .opacity(donePop ? 1 : 0)
+                    .onAppear {
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.6)) {
+                            donePop = true
+                        }
+                    }
+            case .idle:
+                EmptyView()
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 40)
+    }
+
+    // MARK: 组件
+
+    private func field<Content: View>(
+        _ label: String, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label)
+                .font(.mSans(11, .medium))
+                .foregroundStyle(MColor.text3)
+            content()
+        }
+    }
+
+    private func fieldChrome<Content: View>(
+        chevron: Bool = true, @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(spacing: 8) {
+            content()
+            Spacer(minLength: 0)
+            if chevron {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(MColor.text3)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 42)
+        .background(
+            RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
+                .fill(MColor.surface2.opacity(0.75))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
+                .strokeBorder(MColor.hairline, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+    }
+
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .mMeta(10, color: MColor.text3)
+            Spacer(minLength: 0)
+            Text(value)
+                .font(.mSans(10.5, .medium))
+                .foregroundStyle(MColor.text2)
+                .lineLimit(1)
+        }
+    }
+
+    private var hairline: some View {
+        Rectangle()
+            .fill(MColor.hairline)
+            .frame(height: 1)
+    }
+
+    // MARK: 行为
 
     private func edgeTitle(_ index: Int) -> String {
-        if index == 0, originalLongEdge > 0 {
-            return "原始 \(originalLongEdge)"
+        index == 0 ? "最大可用尺寸" : (index == 1 ? "2048 px" : "4096 px")
+    }
+
+    private var edgeMeta: String {
+        switch edgeIndex {
+        case 0:
+            return originalLongEdge > 0 ? "原图长边 \(originalLongEdge) px" : "按原图长边"
+        case 1:
+            return "长边 2048 px"
+        default:
+            return "长边 4096 px"
         }
-        return index >= 0 && index < edges.count ? edges[index] : "原始"
     }
 
     private func beginExport() {
-        guard phase == .idle else { return }
+        guard phase == .idle, canExport else { return }
         MHaptic.medium()
-        phase = .exporting
-        onExport(format, longEdge) { result in
+        donePop = false
+        withAnimation(MMotion.state) { phase = .exporting }
+        let quality = isJPEG ? Double(qualityValues[min(qualityIndex, qualityValues.count - 1)]) / 100 : 0.95
+        onExport(format.id, edgeIndex, quality) { result in
             switch result {
             case .success(let url):
-                // 相册写入静默进行：成功不打扰，失败/被拒时必须告诉用户文件还在 App 内。
+                // 默认保存到相册：成功不打扰，失败/被拒时必须告诉用户文件还在 App 内。
                 PhotoLibraryExport.save(url) { outcome in
                     switch outcome {
                     case .saved:
@@ -1661,3 +1909,4 @@ struct MExportSheet: View {
         }
     }
 }
+
