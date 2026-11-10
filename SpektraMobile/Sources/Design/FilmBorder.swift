@@ -14,6 +14,7 @@ import SwiftUI
 enum MFilmBorderGauge: String, CaseIterable, Identifiable {
     case full135
     case half135
+    case xpan
     case roll645
     case roll66
     case roll67
@@ -29,6 +30,7 @@ enum MFilmBorderGauge: String, CaseIterable, Identifiable {
         switch self {
         case .full135: return "135 全画幅"
         case .half135: return "135 半格"
+        case .xpan: return "XPan 宽幅"
         case .roll645: return "120 645"
         case .roll66: return "120 6×6"
         case .roll67: return "120 6×7"
@@ -45,6 +47,7 @@ enum MFilmBorderGauge: String, CaseIterable, Identifiable {
         switch self {
         case .full135: return 36
         case .half135: return 24
+        case .xpan: return 65
         case .roll645: return 56
         case .roll66: return 56
         case .roll67: return 70
@@ -59,7 +62,7 @@ enum MFilmBorderGauge: String, CaseIterable, Identifiable {
     /// 齿孔边到画幅边的留边（mm），已按规格取半宽。
     var marginPerfMM: Double {
         switch self {
-        case .full135: return 5.5
+        case .full135, .xpan: return 5.5
         case .half135: return 8.5
         case .roll645, .roll66, .roll67, .roll69: return 2.5
         case .sheet45: return 3.5
@@ -72,7 +75,7 @@ enum MFilmBorderGauge: String, CaseIterable, Identifiable {
     /// 画幅两端的留边（mm），即上下片之间的间隔摊到单侧。
     var marginEndMM: Double {
         switch self {
-        case .full135, .half135: return 2.0
+        case .full135, .half135, .xpan: return 2.0
         case .roll645, .roll66, .roll67, .roll69: return 2.5
         case .sheet45: return 4.0
         case .cart110: return 2.0
@@ -83,8 +86,7 @@ enum MFilmBorderGauge: String, CaseIterable, Identifiable {
 
     var defaultPerf: MFilmBorderPerf {
         switch self {
-        case .full135: return .ks
-        case .half135: return .ks
+        case .full135, .half135, .xpan: return .ks
         case .roll645, .roll66, .roll67, .roll69: return .none
         case .sheet45: return .none
         case .cart110: return .single110
@@ -103,8 +105,36 @@ enum MFilmBorderGauge: String, CaseIterable, Identifiable {
 
     var isSheet: Bool { self == .sheet45 }
 
-    /// 135 全画幅与半格共用同一套片边比例；其它幅面的片边仍按机械尺寸换算。
-    var is135: Bool { self == .full135 || self == .half135 }
+    /// 画幅宽高比（宽 / 高），用于预设缩略图取景，让每张卡片的比例一眼可辨。
+    var frameAspect: Double {
+        switch self {
+        case .full135: return 3.0 / 2.0
+        case .half135: return 2.0 / 3.0
+        case .xpan: return 65.0 / 24.0
+        case .roll645: return 4.0 / 3.0
+        case .roll66: return 1.0
+        case .roll67: return 7.0 / 6.0
+        case .roll69: return 3.0 / 2.0
+        case .sheet45: return 5.0 / 4.0
+        case .cart110: return 17.0 / 13.0
+        case .cine16: return 4.0 / 3.0
+        case .cine35: return 16.0 / 9.0
+        }
+    }
+
+    /// 视觉比例下片边占长边的比例（齿孔侧 / 画幅两端）。
+    /// 135 按机械尺寸会把照片压成一条，收到 7.5% 才接近参考扫描件；
+    /// 120 与页片本来只有 2.5–3.5mm 留边，比例上略收一点即可。
+    var visualMarginRatio: (perf: Double, end: Double) {
+        switch self {
+        case .full135, .half135, .xpan: return (0.075, 0.012)
+        case .roll645, .roll66, .roll67, .roll69: return (0.045, 0.020)
+        case .sheet45: return (0.030, 0.030)
+        case .cart110: return (0.080, 0.060)
+        case .cine16: return (0.100, 0.020)
+        case .cine35: return (0.090, 0.020)
+        }
+    }
 }
 
 enum MFilmBorderPerf: String, CaseIterable, Identifiable {
@@ -205,16 +235,32 @@ enum MFilmBorderBase: String, CaseIterable, Identifiable {
     case colorNegative
     case bw
     case reversal
+    case graphite
     case clear
+    case ivory
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .colorNegative: return "彩负片基"
-        case .bw: return "黑白片基"
-        case .reversal: return "反转片基"
-        case .clear: return "透明片基"
+        case .colorNegative: return "暖黑"
+        case .bw: return "中性黑"
+        case .reversal: return "冷黑"
+        case .graphite: return "石墨灰"
+        case .clear: return "琥珀"
+        case .ivory: return "暖白"
+        }
+    }
+
+    /// 片基 sRGB 基色：渲染与取色板共用同一组数值，避免两边对不上。
+    var rgb: (Double, Double, Double) {
+        switch self {
+        case .colorNegative: return (0.046, 0.040, 0.033)
+        case .bw: return (0.036, 0.035, 0.032)
+        case .reversal: return (0.020, 0.019, 0.017)
+        case .graphite: return (0.200, 0.205, 0.215)
+        case .clear: return (0.600, 0.460, 0.290)
+        case .ivory: return (0.860, 0.820, 0.730)
         }
     }
 }
@@ -365,34 +411,59 @@ struct MFilmBorderPreset: Identifiable, Hashable {
     static let all: [MFilmBorderPreset] = [
         none,
         MFilmBorderPreset(
-            id: "kodak135", name: "135 柯达", note: "KS 齿孔 · 边码",
+            id: "kodak135", name: "135 方格", note: "KS 齿孔 · 边码",
             config: presetConfig("kodak135", gauge: .full135, base: .colorNegative,
                                  corner: .square, tone: .auto, dx: true)
         ),
         MFilmBorderPreset(
-            id: "fuji135", name: "135 富士", note: "KS 齿孔 · 绿边字",
-            config: presetConfig("fuji135", gauge: .full135, base: .colorNegative,
-                                 corner: .square, tone: .green, dx: true)
+            id: "half135", name: "135 半格", note: "竖条 · 单列孔",
+            config: presetConfig("half135", gauge: .half135, base: .colorNegative,
+                                 corner: .square, tone: .auto, dx: true)
         ),
         MFilmBorderPreset(
-            id: "bw135", name: "135 黑白", note: "灰片基 · 白边字",
-            config: presetConfig("bw135", gauge: .full135, base: .bw,
-                                 corner: .square, tone: .white, dx: true)
+            id: "xpan", name: "XPan", note: "宽幅 · 双边码",
+            config: presetConfig("xpan", gauge: .xpan, base: .colorNegative,
+                                 corner: .square, tone: .auto, dx: true)
         ),
         MFilmBorderPreset(
-            id: "cine135", name: "35mm 电影", note: "BH 齿孔 · 宽片边",
-            config: presetConfig("cine135", gauge: .cine35, base: .reversal,
-                                 corner: .square, tone: .white, dx: false)
-        ),
-        MFilmBorderPreset(
-            id: "roll120", name: "120 中画幅", note: "无边孔 · 编号",
-            config: presetConfig("roll120", gauge: .roll66, base: .colorNegative,
+            id: "roll645", name: "645", note: "120 · 细边",
+            config: presetConfig("roll645", gauge: .roll645, base: .colorNegative,
                                  corner: .square, tone: .auto, dx: false)
         ),
         MFilmBorderPreset(
-            id: "sheet45", name: "4×5 页片", note: "片缺口 · 导轨边",
+            id: "roll66", name: "6×6", note: "120 · 方形",
+            config: presetConfig("roll66", gauge: .roll66, base: .colorNegative,
+                                 corner: .square, tone: .auto, dx: false)
+        ),
+        MFilmBorderPreset(
+            id: "roll67", name: "6×7", note: "120 · 竖幅",
+            config: presetConfig("roll67", gauge: .roll67, base: .colorNegative,
+                                 corner: .square, tone: .auto, dx: false)
+        ),
+        MFilmBorderPreset(
+            id: "roll69", name: "6×9", note: "120 · 宽幅",
+            config: presetConfig("roll69", gauge: .roll69, base: .colorNegative,
+                                 corner: .square, tone: .auto, dx: false)
+        ),
+        MFilmBorderPreset(
+            id: "sheet45", name: "4×5", note: "页片 · 缺口",
             config: presetConfig("sheet45", gauge: .sheet45, base: .bw,
                                  corner: .square, tone: .white, dx: false)
+        ),
+        MFilmBorderPreset(
+            id: "cine35", name: "35mm 电影", note: "BH 齿孔",
+            config: presetConfig("cine35", gauge: .cine35, base: .reversal,
+                                 corner: .square, tone: .white, dx: false)
+        ),
+        MFilmBorderPreset(
+            id: "cine16", name: "16mm 电影", note: "单排孔",
+            config: presetConfig("cine16", gauge: .cine16, base: .reversal,
+                                 corner: .square, tone: .white, dx: false)
+        ),
+        MFilmBorderPreset(
+            id: "cart110", name: "110", note: "暗盒 · 单排孔",
+            config: presetConfig("cart110", gauge: .cart110, base: .colorNegative,
+                                 corner: .square, tone: .auto, dx: false)
         ),
     ]
 
@@ -577,14 +648,15 @@ enum MFilmBorderRenderer {
         let longSide = max(photo.width, photo.height)
         let shortSide = min(photo.width, photo.height)
         let pxPerMM = longSide / CGFloat(gauge.frameLongMM)
-        // 视觉比例只用于 135：真实 5.5mm 片边会把照片压成一条，与参考图观感差距过大。
-        let visual = gauge.is135 && config.widthModeValue == .visual
+        // 视觉比例按各规格的观感比例留边；真实比例严格按底片机械尺寸换算。
+        let visual = config.widthModeValue == .visual
         var marginPerf: CGFloat
         var marginEnd: CGFloat
         if visual {
-            // 上下片边约占长边 7.5%；左右是片与片之间的间隔，只留一条细边。
-            marginPerf = longSide * 0.075 * CGFloat(config.borderScale)
-            marginEnd = longSide * 0.012 * CGFloat(config.borderScale)
+            // 齿孔侧的边给足齿孔与边字，画幅两端只留片与片之间的间隔。
+            let ratio = gauge.visualMarginRatio
+            marginPerf = longSide * CGFloat(ratio.perf) * CGFloat(config.borderScale)
+            marginEnd = longSide * CGFloat(ratio.end) * CGFloat(config.borderScale)
         } else {
             marginPerf = CGFloat(gauge.marginPerfMM) * pxPerMM * CGFloat(config.borderScale)
             marginEnd = CGFloat(gauge.marginEndMM) * pxPerMM * CGFloat(config.borderScale)
@@ -673,20 +745,18 @@ enum MFilmBorderRenderer {
 
     private static func baseRGB(_ config: MFilmBorderConfig) -> (CGFloat, CGFloat, CGFloat) {
         let tone = MFilmBorderBase(rawValue: config.baseTone) ?? .colorNegative
-        var rgb: (Double, Double, Double)
-        switch tone {
-        // 参考扫描件的片基几乎是黑的，只在暗部透一点暖，不再是棕色相框。
-        case .colorNegative: rgb = (0.046, 0.040, 0.033)
-        case .bw: rgb = (0.036, 0.035, 0.032)
-        case .reversal: rgb = (0.020, 0.019, 0.017)
-        case .clear: rgb = (0.60, 0.46, 0.29)
-        }
-        let gain = 1.0 + config.baseBrightness * 0.45
-        rgb = (rgb.0 * gain, rgb.1 * gain, rgb.2 * gain)
+        return baseSwatch(tone, brightness: config.baseBrightness)
+    }
+
+    /// 色板与渲染共用：基色叠加明暗偏移后夹到可渲染区间。
+    static func baseSwatch(_ tone: MFilmBorderBase,
+                           brightness: Double) -> (CGFloat, CGFloat, CGFloat) {
+        let gain = 1.0 + brightness * 0.45
+        let rgb = tone.rgb
         return (
-            CGFloat(min(max(rgb.0, 0.008), 0.92)),
-            CGFloat(min(max(rgb.1, 0.008), 0.92)),
-            CGFloat(min(max(rgb.2, 0.008), 0.92))
+            CGFloat(min(max(rgb.0 * gain, 0.008), 0.92)),
+            CGFloat(min(max(rgb.1 * gain, 0.008), 0.92)),
+            CGFloat(min(max(rgb.2 * gain, 0.008), 0.92))
         )
     }
 
@@ -1051,6 +1121,8 @@ enum MFilmBorderRenderer {
         let fontName = "HelveticaNeue-CondensedBold"
         var fontSize = max(5, min(260, margin * 0.46 * CGFloat(config.textScale)))
         func tracking(_ size: CGFloat) -> CGFloat { size * 0.14 }
+        // 110 / 16mm 只有单侧齿孔：字要排到没有孔的那条片边，否则会压在孔上。
+        let oneEdge = config.perfValue.isOneEdge
 
         if layout.alongX {
             var numberSize = fontSize * 0.90
@@ -1070,14 +1142,18 @@ enum MFilmBorderRenderer {
                     numberWidth = textWidth(number, fontSize: numberSize,
                                             tracking: tracking(numberSize), fontName: fontName)
                 }
-                let baseline = margin * 0.12 + fontSize * 0.72
+                let baseline = oneEdge
+                    ? layout.canvas.height - margin * 0.12 - fontSize * 0.72
+                    : margin * 0.12 + fontSize * 0.72
                 drawText(context, text: label,
                          origin: CGPoint(x: layout.aperture.minX, y: baseline),
                          rotation: 0, fontSize: fontSize, color: color,
                          tracking: tracking(fontSize), fontName: fontName)
             }
             if config.frameNumbers {
-                let baseline = margin * 0.12 + fontSize * 0.72
+                let baseline = oneEdge
+                    ? layout.canvas.height - margin * 0.12 - fontSize * 0.72
+                    : margin * 0.12 + fontSize * 0.72
                 drawText(context, text: number,
                          origin: CGPoint(x: layout.aperture.maxX - numberWidth + fontSize * 0.10,
                                          y: baseline),
@@ -1085,7 +1161,7 @@ enum MFilmBorderRenderer {
                          tracking: tracking(numberSize), fontName: fontName)
             }
         } else {
-            // 竖片：品牌字沿左片边竖排一行，画幅号放在右片边顶端。
+            // 竖片：品牌字沿一条片边竖排，画幅号放在另一条片边。
             if config.edgeText, !label.isEmpty {
                 // 竖排也要先量长再落笔：字太长就等比缩字号，不越过画布上沿。
                 let available = layout.aperture.height - fontSize * 0.5
@@ -1096,18 +1172,28 @@ enum MFilmBorderRenderer {
                     length = textWidth(label, fontSize: fontSize,
                                        tracking: tracking(fontSize), fontName: fontName)
                 }
-                let baselineX = layout.marginX * 0.12 + fontSize * 0.72
+                // 单侧齿孔在左片边，品牌字改到右片边，并且改为自上而下排。
+                let baselineX = oneEdge
+                    ? layout.canvas.width - layout.marginX * 0.12 - fontSize * 0.72
+                    : layout.marginX * 0.12 + fontSize * 0.72
                 drawText(context, text: label,
-                         origin: CGPoint(x: baselineX, y: layout.aperture.minY + length),
-                         rotation: -CGFloat.pi / 2, fontSize: fontSize, color: color,
+                         origin: CGPoint(x: baselineX,
+                                         y: oneEdge ? layout.aperture.minY
+                                                    : layout.aperture.minY + length),
+                         rotation: oneEdge ? CGFloat.pi / 2 : -CGFloat.pi / 2,
+                         fontSize: fontSize, color: color,
                          tracking: tracking(fontSize), fontName: fontName)
             }
             if config.frameNumbers {
                 let size = fontSize * 0.90
-                let rightX = layout.canvas.width - layout.marginX * 0.12 - size * 0.72
+                // 单侧齿孔时编号回到左片边。
+                let numberX = oneEdge
+                    ? layout.marginX * 0.12 + size * 0.72
+                    : layout.canvas.width - layout.marginX * 0.12 - size * 0.72
                 drawText(context, text: number,
-                         origin: CGPoint(x: rightX, y: layout.aperture.minY + size),
-                         rotation: CGFloat.pi / 2, fontSize: size, color: color,
+                         origin: CGPoint(x: numberX, y: layout.aperture.minY + size),
+                         rotation: oneEdge ? -CGFloat.pi / 2 : CGFloat.pi / 2,
+                         fontSize: size, color: color,
                          tracking: tracking(size), fontName: fontName)
             }
         }
@@ -1499,7 +1585,11 @@ enum MFilmBorderThumbnailCache {
                       size: CGSize = CGSize(width: 112, height: 82)) -> MPlatformImage? {
         let key = "\(preset.id)-\(Int(size.width))x\(Int(size.height))"
         if let hit = cache[key] { return hit }
-        guard let sample = MFilmBorderRenderer.samplePhoto(width: 96, height: 64) else {
+        // 取样图按该幅面的宽高比裁，卡片上能直接看出方格 / 半格 / 宽幅的差别。
+        let aspect = preset.config.gaugeValue.frameAspect
+        let sampleWidth = aspect >= 1 ? 96 : max(40, Int((96 * aspect).rounded()))
+        let sampleHeight = aspect >= 1 ? max(40, Int((96 / aspect).rounded())) : 96
+        guard let sample = MFilmBorderRenderer.samplePhoto(width: sampleWidth, height: sampleHeight) else {
             return nil
         }
         let config = preset.config

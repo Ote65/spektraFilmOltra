@@ -40,7 +40,8 @@ final class MobileGradeSession: ObservableObject {
     private var borderPersistWork: DispatchWorkItem?
     /// 片边重合成单独一条队列：滑条拖动时只保留最新一帧，主线程只做赋值。
     private let borderQueue = DispatchQueue(label: "spektra.mobile.grade.border", qos: .userInitiated)
-    private var borderToken = 0
+    /// 新的片边请求一来就取消上一帧合成，避免拖动滑条时任务排队造成延迟。
+    private var borderFlag: MCancelFlag?
     private var displayRecipe = MGradeRecipe()
     private var lutPath = ""
     private var token = 0
@@ -132,9 +133,18 @@ final class MobileGradeSession: ObservableObject {
         start()
     }
 
+    /// 顺时针旋转 90°：旋转属于照片本身，交给显影会话写入编辑数据后重建交接图。
+    func rotateClockwise() {
+        guard !isExporting else { return }
+        develop.rotateClockwise()
+        sourceReady = false
+        start()
+    }
+
     func cancel() {
         token += 1
         exportToken += 1
+        borderFlag?.cancel()
         pendingProxy?.cancel()
         pendingSettle?.cancel()
     }
@@ -163,24 +173,29 @@ final class MobileGradeSession: ObservableObject {
         let base = basePreviewCG
         let original = originalBaseCG
         guard base != nil || original != nil else { return }
-        borderToken += 1
-        let current = borderToken
+        borderFlag?.cancel()
+        let flag = MCancelFlag()
+        borderFlag = flag
         let config = border
         let filmID = develop.filmID
         let identifier = photoID
         borderQueue.async { [weak self] in
+            // 排到队首时已有更新的请求就直接放弃，旧帧不再合成。
+            guard !flag.isCancelled else { return }
             let framed = base.map {
                 MFilmBorderRenderer.preview(
                     photo: $0, config: config, filmID: filmID, photoID: identifier
                 ) ?? $0
             }
+            guard !flag.isCancelled else { return }
             let framedOriginal = original.map {
                 MFilmBorderRenderer.preview(
                     photo: $0, config: config, filmID: filmID, photoID: identifier
                 ) ?? $0
             }
+            guard !flag.isCancelled else { return }
             Task { @MainActor [weak self] in
-                guard let self, self.borderToken == current else { return }
+                guard let self, self.borderFlag === flag else { return }
                 if let framed {
                     self.previewImage = MImage.make(cgImage: framed)
                     self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))

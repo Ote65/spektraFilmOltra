@@ -234,6 +234,12 @@ struct GradeScreen: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             // 与显影台同一入口：预览分辨率档位始终可见，不随抽屉高度变化。
+            MCircleIconButton(icon: "rotate.right", size: 13, frame: 34) {
+                MHaptic.tick()
+                session.rotateClockwise()
+            }
+            .accessibilityLabel("顺时针旋转 90 度")
+
             gradeScaleMenu
 
             MBrassPill(title: "导出", icon: "square.and.arrow.up", height: 32) {
@@ -1051,25 +1057,8 @@ struct GradeScreen: View {
     private var borderPanel: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text("片边")
-                        .mLabel(8.5, color: MColor.text3)
-                    Spacer(minLength: 8)
-                    Text(MFilmBorderPreset.name(for: session.border))
-                        .mMeta(8, color: MColor.text4)
-                    Button {
-                        MHaptic.tick()
-                        withAnimation(MMotion.state) { session.resetBorder() }
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(MColor.text3)
-                            .frame(width: 22, height: 22)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.top, 6)
+                MToggleRow(label: "启用片边", isOn: borderEnabled, compact: true)
+                    .padding(.top, 6)
 
                 MHScrollRail(itemCount: MFilmBorderPreset.all.count, itemWidth: 86,
                              spacing: 8, leading: MMetric.pageMargin, trailing: 22,
@@ -1088,23 +1077,8 @@ struct GradeScreen: View {
                 .padding(.horizontal, -MMetric.pageMargin)
                 .padding(.top, 8)
 
-                MToggleRow(label: "启用片边", isOn: borderEnabled, compact: true)
-
                 if session.border.enabled {
-                    MChoiceRow(label: "片边预设", value: MFilmBorderPreset.name(for: session.border),
-                               options: borderPresetOptions) { id in
-                        guard let preset = MFilmBorderPreset.preset(id: id) else { return }
-                        withAnimation(MMotion.state) { session.setBorderPreset(preset) }
-                    }
-
-                    if session.border.gaugeValue.is135 {
-                        MChoiceRow(label: "片边比例", value: session.border.widthModeValue.label,
-                                   options: borderWidthModeOptions) { raw in
-                            session.updateBorder { $0.widthMode = raw }
-                        }
-                    }
-
-                    MChoiceRow(label: "底片规格", value: session.border.gaugeValue.label,
+                    MChoiceRow(label: "比例", value: session.border.gaugeValue.label,
                                options: gaugeOptions) { raw in
                         guard let gauge = MFilmBorderGauge(rawValue: raw) else { return }
                         session.updateBorder {
@@ -1116,9 +1090,16 @@ struct GradeScreen: View {
                         }
                     }
 
+                    borderColorRail
+
                     MParamSlider(label: "片边宽度", value: borderDouble(\.borderScale),
                                  base: 1, range: 0.4...2.0, step: 0.01, decimals: 2,
                                  suffix: "×", compact: true)
+
+                    MChoiceRow(label: "宽度口径", value: session.border.widthModeValue.label,
+                               options: borderWidthModeOptions) { raw in
+                        session.updateBorder { $0.widthMode = raw }
+                    }
 
                     MChoiceRow(label: "画幅角型", value: cornerValue.label,
                                options: cornerOptions) { raw in
@@ -1144,10 +1125,6 @@ struct GradeScreen: View {
                                  base: 0, range: -1...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
 
-                    MChoiceRow(label: "片基色调", value: baseValue.label,
-                               options: baseOptions) { raw in
-                        session.updateBorder { $0.baseTone = raw }
-                    }
                     MParamSlider(label: "片基明暗", value: borderDouble(\.baseBrightness),
                                  base: 0, range: -1...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
@@ -1190,6 +1167,81 @@ struct GradeScreen: View {
         }
         .scrollIndicators(.never)
         .defaultScrollAnchor(DebugLaunch.gradePanelBottom ? .bottom : .top)
+    }
+
+    /// 边框颜色：横向滚动的圆形色板，选色不用再进折叠菜单。
+    private var borderColorRail: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("边框颜色")
+                    .font(.mSans(11))
+                    .foregroundStyle(MColor.text2)
+                Text(baseValue.label)
+                    .mMeta(8, color: MColor.text4)
+                Spacer(minLength: 8)
+                Button {
+                    MHaptic.tick()
+                    withAnimation(MMotion.state) { session.resetBorder() }
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(MColor.text3)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("重置片边")
+            }
+
+            ScrollView(.horizontal) {
+                HStack(spacing: 12) {
+                    ForEach(MFilmBorderBase.allCases) { tone in
+                        borderColorDot(tone)
+                    }
+                }
+                .padding(.horizontal, MMetric.pageMargin)
+                .padding(.vertical, 3)
+            }
+            .scrollIndicators(.never)
+            .padding(.horizontal, -MMetric.pageMargin)
+        }
+        .padding(.top, 12)
+    }
+
+    private func borderColorDot(_ tone: MFilmBorderBase) -> some View {
+        let rgb = MFilmBorderRenderer.baseSwatch(tone, brightness: session.border.baseBrightness)
+        let selected = baseValue == tone
+        return Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) {
+                session.updateBorder { $0.baseTone = tone.rawValue }
+            }
+        } label: {
+            Circle()
+                .fill(Color(red: Double(rgb.0), green: Double(rgb.1), blue: Double(rgb.2)))
+                .frame(width: 30, height: 30)
+                .overlay(
+                    Circle().strokeBorder(selected ? MColor.brass : MColor.hairline,
+                                          lineWidth: selected ? 1.8 : 1)
+                )
+                .overlay(alignment: .bottomTrailing) {
+                    if selected {
+                        Circle()
+                            .fill(MColor.brass)
+                            .frame(width: 10, height: 10)
+                            .overlay(
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 6, weight: .bold))
+                                    .foregroundStyle(MColor.brassInk)
+                            )
+                            .offset(x: 2, y: 2)
+                    }
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(MPressStyle(scale: 0.92))
+        .accessibilityLabel(tone.label)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 
     // MARK: 调色/片边绑定
@@ -1297,10 +1349,6 @@ struct GradeScreen: View {
         MFilmBorderTextTone(rawValue: session.border.textTone) ?? .auto
     }
 
-    private var borderPresetOptions: [MProOption] {
-        MFilmBorderPreset.all.map { MProOption(value: $0.id, label: $0.name) }
-    }
-
     private var gaugeOptions: [MProOption] {
         MFilmBorderGauge.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
@@ -1315,10 +1363,6 @@ struct GradeScreen: View {
 
     private var perfOptions: [MProOption] {
         MFilmBorderPerf.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var baseOptions: [MProOption] {
-        MFilmBorderBase.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
 
     private var textToneOptions: [MProOption] {
