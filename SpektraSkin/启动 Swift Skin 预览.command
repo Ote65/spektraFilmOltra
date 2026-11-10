@@ -1,0 +1,5 @@
+#!/bin/zsh
+set -e
+cd "$(dirname "$0")"
+./build.sh
+open build/SpektraFilm.app

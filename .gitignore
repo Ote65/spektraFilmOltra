@@ -197,3 +197,15 @@ uv.lock
 .impeccable/
 build-macos/
 *.dmg
+
+################################################################################
+# iOS / Swift 原生工程
+
+.build/
+build/
+DerivedData/
+.DS_Store
+.scratch/
+.screenshots/
+out-*.png
+**/xcuserdata/

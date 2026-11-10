@@ -1,0 +1,419 @@
+import Foundation
+import SwiftUI
+import CoreGraphics
+import ImageIO
+#if os(iOS)
+import AVFoundation
+#endif
+
+/// 一次 RAW 拍摄的结果：临时 DNG 文件 + 取景器里用的缩略图。
+struct MCameraShot: Identifiable {
+    let id = UUID()
+    let url: URL
+    let thumbnail: MPlatformImage?
+}
+
+/// 相机页的拍摄会话：AVCaptureSession + AVCapturePhotoOutput 的薄封装。
+///
+/// 只拍 RAW（DNG）：显影台只接受 RAW，拍完由根视图入库。
+/// 所有 `@Published` 都在主线程写入；AVFoundation 的配置与启停在 `sessionQueue` 上跑。
+final class MCameraSession: NSObject, ObservableObject {
+    enum Permission: Equatable {
+        case idle
+        case requesting
+        case authorized
+        case denied
+    }
+
+    enum FlashMode: String, CaseIterable, Identifiable {
+        case off, auto, on
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .off: return "关闭"
+            case .auto: return "自动"
+            case .on: return "开启"
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .off: return "bolt.slash"
+            case .auto: return "bolt"
+            case .on: return "bolt.fill"
+            }
+        }
+    }
+
+    enum SessionError: LocalizedError {
+        case noDevice
+        case noRawData
+
+        var errorDescription: String? {
+            switch self {
+            case .noDevice: return "找不到可用的后置摄像头"
+            case .noRawData: return "这张照片没有 RAW 数据，请重试"
+            }
+        }
+    }
+
+    @Published private(set) var permission: Permission = .idle
+    @Published private(set) var isRunning = false
+    @Published private(set) var isCapturing = false
+    @Published private(set) var rawAvailable = false
+    @Published private(set) var hasFlash = false
+    @Published private(set) var zoom: CGFloat = 1
+    @Published private(set) var lastShot: MCameraShot?
+    /// 设备 / 环境层面的不可用原因（模拟器、没有摄像头）。
+    @Published private(set) var unusableReason: String?
+    /// 一次拍摄失败的原因，界面以 toast 呈现。
+    @Published private(set) var message: String?
+
+    @Published var flash: FlashMode = .off
+
+    /// 只有就绪且支持 RAW 时才允许按快门。
+    var canCapture: Bool {
+        isRunning && rawAvailable && !isCapturing && unusableReason == nil
+    }
+
+    var isRawReady: Bool {
+        isRunning && rawAvailable && unusableReason == nil
+    }
+
+    /// 快门被挡住时的说明文案。
+    var blockedHint: String {
+        if let unusableReason { return unusableReason }
+        if permission == .denied { return "没有相机权限，请到系统设置里打开" }
+        if isCapturing { return "正在写入 DNG…" }
+        if !isRunning { return "相机还在启动" }
+        if !rawAvailable { return "这台设备不提供 RAW 拍摄" }
+        return "相机还没准备好"
+    }
+
+    #if os(iOS)
+    let session = AVCaptureSession()
+    private let photoOutput = AVCapturePhotoOutput()
+    private let sessionQueue = DispatchQueue(label: "spektra.camera.session", qos: .userInitiated)
+    private var device: AVCaptureDevice?
+    private var rawFormat: OSType?
+    private var isConfigured = false
+    private var captureDelegate: MCaptureDelegate?
+    private var maxZoom: CGFloat = 1
+    #endif
+
+    override init() {
+        super.init()
+        #if os(iOS)
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized: permission = .authorized
+        case .notDetermined: permission = .idle
+        default: permission = .denied
+        }
+        #endif
+    }
+
+    // MARK: - 生命周期
+
+    func start() {
+        #if os(iOS)
+        if isSimulator {
+            permission = .authorized
+            unusableReason = "模拟器没有相机，请在 iPhone 真机上试拍 RAW"
+            return
+        }
+        guard unusableReason == nil else { return }
+
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            permission = .authorized
+            startSession()
+        case .notDetermined:
+            permission = .requesting
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.permission = granted ? .authorized : .denied
+                    if granted { self.startSession() }
+                }
+            }
+        default:
+            permission = .denied
+        }
+        #endif
+    }
+
+    func stop() {
+        #if os(iOS)
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if self.session.isRunning { self.session.stopRunning() }
+            DispatchQueue.main.async { self.isRunning = false }
+        }
+        #endif
+    }
+
+    private var isSimulator: Bool {
+        #if targetEnvironment(simulator)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    #if os(iOS)
+    private func startSession() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            var format: OSType?
+            if !self.isConfigured {
+                do {
+                    format = try self.configure()
+                    self.isConfigured = true
+                } catch {
+                    DispatchQueue.main.async {
+                        self.unusableReason = error.localizedDescription
+                        self.permission = .authorized
+                    }
+                    return
+                }
+            } else {
+                format = self.rawFormat
+            }
+
+            if !self.session.isRunning { self.session.startRunning() }
+            let running = self.session.isRunning
+            let flash = self.device?.hasFlash ?? false
+            let zoomLimit = self.device?.activeFormat.videoMaxZoomFactor ?? 1
+
+            DispatchQueue.main.async {
+                self.rawFormat = format
+                self.rawAvailable = format != nil
+                self.hasFlash = flash
+                self.maxZoom = zoomLimit
+                self.isRunning = running
+            }
+        }
+    }
+
+    /// 在 sessionQueue 上调用：装配输入 / 输出 / 竖屏方向，返回可用的 RAW 像素格式。
+    private func configure() throws -> OSType? {
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+                ?? AVCaptureDevice.default(for: .video) else {
+            throw SessionError.noDevice
+        }
+
+        let input = try AVCaptureDeviceInput(device: device)
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+
+        session.sessionPreset = .photo
+        guard session.canAddInput(input) else { throw SessionError.noDevice }
+        session.addInput(input)
+        guard session.canAddOutput(photoOutput) else { throw SessionError.noDevice }
+        session.addOutput(photoOutput)
+
+        // App 只支持竖屏：把输出连接固定成竖拍，拍到的 DNG 不需要再做旋转。
+        if let connection = photoOutput.connection(with: .video) {
+            if #available(iOS 17.0, *) {
+                if connection.isVideoRotationAngleSupported(90) {
+                    connection.videoRotationAngle = 90
+                }
+            } else if connection.isVideoOrientationSupported {
+                connection.videoOrientation = .portrait
+            }
+        }
+
+        // 优先 Bayer RAW（体积小、是真 RAW）；没有时才退回 Apple ProRAW。
+        let formats = photoOutput.availableRawPhotoPixelFormatTypes
+        let bayer = formats.first { !AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
+        let picked = bayer ?? formats.first
+
+        self.device = device
+        return picked
+    }
+    #endif
+
+    // MARK: - 拍摄
+
+    func capture() {
+        #if os(iOS)
+        guard canCapture, let rawFormat else { return }
+        isCapturing = true
+        message = nil
+
+        let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: nil)
+        settings.photoQualityPrioritization = .balanced
+        if hasFlash, photoOutput.supportedFlashModes.contains(flash.avMode) {
+            settings.flashMode = flash.avMode
+        }
+
+        let delegate = MCaptureDelegate { [weak self] result in
+            DispatchQueue.main.async { self?.finish(result) }
+        }
+        captureDelegate = delegate
+        photoOutput.capturePhoto(with: settings, delegate: delegate)
+        #endif
+    }
+
+    #if os(iOS)
+    private func finish(_ result: Result<MCameraShot, Error>) {
+        isCapturing = false
+        captureDelegate = nil
+        switch result {
+        case .success(let shot):
+            lastShot = shot
+        case .failure(let error):
+            message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+    #endif
+
+    func clearMessage() {
+        message = nil
+    }
+
+    /// 从系统设置授权返回前台时重新对齐权限，并补一次启动。
+    func refreshPermission() {
+        #if os(iOS)
+        guard !isSimulator else { return }
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            guard permission != .authorized else { return }
+            permission = .authorized
+            start()
+        case .denied, .restricted:
+            permission = .denied
+        case .notDetermined:
+            permission = .idle
+        @unknown default:
+            break
+        }
+        #endif
+    }
+
+    // MARK: - 控制
+
+    func cycleFlash() {
+        guard hasFlash else { return }
+        let all = FlashMode.allCases
+        let index = all.firstIndex(of: flash) ?? 0
+        flash = all[(index + 1) % all.count]
+    }
+
+    func toggleZoom() {
+        #if os(iOS)
+        guard let device else { return }
+        let next: CGFloat = zoom > 1.01 ? 1 : 2
+        let target = min(next, max(1, maxZoom))
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = target
+            device.unlockForConfiguration()
+            zoom = device.videoZoomFactor
+        } catch {
+            return
+        }
+        #endif
+    }
+
+    /// `point` 是 AVCaptureVideoPreviewLayer 的设备坐标（左上 0,0）。
+    func focus(at point: CGPoint) {
+        #if os(iOS)
+        guard let device else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusPointOfInterestSupported {
+                device.focusPointOfInterest = point
+                device.focusMode = .autoFocus
+            }
+            if device.isExposurePointOfInterestSupported {
+                device.exposurePointOfInterest = point
+                device.exposureMode = .autoExpose
+            }
+            device.unlockForConfiguration()
+        } catch {
+            return
+        }
+        #endif
+    }
+}
+
+#if os(iOS)
+private extension MCameraSession.FlashMode {
+    var avMode: AVCaptureDevice.FlashMode {
+        switch self {
+        case .off: return .off
+        case .auto: return .auto
+        case .on: return .on
+        }
+    }
+}
+
+/// AVCapturePhotoOutput 的代理：把 RAW 数据落到临时 DNG，并顺手取一张缩略图。
+private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
+    private let completion: (Result<MCameraShot, Error>) -> Void
+    private var finished = false
+
+    init(completion: @escaping (Result<MCameraShot, Error>) -> Void) {
+        self.completion = completion
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishProcessingPhoto photo: AVCapturePhoto,
+                     error: Error?) {
+        guard !finished else { return }
+        finished = true
+
+        if let error {
+            completion(.failure(error))
+            return
+        }
+        guard photo.isRawPhoto, let data = photo.fileDataRepresentation() else {
+            completion(.failure(MCameraSession.SessionError.noRawData))
+            return
+        }
+
+        let name = "Spektra-\(Self.stamp())-\(Int.random(in: 100...999)).dng"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        completion(.success(MCameraShot(url: url, thumbnail: Self.thumbnail(url: url))))
+    }
+
+    /// 出片前就失败（如采集被中断）时只会回调这里；不复位的话 `isCapturing` 会永远卡住。
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
+                     error: Error?) {
+        guard let error, !finished else { return }
+        finished = true
+        completion(.failure(error))
+    }
+
+    private static func stamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
+    }
+
+    /// 只读 DNG 内嵌预览，避免为了取景器缩略图去解码整张 RAW。
+    private static func thumbnail(url: URL) -> MPlatformImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 240
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return MImage.make(cgImage: image)
+    }
+}
+#endif
