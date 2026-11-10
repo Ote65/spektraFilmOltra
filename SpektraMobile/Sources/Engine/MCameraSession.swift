@@ -47,6 +47,30 @@ final class MCameraSession: NSObject, ObservableObject {
         }
     }
 
+    /// 取景器里的焦段按钮：数字是 35mm 等效焦距，`zoom` 是折算到设备上的变焦倍数。
+    enum Lens: Int, CaseIterable, Identifiable {
+        case wide = 26
+        case standard = 35
+        case portrait = 50
+        case tele = 77
+
+        var id: Int { rawValue }
+        var focal: Int { rawValue }
+
+        var zoom: CGFloat {
+            switch self {
+            case .wide: return 1
+            case .standard: return 1.5
+            case .portrait: return 2
+            case .tele: return 3
+            }
+        }
+
+        var zoomLabel: String {
+            zoom == zoom.rounded() ? "\(Int(zoom))×" : String(format: "%.1f×", zoom)
+        }
+    }
+
     enum SessionError: LocalizedError {
         case noDevice
         case noRawData
@@ -73,6 +97,12 @@ final class MCameraSession: NSObject, ObservableObject {
 
     @Published var flash: FlashMode = .off
 
+    @Published private(set) var lens: Lens = .wide
+    @Published private(set) var isFront = false
+    @Published private(set) var exposureBias: Double = 0
+    /// nil 表示自动白平衡。
+    @Published private(set) var temperature: Int?
+
     /// 只有就绪且支持 RAW 时才允许按快门。
     var canCapture: Bool {
         isRunning && rawAvailable && !isCapturing && unusableReason == nil
@@ -90,6 +120,20 @@ final class MCameraSession: NSObject, ObservableObject {
         if !isRunning { return "相机还在启动" }
         if !rawAvailable { return "这台设备不提供 RAW 拍摄" }
         return "相机还没准备好"
+    }
+
+    var temperatureLabel: String { temperature.map { "\($0)K" } ?? "Auto" }
+
+    var exposureLabel: String { String(format: "%+.1f", exposureBias) }
+
+    /// 只有设备变焦能到的焦段才显示。
+    var availableLenses: [Lens] {
+        #if os(iOS)
+        let limit = max(1, maxZoom)
+        return Lens.allCases.filter { $0.zoom <= limit + 0.05 }
+        #else
+        return [.wide]
+        #endif
     }
 
     #if os(iOS)
@@ -225,6 +269,12 @@ final class MCameraSession: NSObject, ObservableObject {
             }
         }
 
+        // 部分 Pro 机型只暴露 Apple ProRAW：不先打开这个开关，下面的格式列表会是空的，
+        // 相机就会一直停在「这台设备不提供 RAW 拍摄」。
+        if photoOutput.isAppleProRAWSupported, !photoOutput.isAppleProRAWEnabled {
+            photoOutput.isAppleProRAWEnabled = true
+        }
+
         // 优先 Bayer RAW（体积小、是真 RAW）；没有时才退回 Apple ProRAW。
         let formats = photoOutput.availableRawPhotoPixelFormatTypes
         let bayer = formats.first { !AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
@@ -243,8 +293,8 @@ final class MCameraSession: NSObject, ObservableObject {
         isCapturing = true
         message = nil
 
+        // 只拍 RAW：qualityPrioritization 只对 processed 图有意义，设了反而会被系统拒绝，所以不设。
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: nil)
-        settings.photoQualityPrioritization = .balanced
         if hasFlash, photoOutput.supportedFlashModes.contains(flash.avMode) {
             settings.flashMode = flash.avMode
         }
@@ -302,20 +352,144 @@ final class MCameraSession: NSObject, ObservableObject {
         flash = all[(index + 1) % all.count]
     }
 
-    func toggleZoom() {
+    /// 选焦段：把 35mm 等效焦距折算成设备变焦倍数。
+    func select(_ lens: Lens) {
         #if os(iOS)
         guard let device else { return }
-        let next: CGFloat = zoom > 1.01 ? 1 : 2
-        let target = min(next, max(1, maxZoom))
+        let target = min(lens.zoom, max(1, maxZoom))
         do {
             try device.lockForConfiguration()
             device.videoZoomFactor = target
             device.unlockForConfiguration()
-            zoom = device.videoZoomFactor
+        } catch {
+            return
+        }
+        zoom = device.videoZoomFactor
+        self.lens = lens
+        #endif
+    }
+
+    /// 前后摄像头切换。前置多数机型不提供 RAW，切不过去时退回后置并给出提示。
+    func flip() {
+        #if os(iOS)
+        guard isRunning, !isCapturing, let current = device else { return }
+        let target: AVCaptureDevice.Position = current.position == .front ? .back : .front
+        guard let next = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: target),
+              let input = try? AVCaptureDeviceInput(device: next) else {
+            message = "找不到可用的摄像头"
+            return
+        }
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let previous = self.session.inputs.first
+
+            self.session.beginConfiguration()
+            if let previous { self.session.removeInput(previous) }
+            let attached = self.session.canAddInput(input)
+            if attached { self.session.addInput(input) }
+            // 换设备后格式列表会重算，ProRAW 开关也要在这个配置窗口里重新确认。
+            if self.photoOutput.isAppleProRAWSupported, !self.photoOutput.isAppleProRAWEnabled {
+                self.photoOutput.isAppleProRAWEnabled = true
+            }
+            self.session.commitConfiguration()
+
+            let formats = attached ? self.photoOutput.availableRawPhotoPixelFormatTypes : []
+            let bayer = formats.first { !AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
+            let picked = bayer ?? formats.first
+
+            // Spektra 只拍 RAW：前置没有 RAW 就把后置装回去。
+            guard picked != nil else {
+                self.session.beginConfiguration()
+                if let failed = self.session.inputs.first { self.session.removeInput(failed) }
+                if let previous, self.session.canAddInput(previous) {
+                    self.session.addInput(previous)
+                }
+                self.session.commitConfiguration()
+                DispatchQueue.main.async {
+                    self.message = target == .front
+                        ? "这台 iPhone 的前置镜头不提供 RAW，已切回后置"
+                        : "切换摄像头失败"
+                }
+                return
+            }
+
+            if let connection = self.photoOutput.connection(with: .video) {
+                if #available(iOS 17.0, *) {
+                    if connection.isVideoRotationAngleSupported(90) {
+                        connection.videoRotationAngle = 90
+                    }
+                } else if connection.isVideoOrientationSupported {
+                    connection.videoOrientation = .portrait
+                }
+            }
+
+            DispatchQueue.main.async {
+                self.device = next
+                self.isFront = target == .front
+                self.rawFormat = picked
+                self.rawAvailable = true
+                self.hasFlash = next.hasFlash
+                self.maxZoom = next.activeFormat.videoMaxZoomFactor
+                self.zoom = 1
+                self.lens = .wide
+                self.exposureBias = 0
+                self.temperature = nil
+                self.flash = next.hasFlash ? self.flash : .off
+            }
+        }
+        #endif
+    }
+
+    /// 曝光补偿按 -1 → -0.5 → 0 → +0.5 → +1 循环。
+    func cycleExposure() {
+        #if os(iOS)
+        guard let device else { return }
+        let steps: [Double] = [-1, -0.5, 0, 0.5, 1]
+        let index = steps.firstIndex { abs($0 - exposureBias) < 0.01 } ?? 2
+        let next = steps[(index + 1) % steps.count]
+        do {
+            try device.lockForConfiguration()
+            device.setExposureTargetBias(Float(next))
+            device.unlockForConfiguration()
+        } catch {
+            return
+        }
+        exposureBias = next
+        #endif
+    }
+
+    /// 色温按 自动 → 3200K → 4300K → 5600K → 7000K 循环。
+    func cycleTemperature() {
+        let steps: [Int?] = [nil, 3200, 4300, 5600, 7000]
+        let index = steps.firstIndex { $0 == temperature } ?? 0
+        apply(temperature: steps[(index + 1) % steps.count])
+    }
+
+    private func apply(temperature kelvin: Int?) {
+        #if os(iOS)
+        guard let device else { return }
+        do {
+            try device.lockForConfiguration()
+            if let kelvin {
+                let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                    temperature: Float(kelvin), tint: 0
+                )
+                var gains = device.deviceWhiteBalanceGains(for: values)
+                let limit = device.maxWhiteBalanceGain
+                gains.redGain = min(max(gains.redGain, 1), limit)
+                gains.greenGain = min(max(gains.greenGain, 1), limit)
+                gains.blueGain = min(max(gains.blueGain, 1), limit)
+                try device.setWhiteBalanceModeLocked(with: gains)
+            } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                device.whiteBalanceMode = .continuousAutoWhiteBalance
+            }
+            device.unlockForConfiguration()
         } catch {
             return
         }
         #endif
+        temperature = kelvin
     }
 
     /// `point` 是 AVCaptureVideoPreviewLayer 的设备坐标（左上 0,0）。
@@ -406,7 +580,8 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     private static func thumbnail(url: URL) -> MPlatformImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            // 先用 DNG 内嵌的小预览；只有缺失时才解整张 RAW，避免快门后立刻吃一大块内存。
+            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: 240
         ]
