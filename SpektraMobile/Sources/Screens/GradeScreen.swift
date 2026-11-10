@@ -14,13 +14,13 @@ struct GradeScreen: View {
     @State private var recipe = MGradeRecipe()
     @State private var tabIndex = DebugLaunch.gradeTab
     @State private var drawerHeight: CGFloat = MMetric.drawerMin
-    @State private var drawerBeforeCurve: CGFloat?
     @State private var panelContentHeight: CGFloat = 0
     @State private var panelViewportHeight: CGFloat = 0
     @State private var drawerChrome: CGFloat = 0
-    @State private var pendingCurveExpand = DebugLaunch.gradeTab == 3
     @State private var exportOpen = DebugLaunch.exportOpen
     @State private var showLUTImporter = false
+    @State private var hslBand = 0
+    @State private var gradingZone = 1
     @State private var stageSize: CGSize = .zero
     // 交接图就绪前先弹出一块白色画布，再显影渐变成照片
     @State private var cardRect: CGRect = .zero
@@ -552,12 +552,13 @@ struct GradeScreen: View {
                 toggleDrawer()
             }
 
-            Group {
-                switch MGradeTab.allCases[min(tabIndex, 3)] {
+            ZStack {
+                switch MGradeTab.allCases[min(tabIndex, MGradeTab.allCases.count - 1)] {
                 case .presets: presetPanel
                 case .light: lightPanel
                 case .color: colorPanel
-                case .curve: curvePanel
+                case .texture: texturePanel
+                case .border: borderPanel
                 }
             }
             .id(tabIndex)
@@ -583,6 +584,7 @@ struct GradeScreen: View {
         }
         // 抽屉和底部页签胶囊共用同一套原生液态玻璃材质，色调保持一致。
         .mGlassSurface(drawerShape, fallbackFill: MColor.surface2.opacity(0.96))
+        .clipShape(drawerShape)
         .overlay {
             drawerShape
                 .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
@@ -605,15 +607,7 @@ struct GradeScreen: View {
     private func syncDrawerToContent() {
         guard panelViewportHeight > 0, panelContentHeight > 0 else { return }
         let fit = fitHeight(for: panelContentHeight)
-        let target: CGFloat
-        if pendingCurveExpand {
-            target = fit
-            if abs(drawerHeight - fit) <= 1 { pendingCurveExpand = false }
-        } else if isLockedTab {
-            target = fit
-        } else {
-            target = min(drawerHeight, fit)
-        }
+        let target: CGFloat = isLockedTab ? fit : min(drawerHeight, fit)
         guard abs(drawerHeight - target) > 1 else { return }
         drawerHeight = target
     }
@@ -644,36 +638,20 @@ struct GradeScreen: View {
         drawerHeight > minDrawerHeight + 1
     }
 
-    /// 点击 chevron 切换档位；曲线页由 `selectTab` 自动展开，这里只做手动两档。
+    /// 点击 chevron 切换两档高度。
     private func toggleDrawer() {
         guard !isLockedTab else { return }
-        if tabIndex == 3 { pendingCurveExpand = false }
         let target = isDrawerExpanded ? minDrawerHeight : fitDrawerHeight
         withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
             drawerHeight = target
         }
     }
 
-    /// 切到曲线时自动升到刚好容纳曲线内容的高度；切回其他页时恢复到进入曲线前的高度。
-    /// 横向换页与高度变化放在同一次动画里，保证面板和内容一起横移、一起下移。
+    /// 横向换页只换内容；高度交给 `syncDrawerToContent` 按新页内容收敛。
     private func selectTab(_ index: Int) {
-        guard index != tabIndex, index < 4 else { return }
-        let wasCurve = tabIndex == 3
-        let willCurve = index == 3
-        var target = drawerHeight
-        if willCurve, !wasCurve {
-            drawerBeforeCurve = drawerHeight
-            pendingCurveExpand = true
-            target = drawerHeight
-        } else if wasCurve, !willCurve {
-            pendingCurveExpand = false
-            target = drawerBeforeCurve ?? MMetric.drawerMin
-            drawerBeforeCurve = nil
-            if target > fitDrawerHeight { target = fitDrawerHeight }
-        }
+        guard index != tabIndex, index < MGradeTab.allCases.count else { return }
         withAnimation(MMotion.drawer) {
             tabIndex = index
-            drawerHeight = target
         }
     }
 
@@ -855,6 +833,10 @@ struct GradeScreen: View {
                 MParamSlider(label: "黑色", value: $recipe.blacks, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
                 MParamSlider(label: "中间调", value: $recipe.midtones, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
                 MParamSlider(label: "高光柔和", value: $recipe.highlightRolloff, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                // 曲线并回光影页：先走滑条定调，再在最下面用点曲线精修。
+                MHairline().padding(.top, 14)
+                curveSection
             }
             // 顶部不再放分组标题，滑条直接从抽屉上沿开始。
             .padding(.top, 4)
@@ -864,6 +846,69 @@ struct GradeScreen: View {
         }
         .scrollIndicators(.never)
         .defaultScrollAnchor(DebugLaunch.gradePanelBottom ? .bottom : .top)
+    }
+
+    /// 光影页底部的点曲线（原「曲线」页签）。
+    private var curveSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text("曲线")
+                    .mLabel(8.5, color: MColor.text3)
+
+                Spacer(minLength: 8)
+
+                ForEach(["RGB", "R", "G", "B"], id: \.self) { channel in
+                    Button {
+                        MHaptic.tick()
+                        withAnimation(MMotion.state) { curveChannel = channel }
+                    } label: {
+                        Text(channel)
+                            .font(.mSans(9, curveChannel == channel ? .semibold : .regular).monospacedDigit())
+                            .foregroundStyle(curveChannel == channel ? MColor.brass : MColor.text3)
+                            .padding(.horizontal, 8)
+                            .frame(height: 22)
+                            .background(
+                                Capsule().fill(curveChannel == channel ? MColor.brassWash : MColor.surface2.opacity(0.7))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(channel != "RGB")
+                    .opacity(channel == "RGB" ? 1 : 0.35)
+                }
+
+                Button {
+                    MHaptic.tick()
+                    withAnimation(MMotion.state) { resetCurve() }
+                } label: {
+                    Text("复位")
+                        .font(.mSans(9, .medium))
+                        .foregroundStyle(MColor.text3)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.top, 10)
+
+            MCurveEditor(points: $curvePoints, channel: curveChannel)
+                .frame(height: 208)
+                .padding(.top, 10)
+
+            HStack(spacing: 8) {
+                Spacer()
+                Text("中灰锁定")
+                    .mMeta(8, color: MColor.text4)
+            }
+            .padding(.top, 7)
+        }
+    }
+
+    private func resetCurve() {
+        curvePoints = [
+            CGPoint(x: 0.0, y: 0.0),
+            CGPoint(x: 0.26, y: 0.26),
+            CGPoint(x: 0.52, y: 0.52),
+            CGPoint(x: 0.78, y: 0.78),
+            CGPoint(x: 1.0, y: 1.0),
+        ]
     }
 
     // MARK: - 色调
@@ -876,37 +921,52 @@ struct GradeScreen: View {
                 MParamSlider(label: "色温", value: $recipe.temperature, base: 0, range: -100...100, step: 1, decimals: 0, suffix: " CC", compact: true)
                 MParamSlider(label: "色调", value: $recipe.tint, base: 0, range: -100...100, step: 1, decimals: 0, suffix: " CC", compact: true)
 
-                // 引擎的 `applySaturation` / `applyVignette` / `applyGrain` 一直存在，
-                // 只是此前没有接到调色台 UI 与 `MGradeRecipe`。补上后颗粒、暗角、浓度
-                // 在调色台可用，且导出走同一份 recipe。
-                MSectionHead(title: "质感").padding(.top, 8)
+                MSectionHead(title: "饱和度").padding(.top, 8)
 
-                MParamSlider(label: "浓度", value: $recipe.saturation, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
-                MParamSlider(label: "暗角", value: $recipe.vignette, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
-                MParamSlider(label: "颗粒", value: $recipe.grain, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "自然饱和度", value: $recipe.vibrance, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "饱和度", value: $recipe.saturation, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "浓度", value: $recipe.colorDensity, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
 
-                // 曲线已经独立成一个页签，这里不再放重复入口。
-                Button {
-                    MHaptic.medium()
-                    withAnimation(MMotion.state) { recipe = MGradeRecipe() }
-                    onToast("调色参数已重置")
-                } label: {
-                    Text("重置调色")
-                        .font(.mSans(11, .medium))
-                        .foregroundStyle(MColor.text2)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 32)
-                        .background(
-                            RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                                .fill(MColor.surface2)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                                .strokeBorder(MColor.hairline, lineWidth: 1)
-                        )
+                MSectionHead(title: "混合").padding(.top, 8)
+
+                bandChips(
+                    labels: ["红", "橙", "黄", "绿", "青", "蓝", "紫", "洋红"],
+                    colors: [0.00, 0.08, 0.15, 0.33, 0.50, 0.60, 0.75, 0.90],
+                    selected: hslBand
+                ) { index in
+                    hslBand = index
                 }
-                .buttonStyle(.plain)
-                .padding(.top, 10)
+                .padding(.top, 6)
+
+                MParamSlider(label: "色相", value: hslBinding(\.hue), base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "饱和度", value: hslBinding(\.saturation), base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "明度", value: hslBinding(\.luminance), base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                MSectionHead(title: "颜色分级").padding(.top, 8)
+
+                bandChips(
+                    labels: ["阴影", "中间调", "高光"],
+                    colors: nil,
+                    selected: gradingZone
+                ) { index in
+                    gradingZone = index
+                }
+                .padding(.top, 6)
+
+                MParamSlider(label: "色相", value: gradingBinding(\.hue), base: 0, range: 0...360, step: 1, decimals: 0, suffix: "°", compact: true)
+                MParamSlider(label: "饱和度", value: gradingBinding(\.saturation), base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "明度", value: gradingBinding(\.luminance), base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "混合", value: $recipe.grading.blending, base: 50, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "平衡", value: $recipe.grading.balance, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                resetButton("重置调色") {
+                    MHaptic.medium()
+                    withAnimation(MMotion.state) {
+                        recipe = MGradeRecipe()
+                        resetCurve()
+                    }
+                    onToast("调色参数已重置")
+                }
             }
             .padding(.horizontal, MMetric.pageMargin)
             .padding(.bottom, 14)
@@ -916,75 +976,385 @@ struct GradeScreen: View {
         .defaultScrollAnchor(DebugLaunch.gradePanelBottom ? .bottom : .top)
     }
 
-    // MARK: - 曲线
+    // MARK: - 质感
 
-    private var curvePanel: some View {
+    private var texturePanel: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 6) {
-                    ForEach(["RGB", "R", "G", "B"], id: \.self) { channel in
-                        Button {
-                            MHaptic.tick()
-                            withAnimation(MMotion.state) { curveChannel = channel }
-                        } label: {
-                            Text(channel)
-                                .font(.mSans(9.5, curveChannel == channel ? .semibold : .regular).monospacedDigit())
-                                .foregroundStyle(curveChannel == channel ? MColor.brass : MColor.text3)
-                                .padding(.horizontal, 11)
-                                .frame(height: 26)
-                                .background(
-                                    Capsule().fill(curveChannel == channel ? MColor.brassWash : MColor.surface2.opacity(0.7))
-                                )
-                                .overlay(
-                                    Capsule().strokeBorder(
-                                        curveChannel == channel ? MColor.brass.opacity(0.32) : MColor.hairlineFaint,
-                                        lineWidth: 1
-                                    )
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(channel != "RGB")
-                        .opacity(channel == "RGB" ? 1 : 0.35)
+                MSectionHead(title: "质感").padding(.top, 4)
+
+                MParamSlider(label: "清晰度", value: $recipe.clarity, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "纹理", value: $recipe.texture, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "去朦胧", value: $recipe.dehaze, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                MSectionHead(title: "锐化").padding(.top, 8)
+
+                MParamSlider(label: "锐化", value: $recipe.sharpenAmount, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "半径", value: $recipe.sharpenRadius, base: 1, range: 0.5...3, step: 0.1, decimals: 1, suffix: "", compact: true)
+                MParamSlider(label: "阈值", value: $recipe.sharpenThreshold, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                MSectionHead(title: "降噪").padding(.top, 8)
+
+                MParamSlider(label: "亮度降噪", value: $recipe.noiseLuminance, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "色彩降噪", value: $recipe.noiseColor, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                MSectionHead(title: "颗粒").padding(.top, 8)
+
+                MParamSlider(label: "颗粒", value: $recipe.grain, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "大小", value: $recipe.grainSize, base: 25, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "粗糙度", value: $recipe.grainRoughness, base: 50, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                MSectionHead(title: "暗角").padding(.top, 8)
+
+                MParamSlider(label: "数量", value: $recipe.vignette, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "中间点", value: $recipe.vignetteMidpoint, base: 50, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "圆度", value: $recipe.vignetteRoundness, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
+                MParamSlider(label: "羽化", value: $recipe.vignetteFeather, base: 50, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                MSectionHead(title: "色差").padding(.top, 8)
+
+                MParamSlider(label: "色差", value: $recipe.chromaticAberration, base: 0, range: 0...100, step: 1, decimals: 0, suffix: "", compact: true)
+
+                resetButton("重置质感") {
+                    MHaptic.medium()
+                    withAnimation(MMotion.state) {
+                        recipe.clarity = 0
+                        recipe.texture = 0
+                        recipe.dehaze = 0
+                        recipe.sharpenAmount = 0
+                        recipe.sharpenRadius = 1
+                        recipe.sharpenThreshold = 0
+                        recipe.noiseLuminance = 0
+                        recipe.noiseColor = 0
+                        recipe.grain = 0
+                        recipe.grainSize = 25
+                        recipe.grainRoughness = 50
+                        recipe.vignette = 0
+                        recipe.vignetteMidpoint = 50
+                        recipe.vignetteRoundness = 0
+                        recipe.vignetteFeather = 50
+                        recipe.chromaticAberration = 0
                     }
-
-                    Spacer()
-
-                    Button {
-                        MHaptic.tick()
-                        withAnimation(MMotion.state) {
-                            curvePoints = [
-                                CGPoint(x: 0.0, y: 0.0),
-                                CGPoint(x: 0.26, y: 0.26),
-                                CGPoint(x: 0.52, y: 0.52),
-                                CGPoint(x: 0.78, y: 0.78),
-                                CGPoint(x: 1.0, y: 1.0),
-                            ]
-                        }
-                    } label: {
-                        Text("复位")
-                            .font(.mSans(9.5, .medium))
-                            .foregroundStyle(MColor.text3)
-                    }
-                    .buttonStyle(.plain)
+                    onToast("质感参数已重置")
                 }
-                .padding(.top, 12)
-
-                MCurveEditor(points: $curvePoints, channel: curveChannel)
-                    .frame(height: 208)
-                    .padding(.top, 10)
-
-                HStack(spacing: 8) {
-                    Spacer()
-                    Text("中灰锁定")
-                        .mMeta(8, color: MColor.text4)
-                }
-                .padding(.top, 7)
             }
             .padding(.horizontal, MMetric.pageMargin)
             .padding(.bottom, 14)
             .background(MPanelHeightReporter())
         }
         .scrollIndicators(.never)
+        .defaultScrollAnchor(DebugLaunch.gradePanelBottom ? .bottom : .top)
+    }
+
+    // MARK: - 边框
+
+    private var borderPanel: some View {
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("片边")
+                        .mLabel(8.5, color: MColor.text3)
+                    Spacer(minLength: 8)
+                    Text(MFilmBorderPreset.name(for: session.border))
+                        .mMeta(8, color: MColor.text4)
+                    Button {
+                        MHaptic.tick()
+                        withAnimation(MMotion.state) { session.resetBorder() }
+                    } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(MColor.text3)
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.top, 6)
+
+                MHScrollRail(itemCount: MFilmBorderPreset.all.count, itemWidth: 86,
+                             spacing: 8, leading: MMetric.pageMargin, trailing: 22,
+                             itemHeight: 84, fadeColor: .clear) {
+                    ForEach(MFilmBorderPreset.all) { preset in
+                        MFilmBorderPresetCard(
+                            preset: preset,
+                            selected: borderPresetIsSelected(preset)
+                        ) {
+                            MHaptic.tick()
+                            withAnimation(MMotion.state) { session.setBorderPreset(preset) }
+                        }
+                    }
+                }
+                .frame(height: 84)
+                .padding(.horizontal, -MMetric.pageMargin)
+                .padding(.top, 8)
+
+                MToggleRow(label: "启用片边", isOn: borderEnabled, compact: true)
+
+                if session.border.enabled {
+                    MChoiceRow(label: "片边预设", value: MFilmBorderPreset.name(for: session.border),
+                               options: borderPresetOptions) { id in
+                        guard let preset = MFilmBorderPreset.preset(id: id) else { return }
+                        withAnimation(MMotion.state) { session.setBorderPreset(preset) }
+                    }
+
+                    MChoiceRow(label: "底片规格", value: session.border.gaugeValue.label,
+                               options: gaugeOptions) { raw in
+                        guard let gauge = MFilmBorderGauge(rawValue: raw) else { return }
+                        session.updateBorder {
+                            $0.gauge = raw
+                            $0.baseTone = gauge.defaultBase.rawValue
+                            $0.perf = MFilmBorderPerf.auto.rawValue
+                            $0.notch = gauge.isSheet
+                            $0.edgeText = !gauge.isSheet
+                        }
+                    }
+
+                    MParamSlider(label: "片边宽度", value: borderDouble(\.borderScale),
+                                 base: 1, range: 0.4...2.0, step: 0.01, decimals: 2,
+                                 suffix: "×", compact: true)
+
+                    MChoiceRow(label: "画幅角型", value: cornerValue.label,
+                               options: cornerOptions) { raw in
+                        session.updateBorder { $0.corner = raw }
+                    }
+
+                    MParamSlider(label: "角口大小", value: borderDouble(\.cornerScale),
+                                 base: 1, range: 0...3, step: 0.01, decimals: 2,
+                                 suffix: "×", isEnabled: cornerValue != .square, compact: true)
+
+                    MChoiceRow(label: "齿孔类型", value: session.border.perfValue.label,
+                               options: perfOptions) { raw in
+                        session.updateBorder { $0.perf = raw }
+                    }
+
+                    MParamSlider(label: "齿孔大小", value: borderDouble(\.perfScale),
+                                 base: 1, range: 0.5...1.8, step: 0.01, decimals: 2,
+                                 suffix: "×", compact: true)
+                    MParamSlider(label: "齿孔间距", value: borderDouble(\.perfPitch),
+                                 base: 1, range: 0.5...2.0, step: 0.01, decimals: 2,
+                                 suffix: "×", compact: true)
+                    MParamSlider(label: "齿孔明暗", value: borderDouble(\.perfBrightness),
+                                 base: 0, range: -1...1, step: 0.01, decimals: 2,
+                                 suffix: "", compact: true)
+
+                    MChoiceRow(label: "片基色调", value: baseValue.label,
+                               options: baseOptions) { raw in
+                        session.updateBorder { $0.baseTone = raw }
+                    }
+                    MParamSlider(label: "片基明暗", value: borderDouble(\.baseBrightness),
+                                 base: 0, range: -1...1, step: 0.01, decimals: 2,
+                                 suffix: "", compact: true)
+
+                    MToggleRow(label: "边字", isOn: borderBool(\.edgeText), compact: true)
+                    if session.border.edgeText {
+                        MTextFieldRow(label: "边字内容", text: borderText,
+                                      placeholder: "自动（随胶片）")
+                        MChoiceRow(label: "边字颜色", value: textToneValue.label,
+                                   options: textToneOptions) { raw in
+                            session.updateBorder { $0.textTone = raw }
+                        }
+                        MParamSlider(label: "边字大小", value: borderDouble(\.textScale),
+                                     base: 1, range: 0.5...2.5, step: 0.01, decimals: 2,
+                                     suffix: "×", compact: true)
+                        MToggleRow(label: "画幅编号", isOn: borderBool(\.frameNumbers),
+                                   compact: true)
+                        MToggleRow(label: "DX 码", isOn: borderBool(\.dxCode), compact: true)
+                    }
+
+                    if session.border.gaugeValue.isSheet {
+                        MToggleRow(label: "片缺口", isOn: borderBool(\.notch), compact: true)
+                    }
+
+                    MParamSlider(label: "划痕", value: borderDouble(\.scratches),
+                                 base: 0.18, range: 0...1, step: 0.01, decimals: 2,
+                                 suffix: "", compact: true)
+                    MParamSlider(label: "灰尘", value: borderDouble(\.dust),
+                                 base: 0.14, range: 0...1, step: 0.01, decimals: 2,
+                                 suffix: "", compact: true)
+                    MParamSlider(label: "边缘雾化", value: borderDouble(\.fog),
+                                 base: 0.10, range: 0...1, step: 0.01, decimals: 2,
+                                 suffix: "", compact: true)
+                }
+            }
+            .padding(.horizontal, MMetric.pageMargin)
+            .padding(.bottom, 14)
+            .background(MPanelHeightReporter())
+        }
+        .scrollIndicators(.never)
+        .defaultScrollAnchor(DebugLaunch.gradePanelBottom ? .bottom : .top)
+    }
+
+    // MARK: 调色/片边绑定
+
+    private func hslBinding(_ keyPath: WritableKeyPath<HslBand, Double>) -> Binding<Double> {
+        Binding(
+            get: {
+                recipe.hslBands.indices.contains(hslBand)
+                    ? recipe.hslBands[hslBand][keyPath: keyPath] : 0
+            },
+            set: { value in
+                guard recipe.hslBands.indices.contains(hslBand) else { return }
+                recipe.hslBands[hslBand][keyPath: keyPath] = value
+            }
+        )
+    }
+
+    private var gradingZoneKeyPath: WritableKeyPath<ColorGrading, GradeZone> {
+        switch gradingZone {
+        case 0: return \.shadows
+        case 2: return \.highlights
+        default: return \.midtones
+        }
+    }
+
+    private func gradingBinding(_ keyPath: WritableKeyPath<GradeZone, Double>) -> Binding<Double> {
+        let zone = gradingZoneKeyPath
+        return Binding(
+            get: { recipe.grading[keyPath: zone][keyPath: keyPath] },
+            set: { recipe.grading[keyPath: zone][keyPath: keyPath] = $0 }
+        )
+    }
+
+    private func bandChips(
+        labels: [String],
+        colors: [Double]?,
+        selected: Int,
+        action: @escaping (Int) -> Void
+    ) -> some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 6) {
+                ForEach(Array(labels.enumerated()), id: \.offset) { index, label in
+                    Button {
+                        MHaptic.tick()
+                        withAnimation(MMotion.state) { action(index) }
+                    } label: {
+                        HStack(spacing: 4) {
+                            if let colors {
+                                Circle()
+                                    .fill(Color(hue: colors[index], saturation: 0.72, brightness: 0.86))
+                                    .frame(width: 7, height: 7)
+                            }
+                            Text(label)
+                                .font(.mSans(9, selected == index ? .semibold : .regular))
+                                .foregroundStyle(selected == index ? MColor.brass : MColor.text3)
+                        }
+                        .padding(.horizontal, 9)
+                        .frame(height: 24)
+                        .background(
+                            Capsule().fill(selected == index ? MColor.brassWash : MColor.surface2.opacity(0.7))
+                        )
+                        .overlay(
+                            Capsule().strokeBorder(
+                                selected == index ? MColor.brass.opacity(0.32) : MColor.hairlineFaint,
+                                lineWidth: 1
+                            )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .scrollIndicators(.never)
+    }
+
+    private func resetButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.mSans(11, .medium))
+                .foregroundStyle(MColor.text2)
+                .frame(maxWidth: .infinity)
+                .frame(height: 32)
+                .background(
+                    RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
+                        .fill(MColor.surface2)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
+                        .strokeBorder(MColor.hairline, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 12)
+    }
+
+    private var cornerValue: MFilmBorderCorner {
+        MFilmBorderCorner(rawValue: session.border.corner) ?? .rounded
+    }
+
+    private var baseValue: MFilmBorderBase {
+        MFilmBorderBase(rawValue: session.border.baseTone) ?? .colorNegative
+    }
+
+    private var textToneValue: MFilmBorderTextTone {
+        MFilmBorderTextTone(rawValue: session.border.textTone) ?? .auto
+    }
+
+    private var borderPresetOptions: [MProOption] {
+        MFilmBorderPreset.all.map { MProOption(value: $0.id, label: $0.name) }
+    }
+
+    private var gaugeOptions: [MProOption] {
+        MFilmBorderGauge.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var cornerOptions: [MProOption] {
+        MFilmBorderCorner.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var perfOptions: [MProOption] {
+        MFilmBorderPerf.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var baseOptions: [MProOption] {
+        MFilmBorderBase.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var textToneOptions: [MProOption] {
+        MFilmBorderTextTone.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private func borderPresetIsSelected(_ preset: MFilmBorderPreset) -> Bool {
+        guard session.border.enabled == preset.config.enabled else { return false }
+        return preset.config.matches(session.border)
+    }
+
+    private var borderEnabled: Binding<Bool> {
+        Binding(
+            get: { session.border.enabled },
+            set: { isOn in
+                if isOn, session.border.preset == "none",
+                   let preset = MFilmBorderPreset.preset(id: "kodak135") {
+                    withAnimation(MMotion.state) { session.setBorderPreset(preset) }
+                } else {
+                    session.updateBorder { $0.enabled = isOn }
+                }
+            }
+        )
+    }
+
+    private func borderDouble(
+        _ keyPath: WritableKeyPath<MFilmBorderConfig, Double>
+    ) -> Binding<Double> {
+        Binding(
+            get: { session.border[keyPath: keyPath] },
+            set: { value in session.updateBorder { $0[keyPath: keyPath] = value } }
+        )
+    }
+
+    private func borderBool(
+        _ keyPath: WritableKeyPath<MFilmBorderConfig, Bool>
+    ) -> Binding<Bool> {
+        Binding(
+            get: { session.border[keyPath: keyPath] },
+            set: { value in session.updateBorder { $0[keyPath: keyPath] = value } }
+        )
+    }
+
+    private var borderText: Binding<String> {
+        Binding(
+            get: { session.border.customText },
+            set: { value in session.updateBorder { $0.customText = value } }
+        )
     }
 
     // MARK: - 工具条
@@ -1044,7 +1414,8 @@ struct GradeScreen: View {
             ("预设", "rectangle.stack"),
             ("光影", "sun.max"),
             ("色调", "paintpalette"),
-            ("曲线", "waveform.path"),
+            ("质感", "camera.filters"),
+            ("边框", "film"),
         ]
     }
 
@@ -1052,8 +1423,8 @@ struct GradeScreen: View {
     private func syncCurve() {
         recipe.curveShadows = curveOffset(at: 0.12)
         recipe.curveDarks = curveOffset(at: 0.35)
-        recipe.curveLights = curveOffset(at: 0.65)
-        recipe.curveHighlights = curveOffset(at: 0.92)
+        recipe.curveLights = curveOffset(at: 0.62)
+        recipe.curveHighlights = curveOffset(at: 0.88)
     }
 
     private func curveOffset(at x: Double) -> Double {

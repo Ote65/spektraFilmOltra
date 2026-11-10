@@ -40,6 +40,7 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSPhotoLibraryAddUsageDescription: "导出成片会保存到系统相册，方便直接在照片 App 里查看与分享。"
+        NSCameraUsageDescription: "取景拍照需要访问相机：只拍摄 RAW（DNG），拍完直接入库显影。"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.spektrafilm.mobile

@@ -323,6 +323,10 @@ final class MobileEngine: ObservableObject {
         }
         let grade = MobileGradeSession(photo: photo, store: store, develop: develop)
         gradeSession = grade
+        if let id = DebugLaunch.gradeBorder,
+           let preset = MFilmBorderPreset.preset(id: id) {
+            grade.setBorderPreset(preset)
+        }
         grade.start()
         return grade
     }

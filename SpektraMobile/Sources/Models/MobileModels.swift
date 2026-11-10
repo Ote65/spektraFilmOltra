@@ -148,14 +148,15 @@ struct MLUT: Identifiable, Hashable {
 }
 
 enum MGradeTab: String, CaseIterable, Identifiable {
-    case presets, light, color, curve
+    case presets, light, color, texture, border
     var id: String { rawValue }
     var title: String {
         switch self {
         case .presets: return "预设"
         case .light: return "光影"
         case .color: return "色调"
-        case .curve: return "曲线"
+        case .texture: return "质感"
+        case .border: return "边框"
         }
     }
 }
@@ -172,6 +173,10 @@ struct MGradeRecipe: Equatable {
     var temperature: Double = 0
     var tint: Double = 0
     var saturation: Double = 0
+    var vibrance: Double = 0
+    var colorDensity: Double = 0
+    var hslBands: [HslBand] = Array(repeating: HslBand(), count: 8)
+    var grading = ColorGrading()
     var vignette: Double = 0
     var grain: Double = 0
     var lutName: String = "无 LUT"
@@ -180,6 +185,20 @@ struct MGradeRecipe: Equatable {
     var curveLights: Double = 0
     var curveDarks: Double = 0
     var curveShadows: Double = 0
+    var clarity: Double = 0
+    var texture: Double = 0
+    var dehaze: Double = 0
+    var sharpenAmount: Double = 0
+    var sharpenRadius: Double = 1
+    var sharpenThreshold: Double = 0
+    var noiseLuminance: Double = 0
+    var noiseColor: Double = 0
+    var grainSize: Double = 25
+    var grainRoughness: Double = 50
+    var vignetteMidpoint: Double = 50
+    var vignetteRoundness: Double = 0
+    var vignetteFeather: Double = 50
+    var chromaticAberration: Double = 0
 
     /// 视图模型 → 调色引擎配方。只写既有字段，不新增算法。
     func gradeRecipe(lutPath: String) -> GradeRecipe {
@@ -199,8 +218,26 @@ struct MGradeRecipe: Equatable {
         recipe.color.temperature = temperature
         recipe.color.tint = tint
         recipe.color.saturation = saturation
+        recipe.color.vibrance = vibrance
+        recipe.color.colorDensity = colorDensity
+        recipe.color.hsl = hslBands
+        recipe.color.grading = grading
         recipe.optics.vignetteAmount = vignette
+        recipe.optics.vignetteMidpoint = vignetteMidpoint
+        recipe.optics.vignetteRoundness = vignetteRoundness
+        recipe.optics.vignetteFeather = vignetteFeather
         recipe.optics.grainAmount = grain
+        recipe.optics.grainSize = grainSize
+        recipe.optics.grainRoughness = grainRoughness
+        recipe.optics.chromaticAberration = chromaticAberration
+        recipe.quality.clarity = clarity
+        recipe.quality.texture = texture
+        recipe.quality.dehaze = dehaze
+        recipe.quality.sharpenAmount = sharpenAmount
+        recipe.quality.sharpenRadius = sharpenRadius
+        recipe.quality.sharpenThreshold = sharpenThreshold
+        recipe.quality.noiseLuminance = noiseLuminance
+        recipe.quality.noiseColor = noiseColor
         recipe.lut.path = lutPath
         recipe.lut.strength = lutStrength
         return recipe
@@ -223,8 +260,28 @@ struct MGradeRecipe: Equatable {
         temperature = grade.color.temperature
         tint = grade.color.tint
         saturation = grade.color.saturation
+        vibrance = grade.color.vibrance
+        colorDensity = grade.color.colorDensity
+        hslBands = (0..<8).map { index in
+            index < grade.color.hsl.count ? grade.color.hsl[index] : HslBand()
+        }
+        grading = grade.color.grading
         vignette = grade.optics.vignetteAmount
+        vignetteMidpoint = grade.optics.vignetteMidpoint
+        vignetteRoundness = grade.optics.vignetteRoundness
+        vignetteFeather = grade.optics.vignetteFeather
         grain = grade.optics.grainAmount
+        grainSize = grade.optics.grainSize
+        grainRoughness = grade.optics.grainRoughness
+        chromaticAberration = grade.optics.chromaticAberration
+        clarity = grade.quality.clarity
+        texture = grade.quality.texture
+        dehaze = grade.quality.dehaze
+        sharpenAmount = grade.quality.sharpenAmount
+        sharpenRadius = grade.quality.sharpenRadius
+        sharpenThreshold = grade.quality.sharpenThreshold
+        noiseLuminance = grade.quality.noiseLuminance
+        noiseColor = grade.quality.noiseColor
         self.lutName = lutName
         lutStrength = grade.lut.strength
     }
@@ -234,6 +291,7 @@ struct MGradeRecipe: Equatable {
 
 enum MScreen: Hashable {
     case home
+    case camera
     case develop
     case grade
 }

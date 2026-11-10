@@ -27,11 +27,17 @@ final class MobileGradeSession: ObservableObject {
     @Published private(set) var isExporting = false
     @Published private(set) var lastSavedURL: URL?
     @Published private(set) var previewAspect: CGFloat = 4.0 / 3.0
+    /// 片边：只影响预览与导出，不写入调色配方。
+    @Published private(set) var border = MFilmBorderConfig()
     /// 调色台预览比例（相对 1600 交接图）：1/8、1/4、1/2、1/1。
     @Published private(set) var previewScale: Double
 
     private let gradeQueue = DispatchQueue(label: "spektra.mobile.grade", qos: .userInitiated)
     private var source: ImageRGB?
+    /// 最近一帧「无片边」的调色结果 / 原片显示图；改片边时只重合成这两张。
+    private var basePreviewCG: CGImage?
+    private var originalBaseCG: CGImage?
+    private var borderPersistWork: DispatchWorkItem?
     private var displayRecipe = MGradeRecipe()
     private var lutPath = ""
     private var token = 0
@@ -61,6 +67,10 @@ final class MobileGradeSession: ObservableObject {
         self.previewScale = saved >= 0.125 && saved <= 1.0 ? saved : 1.0
         self.presets = GradePresetStore.shared.all
         self.luts = GradePresetStore.shared.luts()
+        if let data = photo.borderData,
+           let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
+            self.border = decoded.normalized()
+        }
     }
 
     // MARK: - 启动
@@ -71,6 +81,8 @@ final class MobileGradeSession: ObservableObject {
         phaseProgress = 0
         sourceFailure = nil
         errorMessage = nil
+        let filmID = develop.filmID
+        let borderConfig = border
         develop.prepareHandoff(maxEdge: sourceEdge) { [weak self] image in
             guard let self else { return }
             guard let image else {
@@ -86,7 +98,12 @@ final class MobileGradeSession: ObservableObject {
             // 交接图是线性 ProPhoto；对比原图必须先转成线性 sRGB 再显示编码，
             // 否则会把 ProPhoto 当成 sRGB 直接编码，出现明显偏色。
             let display = PreviewLUTService.displayImage(fromLinear: linear)
-            let original = PreviewRenderer.cgImage(from: display)
+            let baseOriginal = PreviewRenderer.cgImage(from: display)
+            let framedOriginal = baseOriginal.map {
+                MFilmBorderRenderer.preview(
+                    photo: $0, config: borderConfig, filmID: filmID, photoID: self.photoID
+                ) ?? $0
+            }
             Task { @MainActor in
                 self.source = linear
                 self.sourceReady = true
@@ -94,9 +111,12 @@ final class MobileGradeSession: ObservableObject {
                 self.errorMessage = nil
                 self.isRendering = false
                 self.phaseLabel = ""
-                self.previewAspect = CGFloat(image.width) / CGFloat(max(1, image.height))
-                if let original {
-                    self.originalImage = MImage.make(cgImage: original)
+                self.originalBaseCG = baseOriginal
+                if let framedOriginal {
+                    self.originalImage = MImage.make(cgImage: framedOriginal)
+                    self.previewAspect = CGFloat(framedOriginal.width) / CGFloat(max(1, framedOriginal.height))
+                } else {
+                    self.previewAspect = CGFloat(image.width) / CGFloat(max(1, image.height))
                 }
                 self.schedule(immediate: true)
             }
@@ -130,6 +150,71 @@ final class MobileGradeSession: ObservableObject {
         UserDefaults.standard.set(value, forKey: Self.previewScaleKey)
         guard sourceReady, !isExporting else { return }
         schedule(immediate: true)
+    }
+
+    // MARK: - 片边
+
+    /// 只改片边时不必重跑调色：拿当前「无片边」帧重新合成即可。
+    private func applyBorderToPreview() {
+        guard let base = basePreviewCG else { return }
+        let framed = MFilmBorderRenderer.preview(
+            photo: base, config: border, filmID: develop.filmID, photoID: photoID
+        ) ?? base
+        previewImage = MImage.make(cgImage: framed)
+        previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
+        if let original = originalBaseCG {
+            let framedOriginal = MFilmBorderRenderer.preview(
+                photo: original, config: border, filmID: develop.filmID, photoID: photoID
+            ) ?? original
+            originalImage = MImage.make(cgImage: framedOriginal)
+        }
+    }
+
+    func setBorder(_ config: MFilmBorderConfig) {
+        let value = config.normalized()
+        guard value != border else { return }
+        border = value
+        persistBorderSoon()
+        applyBorderToPreview()
+    }
+
+    func setBorderPreset(_ preset: MFilmBorderPreset) {
+        var value = preset.config
+        value.enabled = preset.id != "none"
+        value.preset = preset.id
+        setBorder(value)
+    }
+
+    func updateBorder(_ mutate: (inout MFilmBorderConfig) -> Void) {
+        var value = border
+        mutate(&value)
+        value = value.normalized()
+        if !value.enabled {
+            value.preset = "none"
+        } else {
+            let matchesPreset = MFilmBorderPreset.preset(id: value.preset).map {
+                $0.id != "none" && $0.config.matches(value)
+            } ?? false
+            value.preset = matchesPreset ? value.preset : "custom"
+        }
+        setBorder(value)
+    }
+
+    func resetBorder() {
+        setBorder(MFilmBorderConfig())
+    }
+
+    private func persistBorderSoon() {
+        borderPersistWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.persistBorderNow() }
+        borderPersistWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func persistBorderNow() {
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        photo.borderData = try? JSONEncoder().encode(border)
+        try? store.update(photo)
     }
 
     // MARK: - 配方
@@ -214,6 +299,9 @@ final class MobileGradeSession: ObservableObject {
         let flag = MCancelFlag()
         activeFlag = flag
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
+        let borderConfig = border
+        let filmID = develop.filmID
+        let photoID = self.photoID
         proxyInFlight = edge <= proxyEdge
         isRendering = true
         phaseLabel = edge <= proxyEdge ? "调色代理" : "调色精修"
@@ -225,9 +313,22 @@ final class MobileGradeSession: ObservableObject {
                     input, recipe: recipe,
                     shouldCancel: { flag.isCancelled })
                 let cgImage = PreviewRenderer.cgImage(from: result.image)
+                let framed = cgImage.map {
+                    MFilmBorderRenderer.preview(
+                        photo: $0, config: borderConfig, filmID: filmID, photoID: photoID
+                    ) ?? $0
+                }
                 Task { @MainActor [weak self] in
-                    guard let self, self.activeFlag === flag, let cgImage else { return }
-                    self.previewImage = MImage.make(cgImage: cgImage)
+                    guard let self, self.activeFlag === flag, let framed else { return }
+                    self.basePreviewCG = cgImage
+                    if self.border == borderConfig {
+                        self.previewImage = MImage.make(cgImage: framed)
+                        self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
+                    } else if let cgImage {
+                        // 渲染期间又改了片边：以最新片边重新合成，避免回退成旧边框。
+                        self.basePreviewCG = cgImage
+                        self.applyBorderToPreview()
+                    }
                     self.isRendering = false
                     self.proxyInFlight = false
                     self.phaseLabel = ""
@@ -255,7 +356,13 @@ final class MobileGradeSession: ObservableObject {
         }
         let originalEdge = max(store.photos.first(where: { $0.id == photoID })?.width ?? 0,
                                store.photos.first(where: { $0.id == photoID })?.height ?? 0)
-        let edge = ExportEdge.resolve(index: longEdgeIndex, originalLongEdge: originalEdge)
+        let borderConfig = border
+        let filmID = develop.filmID
+        let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
+        // 片边会把成品放大一圈：开启片边时「原始」也按内存余量钳位，避免大图导出被 jetsam。
+        let edge = (longEdgeIndex == 0 && !borderConfig.enabled)
+            ? rawEdge
+            : ExportEdge.clampToMemoryBudget(rawEdge)
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
         let targetSpace: String
         let targetCCTF: Bool
@@ -288,12 +395,21 @@ final class MobileGradeSession: ObservableObject {
                 }
                 return
             }
+            let exportPhotoID = self.photoID
             self.gradeQueue.async {
                 do {
                     let linear = GradeEngine.prepareSource(image)
                     let result = try GradeEngine.render(linear, recipe: recipe)
-                    let output = Self.convertForExport(
+                    var output = Self.convertForExport(
                         result.image, colorSpace: targetSpace, cctfEncoding: targetCCTF)
+                    if borderConfig.enabled {
+                        Task { @MainActor in self.exportLabel = "合成片边" }
+                        output = MFilmBorderRenderer.composite(
+                            image: output, config: borderConfig,
+                            filmID: filmID, photoID: exportPhotoID,
+                            colorSpace: targetSpace, cctfEncoding: targetCCTF
+                        )
+                    }
                     try FileManager.default.createDirectory(
                         at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                     try ImageExport.save(output, to: destination, bitDepth: bitDepth,

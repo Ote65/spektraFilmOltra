@@ -24,6 +24,8 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>取景拍照需要访问相机：只拍摄 RAW（DNG），拍完直接入库显影。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>导出成片会保存到系统相册，方便直接在照片 App 里查看与分享。</string>
 	<key>NSPhotoLibraryUsageDescription</key>

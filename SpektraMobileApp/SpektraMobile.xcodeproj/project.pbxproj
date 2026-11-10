@@ -35,6 +35,8 @@
 		5E4A3B27AE8A660896679EE6 /* MobileComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFEB333890C0D09618141435 /* MobileComponents.swift */; };
 		6067EE188061AFA44AE6E30E /* DevelopScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */; };
 		F1B0A0013C0DE00000000001 /* FilmBorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1B0A0013C0DE00000000002 /* FilmBorder.swift */; };
+		CA5E000000000000000000B1 /* CameraScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA5E000000000000000000A1 /* CameraScreen.swift */; };
+		CA5E000000000000000000B2 /* MCameraSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA5E000000000000000000A2 /* MCameraSession.swift */; };
 		66D070ACC8D57BA6A57610F3 /* MPlatformImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8680D530984F0FFC3DB0DB5 /* MPlatformImage.swift */; };
 		66F8559ED2256B7A1577CB73 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A54F78C0361C2A53D3A662EE /* Assets.xcassets */; };
 		681EEE5D1A70C4EB8E02039E /* PrintingStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 184511334DF68051A980B842 /* PrintingStage.swift */; };
@@ -149,6 +151,8 @@
 		FC0E0B7CF1C19335D215739A /* ParamsDigest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParamsDigest.swift; sourceTree = "<group>"; };
 		FFEB333890C0D09618141435 /* MobileComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileComponents.swift; sourceTree = "<group>"; };
 		F1B0A0013C0DE00000000002 /* FilmBorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilmBorder.swift; sourceTree = "<group>"; };
+		CA5E000000000000000000A1 /* CameraScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraScreen.swift; sourceTree = "<group>"; };
+		CA5E000000000000000000A2 /* MCameraSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCameraSession.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -220,6 +224,7 @@
 		2B6A357311C2C74A68C07BFB /* Screens */ = {
 			isa = PBXGroup;
 			children = (
+				CA5E000000000000000000A1 /* CameraScreen.swift */,
 				BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */,
 				C0A755E3FD7A42CA434C6E5F /* GradeScreen.swift */,
 				2B4C8A0F0875D1B13367B022 /* HomeScreen.swift */,
@@ -266,6 +271,7 @@
 		67E46AED7531C246AA2744A3 /* Engine */ = {
 			isa = PBXGroup;
 			children = (
+				CA5E000000000000000000A2 /* MCameraSession.swift */,
 				1CEE45A13ABE31F2DB4722F3 /* MobileDevelopSession.swift */,
 				5EEDAA0000000000000000A2 /* PhotoLibraryExport.swift */,
 				E536D899C0B961A72C903EA3 /* MobileEngine.swift */,
@@ -497,6 +503,8 @@
 				490BC923DCA9E264F945A512 /* GradeScreen.swift in Sources */,
 				DB95BA62357ABE2B3D4D97EA /* Grain.swift in Sources */,
 				B987F484A5858A7B17BE15F3 /* HomeScreen.swift in Sources */,
+				CA5E000000000000000000B1 /* CameraScreen.swift in Sources */,
+				CA5E000000000000000000B2 /* MCameraSession.swift in Sources */,
 				28965A5D0690C02605787564 /* Illuminants.swift in Sources */,
 				87C712CA8DD0AE217C0A440D /* Image.swift in Sources */,
 				D3B971273D4844E452DE30BE /* ImageBridge.swift in Sources */,

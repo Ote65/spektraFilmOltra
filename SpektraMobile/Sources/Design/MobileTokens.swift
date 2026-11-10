@@ -251,7 +251,9 @@ enum DebugLaunch {
         switch args[index + 1] {
         case "presets": return 0
         case "color": return 2
-        case "curve": return 3
+        case "texture": return 3
+        case "border": return 4
+        case "curve": return 1
         default: return 1
         }
     }
@@ -290,6 +292,14 @@ enum DebugLaunch {
         case "max": return MMetric.drawerMax
         default: return MMetric.drawerMin
         }
+    }
+
+    /// 截图验收用：启动时直接套用某个片边预设，检查调色台预览/导出。
+    static var gradeBorder: String? {
+        guard let index = args.firstIndex(of: "--border"), args.indices.contains(index + 1) else {
+            return nil
+        }
+        return args[index + 1]
     }
 }
 

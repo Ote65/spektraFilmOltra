@@ -29,6 +29,7 @@ struct MobileRootView: View {
         var start: MScreen = .home
         if let index = args.firstIndex(of: "--screen"), args.indices.contains(index + 1) {
             switch args[index + 1] {
+            case "camera": start = .camera
             case "develop": start = .develop
             case "grade": start = .grade
             default: break
@@ -58,10 +59,20 @@ struct MobileRootView: View {
                 onOpenGrade: { photo in
                     openGrade(photo.id, entry: .direct, returningTo: .home)
                 },
+                onOpenCamera: openCamera,
                 onToast: showToast
             )
-            .offset(x: screen == .home ? 0 : -72)
+            .offset(x: screen == .home || screen == .camera ? 0 : -72)
             .allowsHitTesting(screen == .home)
+
+            if screen == .camera {
+                CameraScreen(
+                    onClose: closeCamera,
+                    onCaptured: handleCapture
+                )
+                .transition(.opacity)
+                .zIndex(3)
+            }
 
             if let develop {
                 DevelopScreen(
@@ -145,7 +156,7 @@ struct MobileRootView: View {
                 develop = engine.openDevelop(photoID: first.id)
             case .grade:
                 grade = engine.openGrade(photoID: first.id, entry: .direct)
-            case .home:
+            case .home, .camera:
                 break
             }
             applyDebugQuickIfNeeded(to: develop)
@@ -166,6 +177,35 @@ struct MobileRootView: View {
     }
 
     // MARK: - 导航
+
+    private func openCamera() {
+        withAnimation(MMotion.push) { screen = .camera }
+    }
+
+    private func closeCamera() {
+        withAnimation(MMotion.push) { screen = .home }
+    }
+
+    /// 相机拍完：RAW 入库 → 同步写入系统相册 → 直接进显影台看片。
+    private func handleCapture(_ url: URL) {
+        // 入库要复制 DNG、读写库索引，别压在这一拍的视图更新里，否则快门反馈和转场会顿一下。
+        Task { @MainActor in
+            await Task.yield()
+            let report = engine.importPhotos([url])
+            // 主页网格的数据源是系统相册，所以拍到的 DNG 也要写进相册才能立刻出现在列表里。
+            PhotoLibraryExport.save(url) { _ in
+                try? FileManager.default.removeItem(at: url)
+            }
+
+            guard report.imported > 0, let photoID = report.firstID else {
+                showToast(report.reason.isEmpty ? "拍摄的 RAW 没能入库" : report.reason)
+                withAnimation(MMotion.push) { screen = .home }
+                return
+            }
+            showToast("已拍摄 · RAW 已入库")
+            openDevelop(photoID)
+        }
+    }
 
     private func openDevelop(_ photoID: String) {
         engine.closeGrade()

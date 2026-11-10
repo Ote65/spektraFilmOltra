@@ -6,6 +6,7 @@ struct HomeScreen: View {
     @ObservedObject var engine: MobileEngine
     let onOpenDevelop: (MPhoto) -> Void
     let onOpenGrade: (MPhoto) -> Void
+    let onOpenCamera: () -> Void
     let onToast: (String) -> Void
 
     @State private var filter: HomeFilter = .all
@@ -262,47 +263,52 @@ struct HomeScreen: View {
     // MARK: - 底部
 
     private var bottomBar: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: "square.grid.2x2")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(MColor.text3)
-                Text("全部 · \(visibleAssets.count)")
-                    .font(.mSans(10, .medium))
-                    .foregroundStyle(MColor.text3)
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 42)
-            .background(Capsule().fill(MColor.surface1.opacity(0.92)))
-            .overlay(Capsule().strokeBorder(MColor.hairline, lineWidth: 1))
-
-            Spacer(minLength: 0)
-
-            MCircleIconButton(icon: "arrow.up.arrow.down", size: 13, frame: 42) {
-                MHaptic.tick()
-                withAnimation(MMotion.state) {
-                    sortMode = sortMode == .recent ? .filename : .recent
-                }
-            }
-
-            Button {
-                MHaptic.tick()
-                folderPickerOpen = true
-            } label: {
+        ZStack {
+            HStack(spacing: 10) {
                 HStack(spacing: 6) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("导入")
-                        .font(.mSans(12, .semibold))
+                    Image(systemName: "square.grid.2x2")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(MColor.text3)
+                    Text("全部 · \(visibleAssets.count)")
+                        .font(.mSans(10, .medium))
+                        .foregroundStyle(MColor.text3)
                 }
-                .foregroundStyle(MColor.brassInk)
-                .padding(.horizontal, 18)
-                .frame(height: 46)
-                .background(Capsule().fill(MColor.brass))
-                .contentShape(Capsule())
+                .padding(.horizontal, 12)
+                .frame(height: 42)
+                .background(Capsule().fill(MColor.surface1.opacity(0.92)))
+                .overlay(Capsule().strokeBorder(MColor.hairline, lineWidth: 1))
+
+                Spacer(minLength: 0)
+
+                MCircleIconButton(icon: "arrow.up.arrow.down", size: 13, frame: 42) {
+                    MHaptic.tick()
+                    withAnimation(MMotion.state) {
+                        sortMode = sortMode == .recent ? .filename : .recent
+                    }
+                }
+
+                Button {
+                    MHaptic.tick()
+                    folderPickerOpen = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("导入")
+                            .font(.mSans(12, .semibold))
+                    }
+                    .foregroundStyle(MColor.brassInk)
+                    .padding(.horizontal, 18)
+                    .frame(height: 46)
+                    .background(Capsule().fill(MColor.brass))
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(MPressStyle(scale: 0.94))
             }
-            .buttonStyle(MPressStyle(scale: 0.94))
+
+            cameraEntry
         }
+        .frame(height: 46)
         .padding(.horizontal, MMetric.pageMargin)
         .padding(.top, 10)
         .padding(.bottom, insets.bottom)
@@ -314,6 +320,44 @@ struct HomeScreen: View {
             )
             .allowsHitTesting(false)
         )
+    }
+
+    /// 底部居中的圆形拍照入口：黄铜光圈按钮。
+    private var cameraEntry: some View {
+        Button {
+            MHaptic.medium()
+            onOpenCamera()
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [MColor.brassHigh, MColor.brass, MColor.brassDeep],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                Circle()
+                    .strokeBorder(MColor.brassInk.opacity(0.24), lineWidth: 1)
+                    .padding(4)
+
+                Image(systemName: "camera.aperture")
+                    .font(.system(size: 21, weight: .light))
+                    .foregroundStyle(MColor.brassInk)
+            }
+            .frame(width: 60, height: 60)
+            .shadow(color: .black.opacity(0.46), radius: 10, y: 4)
+            .overlay(alignment: .topTrailing) {
+                Circle()
+                    .fill(MColor.filmRed)
+                    .frame(width: 7, height: 7)
+                    .overlay(Circle().strokeBorder(MColor.app.opacity(0.55), lineWidth: 1))
+                    .offset(x: -4, y: 4)
+            }
+        }
+        .buttonStyle(MPressStyle(scale: 0.92))
+        .accessibilityLabel("拍照")
     }
 
     // MARK: - 长按菜单

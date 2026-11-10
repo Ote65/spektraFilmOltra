@@ -308,12 +308,8 @@ enum GradeEngine {
 
         let shadowTable = hasShadows
             ? toneMaskTable(center: 0.26, width: 0.19, gateDark: true) : []
-        let blackTable = hasBlacks
-            ? toneMaskTable(center: 0.00, width: 0.13, gateDark: false) : []
         let highlightTable = hasHighlights
             ? toneMaskTable(center: 0.74, width: 0.18, gateDark: false) : []
-        let whiteTable = hasWhites
-            ? toneMaskTable(center: 1.00, width: 0.16, gateDark: false) : []
         let midtoneTable = hasMidtones
             ? toneMaskTable(center: 0.47, width: 0.20, gateDark: false) : []
 
@@ -324,13 +320,16 @@ enum GradeEngine {
                 delta += shadows / 100 * 0.28 * sampleMask(shadowTable, y)
             }
             if hasBlacks {
-                delta += blacks / 100 * 0.18 * sampleMask(blackTable, y)
+                // 黑场是端点控制：从纯黑一路铺到约 0.6，而不是只擦最暗的 13% 像素。
+                // 旧的高斯钟形让 +100 也只抬 0.09 L，看似「完全没反应」。
+                delta += blacks / 100 * 0.24 * (1 - smoothstep(0.05, 0.60, y))
             }
             if hasHighlights {
                 delta += highlights / 100 * 0.26 * sampleMask(highlightTable, y)
             }
             if hasWhites {
-                delta += whites / 100 * 0.20 * sampleMask(whiteTable, y)
+                // 白场同理：从约 0.4 开始抬升，避开「正向被 1.0 截断吃掉」的区间。
+                delta += whites / 100 * 0.24 * smoothstep(0.40, 0.95, y)
             }
             if hasMidtones {
                 delta += midtones / 100 * 0.16 * sampleMask(midtoneTable, y)
@@ -351,26 +350,88 @@ enum GradeEngine {
         }
     }
 
+    /// 点曲线：四个分段量是 0…1 输入域上的偏移，在 6 个节点间做单调三次插值（PCHIP）后逐通道查表。
+    /// 旧实现把四段钟形权重相加，S 形拖动会在中灰附近互相抵消甚至反相，
+    /// 表现为「拖了曲线但画面不动 / 中间调被拉灰」。
     private static func applyParametricCurve(_ data: inout [Double], count: Int,
                                              light: LightRecipe) {
-        let curve: [(Double, Double)] = [
-            (light.curveHighlights, 0.88),
-            (light.curveLights, 0.62),
-            (light.curveDarks, 0.35),
-            (light.curveShadows, 0.12),
+        let amounts: [Double] = [
+            0,
+            light.curveShadows,
+            light.curveDarks,
+            light.curveLights,
+            light.curveHighlights,
+            0,
         ]
-        guard curve.contains(where: { abs($0.0) > 1e-6 }) else { return }
-        var lumaValues = [Double](repeating: 0, count: count)
-        for i in 0..<count { lumaValues[i] = luma(data, i) }
-        for (amount, center) in curve where abs(amount) > 1e-6 {
-            for i in 0..<count {
-                let mask = exp(-0.5 * pow((lumaValues[i] - center) / 0.14, 2))
-                let delta = amount / 100 * 0.18 * mask
-                data[i * 3] += delta
-                data[i * 3 + 1] += delta
-                data[i * 3 + 2] += delta
+        guard amounts.contains(where: { abs($0) > 1e-6 }) else { return }
+
+        let xs: [Double] = [0, 0.12, 0.35, 0.62, 0.88, 1]
+        var ys = zip(xs, amounts).map { min(max($0 + $1 / 100, 0), 1) }
+        // 端点固定，避免把纯黑/纯白整段压扁。
+        ys[0] = 0
+        ys[ys.count - 1] = 1
+
+        let slopes = monotoneSlopes(xs: xs, ys: ys)
+        let steps = 1024
+        var lookup = [Double](repeating: 0, count: steps)
+        for index in 0..<steps {
+            let x = Double(index) / Double(steps - 1)
+            var segment = xs.count - 2
+            for i in 0..<(xs.count - 1) where x <= xs[i + 1] {
+                segment = i
+                break
+            }
+            let h = xs[segment + 1] - xs[segment]
+            let t = h > 1e-9 ? min(max((x - xs[segment]) / h, 0), 1) : 0
+            let t2 = t * t
+            let t3 = t2 * t
+            let value = (2 * t3 - 3 * t2 + 1) * ys[segment]
+                + (t3 - 2 * t2 + t) * h * slopes[segment]
+                + (-2 * t3 + 3 * t2) * ys[segment + 1]
+                + (t3 - t2) * h * slopes[segment + 1]
+            lookup[index] = min(max(value, 0), 1)
+        }
+
+        for i in 0..<(count * 3) {
+            let position = min(max(data[i], 0), 1) * Double(steps - 1)
+            let low = Int(position)
+            if low >= steps - 1 {
+                data[i] = lookup[steps - 1]
+            } else {
+                let fraction = position - Double(low)
+                data[i] = lookup[low] * (1 - fraction) + lookup[low + 1] * fraction
             }
         }
+    }
+
+    /// Fritsch–Carlson 单调斜率：保证插值曲线不会在两个节点之间反向回头。
+    private static func monotoneSlopes(xs: [Double], ys: [Double]) -> [Double] {
+        let n = xs.count
+        var h = [Double](repeating: 0, count: n - 1)
+        var delta = [Double](repeating: 0, count: n - 1)
+        for i in 0..<(n - 1) {
+            h[i] = xs[i + 1] - xs[i]
+            delta[i] = h[i] > 1e-9 ? (ys[i + 1] - ys[i]) / h[i] : 0
+        }
+        var slopes = [Double](repeating: 0, count: n)
+        slopes[0] = delta[0]
+        slopes[n - 1] = delta[n - 2]
+        for i in 1..<(n - 1) {
+            slopes[i] = delta[i - 1] * delta[i] <= 0
+                ? 0
+                : (delta[i - 1] + delta[i]) / 2
+        }
+        for i in 0..<(n - 1) where abs(delta[i]) > 1e-9 {
+            let alpha = slopes[i] / delta[i]
+            let beta = slopes[i + 1] / delta[i]
+            let radius = alpha * alpha + beta * beta
+            if radius > 9 {
+                let tau = 3 / radius.squareRoot()
+                slopes[i] = tau * alpha * delta[i]
+                slopes[i + 1] = tau * beta * delta[i]
+            }
+        }
+        return slopes
     }
 
     private static func applyTone(_ data: inout [Double], width: Int, height: Int,
