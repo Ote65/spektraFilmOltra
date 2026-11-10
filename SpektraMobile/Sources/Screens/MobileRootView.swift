@@ -66,12 +66,10 @@ struct MobileRootView: View {
             .allowsHitTesting(screen == .home)
 
             if screen == .camera {
-                CameraScreen(
-                    onClose: closeCamera,
-                    onCaptured: handleCapture
-                )
-                .transition(.opacity)
-                .zIndex(3)
+                // 相机只负责拍 RAW 并写进系统相册，入库交给主页的相册扫描。
+                CameraScreen(onClose: closeCamera)
+                    .transition(.opacity)
+                    .zIndex(3)
             }
 
             if let develop {
@@ -184,25 +182,8 @@ struct MobileRootView: View {
 
     private func closeCamera() {
         withAnimation(MMotion.push) { screen = .home }
-    }
-
-    /// 相机拍完：RAW 入库 → 同步写入系统相册 → 直接进显影台看片。
-    private func handleCapture(_ url: URL) {
-        // 入库要复制 DNG、读写库索引，放到后台队列，别压在快门这一拍的转场里。
-        engine.importPhotosOffMain([url]) { report in
-            // 主页网格的数据源是系统相册，所以拍到的 DNG 也要写进相册才能立刻出现在列表里。
-            PhotoLibraryExport.save(url) { _ in
-                try? FileManager.default.removeItem(at: url)
-            }
-
-            guard report.imported > 0, let photoID = report.firstID else {
-                showToast(report.reason.isEmpty ? "拍摄的 RAW 没能入库" : report.reason)
-                withAnimation(MMotion.push) { screen = .home }
-                return
-            }
-            showToast("已拍摄 · RAW 已入库")
-            openDevelop(photoID)
-        }
+        // 相册里可能刚多了一张 RAW：回主页时重扫一遍。
+        Task { await engine.refreshAssets() }
     }
 
     private func openDevelop(_ photoID: String) {

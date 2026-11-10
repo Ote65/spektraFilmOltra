@@ -34,6 +34,8 @@ struct HomeScreen: View {
                     .padding(.bottom, 106)
                 }
                 .scrollIndicators(.never)
+                // 下拉刷新＝重新扫描相册里的 RAW。
+                .refreshable { await engine.refreshAssets() }
             }
 
             bottomBar

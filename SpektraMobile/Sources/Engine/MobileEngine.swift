@@ -37,7 +37,6 @@ final class MobileEngine: ObservableObject {
     @Published private(set) var importingAssetID: String?
 
     private let thumbnailQueue = DispatchQueue(label: "spektra.mobile.thumb", qos: .utility)
-    private let importQueue = DispatchQueue(label: "spektra.mobile.import", qos: .userInitiated)
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -185,54 +184,6 @@ final class MobileEngine: ObservableObject {
     private static func rawResource(for asset: PHAsset) -> PHAssetResource? {
         PHAssetResource.assetResources(for: asset).first {
             UTType($0.uniformTypeIdentifier)?.conforms(to: .rawImage) == true
-        }
-    }
-
-    /// 拍摄入库：RAW 头解析与文件复制放到后台队列，库状态仍在主线程提交，
-    /// 快门后的转场不再被几十 MB 的 DNG 复制与索引落盘卡住。
-    func importPhotosOffMain(_ urls: [URL], completion: @escaping (ImportReport) -> Void) {
-        guard !urls.isEmpty else {
-            completion(ImportReport())
-            return
-        }
-        isImporting = true
-        importQueue.async { [store] in
-            var staged: [LibraryStore.StagedImport] = []
-            var rejected: [(String, String)] = []
-            for url in urls {
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                do {
-                    staged.append(try store.stageImport(from: url))
-                } catch {
-                    rejected.append((url.lastPathComponent, (error as NSError).localizedDescription))
-                    NSLog("MImport rejected %@ — %@", url.lastPathComponent,
-                          (error as NSError).localizedDescription)
-                }
-            }
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                var report = ImportReport()
-                for item in staged {
-                    do {
-                        let photo = try self.store.commitImport(item)
-                        report.imported += 1
-                        report.firstID = report.firstID ?? photo.id
-                        self.generateThumbnail(for: photo)
-                    } catch {
-                        rejected.append((item.filename, (error as NSError).localizedDescription))
-                        NSLog("MImport commit failed %@ — %@", item.filename,
-                              (error as NSError).localizedDescription)
-                    }
-                }
-                report.rejected = rejected.count
-                if let first = rejected.first {
-                    report.reason = "\(first.0)：\(first.1)"
-                }
-                self.isImporting = false
-                self.refreshPhotos()
-                completion(report)
-            }
         }
     }
 
