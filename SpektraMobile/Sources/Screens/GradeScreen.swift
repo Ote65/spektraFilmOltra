@@ -1097,6 +1097,13 @@ struct GradeScreen: View {
                         withAnimation(MMotion.state) { session.setBorderPreset(preset) }
                     }
 
+                    if session.border.gaugeValue.is135 {
+                        MChoiceRow(label: "片边比例", value: session.border.widthModeValue.label,
+                                   options: borderWidthModeOptions) { raw in
+                            session.updateBorder { $0.widthMode = raw }
+                        }
+                    }
+
                     MChoiceRow(label: "底片规格", value: session.border.gaugeValue.label,
                                options: gaugeOptions) { raw in
                         guard let gauge = MFilmBorderGauge(rawValue: raw) else { return }
@@ -1158,21 +1165,22 @@ struct GradeScreen: View {
                                      suffix: "×", compact: true)
                         MToggleRow(label: "画幅编号", isOn: borderBool(\.frameNumbers),
                                    compact: true)
-                        MToggleRow(label: "DX 码", isOn: borderBool(\.dxCode), compact: true)
+                        MToggleRow(label: "片边编码", isOn: borderBool(\.dxCode), compact: true)
                     }
 
                     if session.border.gaugeValue.isSheet {
                         MToggleRow(label: "片缺口", isOn: borderBool(\.notch), compact: true)
                     }
 
+                    MSectionHead(title: "做旧", trailing: "默认关闭", compact: true)
                     MParamSlider(label: "划痕", value: borderDouble(\.scratches),
-                                 base: 0.18, range: 0...1, step: 0.01, decimals: 2,
+                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
                     MParamSlider(label: "灰尘", value: borderDouble(\.dust),
-                                 base: 0.14, range: 0...1, step: 0.01, decimals: 2,
+                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
                     MParamSlider(label: "边缘雾化", value: borderDouble(\.fog),
-                                 base: 0.10, range: 0...1, step: 0.01, decimals: 2,
+                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
                 }
             }
@@ -1295,6 +1303,10 @@ struct GradeScreen: View {
 
     private var gaugeOptions: [MProOption] {
         MFilmBorderGauge.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var borderWidthModeOptions: [MProOption] {
+        MFilmBorderWidthMode.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
 
     private var cornerOptions: [MProOption] {

@@ -102,6 +102,9 @@ enum MFilmBorderGauge: String, CaseIterable, Identifiable {
     }
 
     var isSheet: Bool { self == .sheet45 }
+
+    /// 135 全画幅与半格共用同一套片边比例；其它幅面的片边仍按机械尺寸换算。
+    var is135: Bool { self == .full135 || self == .half135 }
 }
 
 enum MFilmBorderPerf: String, CaseIterable, Identifiable {
@@ -236,14 +239,33 @@ enum MFilmBorderTextTone: String, CaseIterable, Identifiable {
     }
 }
 
+/// 片边宽度的两种口径：
+/// - `.visual` 按参考扫描件的观感取比例，片边纤细、画面更大；
+/// - `.real` 严格按底片机械尺寸换算，用于需要真实比例的场合。
+enum MFilmBorderWidthMode: String, CaseIterable, Identifiable {
+    case visual
+    case real
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .visual: return "视觉比例"
+        case .real: return "真实比例"
+        }
+    }
+}
+
 // MARK: - 片边参数
 
 struct MFilmBorderConfig: Codable, Hashable {
     var enabled: Bool = false
     var preset: String = "kodak135"
     var gauge: String = MFilmBorderGauge.full135.rawValue
+    /// 旧存档没有这个字段：保持可选，解码时缺失即按视觉比例处理。
+    var widthMode: String? = MFilmBorderWidthMode.visual.rawValue
     var borderScale: Double = 1.0
-    var corner: String = MFilmBorderCorner.rounded.rawValue
+    var corner: String = MFilmBorderCorner.square.rawValue
     var cornerScale: Double = 1.0
     var perf: String = MFilmBorderPerf.auto.rawValue
     var perfScale: Double = 1.0
@@ -258,14 +280,19 @@ struct MFilmBorderConfig: Codable, Hashable {
     var frameNumbers: Bool = true
     var dxCode: Bool = true
     var notch: Bool = true
-    var scratches: Double = 0.18
-    var dust: Double = 0.14
-    var fog: Double = 0.10
+    // 做旧默认全关：干净扫描件才是参考图的方向。
+    var scratches: Double = 0.0
+    var dust: Double = 0.0
+    var fog: Double = 0.0
 
     static let off = MFilmBorderConfig()
 
     var gaugeValue: MFilmBorderGauge {
         MFilmBorderGauge(rawValue: gauge) ?? .full135
+    }
+
+    var widthModeValue: MFilmBorderWidthMode {
+        MFilmBorderWidthMode(rawValue: widthMode ?? "") ?? .visual
     }
 
     var perfValue: MFilmBorderPerf {
@@ -280,8 +307,11 @@ struct MFilmBorderConfig: Codable, Hashable {
             value.gauge = MFilmBorderGauge.full135.rawValue
         }
         if MFilmBorderCorner(rawValue: value.corner) == nil {
-            value.corner = MFilmBorderCorner.rounded.rawValue
+            value.corner = MFilmBorderCorner.square.rawValue
         }
+        // 旧存档或非法值统一归一到具体口径，否则 nil 与预设里的 "visual" 不相等，
+        // 会让预设名误显示成「自定义」。
+        value.widthMode = value.widthModeValue.rawValue
         if MFilmBorderPerf(rawValue: value.perf) == nil {
             value.perf = MFilmBorderPerf.auto.rawValue
         }
@@ -335,14 +365,14 @@ struct MFilmBorderPreset: Identifiable, Hashable {
     static let all: [MFilmBorderPreset] = [
         none,
         MFilmBorderPreset(
-            id: "kodak135", name: "135 柯达", note: "KS 齿孔 · DX",
+            id: "kodak135", name: "135 柯达", note: "KS 齿孔 · 边码",
             config: presetConfig("kodak135", gauge: .full135, base: .colorNegative,
-                                 corner: .rounded, tone: .auto, dx: true)
+                                 corner: .square, tone: .auto, dx: true)
         ),
         MFilmBorderPreset(
             id: "fuji135", name: "135 富士", note: "KS 齿孔 · 绿边字",
             config: presetConfig("fuji135", gauge: .full135, base: .colorNegative,
-                                 corner: .rounded, tone: .green, dx: true)
+                                 corner: .square, tone: .green, dx: true)
         ),
         MFilmBorderPreset(
             id: "bw135", name: "135 黑白", note: "灰片基 · 白边字",
@@ -386,6 +416,7 @@ struct MFilmBorderPreset: Identifiable, Hashable {
         // 4×5 页片没有连续边字，只有缺口码；打开会压住缺口。
         value.edgeText = !gauge.isSheet
         value.perf = MFilmBorderPerf.auto.rawValue
+        value.widthMode = MFilmBorderWidthMode.visual.rawValue
         return value
     }
 
@@ -414,6 +445,8 @@ struct MFilmBorderLayout {
     /// 齿孔沿照片长边排列；横向照片的齿孔在上下边，竖向照片在左右边。
     let alongX: Bool
     let gauge: MFilmBorderGauge
+    /// 是否使用视觉比例（仅 135 生效）：齿孔与边字按片边高度等比缩放。
+    let visual: Bool
 }
 
 // MARK: - 渲染器
@@ -544,8 +577,18 @@ enum MFilmBorderRenderer {
         let longSide = max(photo.width, photo.height)
         let shortSide = min(photo.width, photo.height)
         let pxPerMM = longSide / CGFloat(gauge.frameLongMM)
-        var marginPerf = CGFloat(gauge.marginPerfMM) * pxPerMM * CGFloat(config.borderScale)
-        var marginEnd = CGFloat(gauge.marginEndMM) * pxPerMM * CGFloat(config.borderScale)
+        // 视觉比例只用于 135：真实 5.5mm 片边会把照片压成一条，与参考图观感差距过大。
+        let visual = gauge.is135 && config.widthModeValue == .visual
+        var marginPerf: CGFloat
+        var marginEnd: CGFloat
+        if visual {
+            // 上下片边约占长边 7.5%；左右是片与片之间的间隔，只留一条细边。
+            marginPerf = longSide * 0.075 * CGFloat(config.borderScale)
+            marginEnd = longSide * 0.012 * CGFloat(config.borderScale)
+        } else {
+            marginPerf = CGFloat(gauge.marginPerfMM) * pxPerMM * CGFloat(config.borderScale)
+            marginEnd = CGFloat(gauge.marginEndMM) * pxPerMM * CGFloat(config.borderScale)
+        }
         // 极端画幅（全景、16mm 电影）按真实尺寸会留下过宽的片边；压到肉眼还能接受的上限。
         marginPerf = min(marginPerf, shortSide * 0.30)
         marginEnd = min(marginEnd, longSide * 0.12)
@@ -557,7 +600,7 @@ enum MFilmBorderRenderer {
         return MFilmBorderLayout(
             photo: photo, canvas: canvas, aperture: aperture,
             marginX: marginX, marginY: marginY, pxPerMM: pxPerMM,
-            alongX: alongX, gauge: gauge
+            alongX: alongX, gauge: gauge, visual: visual
         )
     }
 
@@ -612,6 +655,11 @@ enum MFilmBorderRenderer {
             drawEdgeText(context, layout: layout, config: config,
                          filmID: filmID, photoID: photoID)
         }
+        // 视觉比例下用真实胶片边码的样式（琥珀色带 + 黑色刻痕 + 画幅号）替换方块 DX 码。
+        if layout.visual, config.dxCode {
+            drawEdgeCode(context, layout: layout, config: config,
+                         filmID: filmID, photoID: photoID)
+        }
         if config.gaugeValue.isSheet, config.notch {
             drawNotchCode(context, layout: layout, config: config)
         }
@@ -627,17 +675,18 @@ enum MFilmBorderRenderer {
         let tone = MFilmBorderBase(rawValue: config.baseTone) ?? .colorNegative
         var rgb: (Double, Double, Double)
         switch tone {
-        case .colorNegative: rgb = (0.112, 0.074, 0.045)
-        case .bw: rgb = (0.070, 0.069, 0.064)
-        case .reversal: rgb = (0.028, 0.026, 0.022)
+        // 参考扫描件的片基几乎是黑的，只在暗部透一点暖，不再是棕色相框。
+        case .colorNegative: rgb = (0.046, 0.040, 0.033)
+        case .bw: rgb = (0.036, 0.035, 0.032)
+        case .reversal: rgb = (0.020, 0.019, 0.017)
         case .clear: rgb = (0.60, 0.46, 0.29)
         }
         let gain = 1.0 + config.baseBrightness * 0.45
         rgb = (rgb.0 * gain, rgb.1 * gain, rgb.2 * gain)
         return (
-            CGFloat(min(max(rgb.0, 0.01), 0.92)),
-            CGFloat(min(max(rgb.1, 0.01), 0.92)),
-            CGFloat(min(max(rgb.2, 0.01), 0.92))
+            CGFloat(min(max(rgb.0, 0.008), 0.92)),
+            CGFloat(min(max(rgb.1, 0.008), 0.92)),
+            CGFloat(min(max(rgb.2, 0.008), 0.92))
         )
     }
 
@@ -648,11 +697,12 @@ enum MFilmBorderRenderer {
 
     private static func perfRGB(_ config: MFilmBorderConfig) -> (CGFloat, CGFloat, CGFloat) {
         let darkBase = baseLuminance(config) < 0.30
-        var value: Double = darkBase ? 0.80 : 0.10
+        // 参考图的齿孔是暖白、高对比，不是灰白。
+        var value: Double = darkBase ? 0.93 : 0.10
         value += config.perfBrightness * 0.35
         value = min(max(value, 0.01), 0.98)
         if darkBase {
-            return (CGFloat(value), CGFloat(value * 0.965), CGFloat(value * 0.90))
+            return (CGFloat(value), CGFloat(min(0.98, value * 0.985)), CGFloat(min(0.98, value * 0.94)))
         }
         return (CGFloat(value), CGFloat(value), CGFloat(value * 0.96))
     }
@@ -692,10 +742,10 @@ enum MFilmBorderRenderer {
         if let gradient = CGGradient(
             colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
             colors: [
-                CGColor(red: min(1, base.0 * 1.16), green: min(1, base.1 * 1.16),
-                        blue: min(1, base.2 * 1.16), alpha: 1),
-                CGColor(red: base.0 * 0.86, green: base.1 * 0.86,
-                        blue: base.2 * 0.86, alpha: 1),
+                CGColor(red: min(1, base.0 * 1.10), green: min(1, base.1 * 1.10),
+                        blue: min(1, base.2 * 1.10), alpha: 1),
+                CGColor(red: base.0 * 0.94, green: base.1 * 0.94,
+                        blue: base.2 * 0.94, alpha: 1),
             ] as CFArray,
             locations: [0, 1]
         ) {
@@ -708,14 +758,15 @@ enum MFilmBorderRenderer {
         }
 
         // 片基颗粒：位置按照片尺寸归一化，预览与导出是同一片纹理。
+        // 干净扫描件几乎看不到颗粒，只保留极轻的暗部起伏。
         var random = MFilmBorderRandom(seed: "base-texture-\(config.gauge)-\(config.baseTone)")
-        let count = 900
+        let count = 260
         for _ in 0..<count {
             let x = random.range(0, width)
             let y = random.range(0, height)
-            let radius = max(0.4, layout.pxPerMM * random.range(0.02, 0.09))
+            let radius = max(0.4, layout.pxPerMM * random.range(0.015, 0.05))
             let light = random.unit() > 0.5
-            let alpha = random.range(0.02, 0.07)
+            let alpha = random.range(0.015, 0.045)
             context.setFillColor(
                 red: light ? 1 : 0,
                 green: light ? 0.97 : 0,
@@ -737,7 +788,7 @@ enum MFilmBorderRenderer {
         case .square:
             return CGPath(rect: rect, transform: nil)
         case .rounded:
-            let radius = shortSide * 0.035 * CGFloat(config.cornerScale)
+            let radius = shortSide * 0.020 * CGFloat(config.cornerScale)
             return CGPath(roundedRect: rect, cornerWidth: radius,
                           cornerHeight: radius, transform: nil)
         case .chamfer:
@@ -791,15 +842,27 @@ enum MFilmBorderRenderer {
                                          color: (CGFloat, CGFloat, CGFloat)) {
         let perf = config.perfValue
         guard perf != .none else { return }
-        let holeLength = CGFloat(perf.lengthMM) * layout.pxPerMM * CGFloat(config.perfScale)
-        let rawHeight = CGFloat(perf.heightMM) * layout.pxPerMM * CGFloat(config.perfScale)
         let marginAcross = layout.alongX ? layout.marginY : layout.marginX
-        // 110 / 16mm 的孔几乎和片边一样高：压进留边，别咬到画面。
-        let holeHeight = min(rawHeight, marginAcross * 0.78)
+        let holeLength: CGFloat
+        let holeHeight: CGFloat
+        let pitch: CGFloat
+        if layout.visual {
+            // 视觉比例：齿孔跟着片边高度等比缩放，排成一列规整的小圆角方孔。
+            // 上限 0.46 是为了把孔压在边字下方、画面上方，齿孔大小拉满也不会压字。
+            holeHeight = min(marginAcross * 0.42 * CGFloat(config.perfScale),
+                             marginAcross * 0.46)
+            holeLength = holeHeight * 1.30
+            pitch = holeLength * 3.05 * CGFloat(config.perfPitch)
+        } else {
+            // 真实比例：按 KS/BH 的机械尺寸换算。
+            holeHeight = min(CGFloat(perf.heightMM) * layout.pxPerMM * CGFloat(config.perfScale),
+                             marginAcross * (perf.isOneEdge ? 0.78 : 0.54))
+            holeLength = CGFloat(perf.lengthMM) * layout.pxPerMM * CGFloat(config.perfScale)
+            pitch = CGFloat(perf.pitchMM) * layout.pxPerMM * CGFloat(config.perfPitch)
+        }
         guard holeLength > 0.5, holeHeight > 0.5 else { return }
 
         let alongLength = layout.alongX ? layout.aperture.width : layout.aperture.height
-        let pitch = CGFloat(perf.pitchMM) * layout.pxPerMM * CGFloat(config.perfPitch)
         let count: Int
         if perf.isSingle || pitch <= 0 {
             count = max(1, Int((alongLength / max(1, layout.pxPerMM * CGFloat(layout.gauge.frameLongMM))).rounded()))
@@ -816,10 +879,13 @@ enum MFilmBorderRenderer {
         if perf.isOneEdge {
             edges = [marginAcross * 0.5]
         } else {
+            // 视觉比例下孔位贴近画幅（胶片齿孔本来就挨着画幅，外侧留给边字和边码）；
+            // 真实比例保持原来的居中位置，别顺手改掉 110 / 16mm / 电影孔的样子。
+            let inset: CGFloat = layout.visual ? 0.72 : 0.5
             if layout.alongX {
-                edges = [layout.marginY * 0.5, layout.canvas.height - layout.marginY * 0.5]
+                edges = [layout.marginY * inset, layout.canvas.height - layout.marginY * inset]
             } else {
-                edges = [layout.marginX * 0.5, layout.canvas.width - layout.marginX * 0.5]
+                edges = [layout.marginX * inset, layout.canvas.width - layout.marginX * inset]
             }
         }
 
@@ -866,8 +932,8 @@ enum MFilmBorderRenderer {
                           transform: nil)
         default:
             return CGPath(roundedRect: rect,
-                          cornerWidth: min(rect.width, rect.height) * 0.16,
-                          cornerHeight: min(rect.width, rect.height) * 0.16,
+                          cornerWidth: min(rect.width, rect.height) * 0.22,
+                          cornerHeight: min(rect.width, rect.height) * 0.22,
                           transform: nil)
         }
     }
@@ -879,6 +945,12 @@ enum MFilmBorderRenderer {
                                      filmID: String, photoID: String) {
         let color = textRGB(config, filmID: filmID)
         let cgColor = CGColor(red: color.0, green: color.1, blue: color.2, alpha: 0.94)
+        // 视觉比例走 135 专用排版：一行大字、不重复、不越界。
+        if layout.visual {
+            drawCompactEdgeText(context, layout: layout, config: config,
+                                color: cgColor, filmID: filmID, photoID: photoID)
+            return
+        }
         let fontSize = max(5, min(220, layout.pxPerMM * 1.05 * CGFloat(config.textScale)))
         let label = edgeLabel(filmID: filmID, custom: config.customText)
         let tracking = fontSize * 0.10
@@ -968,6 +1040,79 @@ enum MFilmBorderRenderer {
         }
     }
 
+    /// 视觉比例下的 135 边字：缩体大字，左侧品牌、右侧画幅号。
+    /// 先量宽再落笔，放不下就等比缩字号，绝不允许重复到画布外被裁掉。
+    private static func drawCompactEdgeText(_ context: CGContext, layout: MFilmBorderLayout,
+                                            config: MFilmBorderConfig, color: CGColor,
+                                            filmID: String, photoID: String) {
+        let margin = layout.alongX ? layout.marginY : layout.marginX
+        let label = edgeLabel(filmID: filmID, custom: config.customText)
+        let number = frameLabel(photoID: photoID, gauge: layout.gauge)
+        let fontName = "HelveticaNeue-CondensedBold"
+        var fontSize = max(5, min(260, margin * 0.46 * CGFloat(config.textScale)))
+        func tracking(_ size: CGFloat) -> CGFloat { size * 0.14 }
+
+        if layout.alongX {
+            var numberSize = fontSize * 0.90
+            var numberWidth: CGFloat = 0
+            if config.frameNumbers {
+                numberWidth = textWidth(number, fontSize: numberSize,
+                                        tracking: tracking(numberSize), fontName: fontName)
+                    + fontSize * 1.10
+            }
+            let available = layout.canvas.width - layout.marginX * 2 - numberWidth
+            if config.edgeText, !label.isEmpty {
+                let width = textWidth(label, fontSize: fontSize,
+                                      tracking: tracking(fontSize), fontName: fontName)
+                if width > available, width > 0 {
+                    fontSize = max(4, fontSize * available / width)
+                    numberSize = fontSize * 0.90
+                    numberWidth = textWidth(number, fontSize: numberSize,
+                                            tracking: tracking(numberSize), fontName: fontName)
+                }
+                let baseline = margin * 0.12 + fontSize * 0.72
+                drawText(context, text: label,
+                         origin: CGPoint(x: layout.aperture.minX, y: baseline),
+                         rotation: 0, fontSize: fontSize, color: color,
+                         tracking: tracking(fontSize), fontName: fontName)
+            }
+            if config.frameNumbers {
+                let baseline = margin * 0.12 + fontSize * 0.72
+                drawText(context, text: number,
+                         origin: CGPoint(x: layout.aperture.maxX - numberWidth + fontSize * 0.10,
+                                         y: baseline),
+                         rotation: 0, fontSize: numberSize, color: color,
+                         tracking: tracking(numberSize), fontName: fontName)
+            }
+        } else {
+            // 竖片：品牌字沿左片边竖排一行，画幅号放在右片边顶端。
+            if config.edgeText, !label.isEmpty {
+                // 竖排也要先量长再落笔：字太长就等比缩字号，不越过画布上沿。
+                let available = layout.aperture.height - fontSize * 0.5
+                var length = textWidth(label, fontSize: fontSize,
+                                       tracking: tracking(fontSize), fontName: fontName)
+                if length > available, length > 0 {
+                    fontSize = max(4, fontSize * available / length)
+                    length = textWidth(label, fontSize: fontSize,
+                                       tracking: tracking(fontSize), fontName: fontName)
+                }
+                let baselineX = layout.marginX * 0.12 + fontSize * 0.72
+                drawText(context, text: label,
+                         origin: CGPoint(x: baselineX, y: layout.aperture.minY + length),
+                         rotation: -CGFloat.pi / 2, fontSize: fontSize, color: color,
+                         tracking: tracking(fontSize), fontName: fontName)
+            }
+            if config.frameNumbers {
+                let size = fontSize * 0.90
+                let rightX = layout.canvas.width - layout.marginX * 0.12 - size * 0.72
+                drawText(context, text: number,
+                         origin: CGPoint(x: rightX, y: layout.aperture.minY + size),
+                         rotation: CGFloat.pi / 2, fontSize: size, color: color,
+                         tracking: tracking(size), fontName: fontName)
+            }
+        }
+    }
+
     private static func drawRepeatedText(_ context: CGContext, text: String,
                                          origin: CGPoint, rotation: CGFloat,
                                          fontSize: CGFloat, color: CGColor,
@@ -994,15 +1139,16 @@ enum MFilmBorderRenderer {
 
     private static func drawText(_ context: CGContext, text: String, origin: CGPoint,
                                  rotation: CGFloat, fontSize: CGFloat,
-                                 color: CGColor, tracking: CGFloat) {
+                                 color: CGColor, tracking: CGFloat,
+                                 fontName: String = "HelveticaNeue-Bold") {
         guard !text.isEmpty else { return }
-        let fontName: String
+        let resolvedName: String
         if text.unicodeScalars.contains(where: { $0.value > 0x2E80 }) {
-            fontName = "PingFangSC-Semibold"
+            resolvedName = "PingFangSC-Semibold"
         } else {
-            fontName = "HelveticaNeue-Bold"
+            resolvedName = fontName
         }
-        let font = CTFontCreateWithName(fontName as CFString, fontSize, nil)
+        let font = CTFontCreateWithName(resolvedName as CFString, fontSize, nil)
         let attributes: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String): font,
             NSAttributedString.Key(kCTForegroundColorAttributeName as String): color,
@@ -1021,8 +1167,15 @@ enum MFilmBorderRenderer {
         context.restoreGState()
     }
 
-    private static func textWidth(_ text: String, fontSize: CGFloat, tracking: CGFloat) -> CGFloat {
-        let font = CTFontCreateWithName("HelveticaNeue-Bold" as CFString, fontSize, nil)
+    private static func textWidth(_ text: String, fontSize: CGFloat, tracking: CGFloat,
+                                  fontName: String = "HelveticaNeue-Bold") -> CGFloat {
+        let resolvedName: String
+        if text.unicodeScalars.contains(where: { $0.value > 0x2E80 }) {
+            resolvedName = "PingFangSC-Semibold"
+        } else {
+            resolvedName = fontName
+        }
+        let font = CTFontCreateWithName(resolvedName as CFString, fontSize, nil)
         let attributes: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String): font,
             NSAttributedString.Key(kCTKernAttributeName as String): tracking,
@@ -1077,6 +1230,76 @@ enum MFilmBorderRenderer {
                 )
                 context.fill(rect)
             }
+        }
+    }
+
+    // MARK: 片边编码条
+
+    /// 真实负片边码的样式：一条琥珀色带，上面是不规则黑色刻痕，
+    /// 画幅号以深色压印在带上。比原来的方块 DX 码更像胶片本身。
+    private static func drawEdgeCode(_ context: CGContext, layout: MFilmBorderLayout,
+                                     config: MFilmBorderConfig,
+                                     filmID: String, photoID: String) {
+        let margin = layout.alongX ? layout.marginY : layout.marginX
+        let thickness = margin * 0.28
+        guard thickness > 0.5 else { return }
+        let band: CGRect
+        if layout.alongX {
+            band = CGRect(x: layout.aperture.minX,
+                          y: layout.canvas.height - margin * 0.40,
+                          width: layout.aperture.width, height: thickness)
+        } else {
+            band = CGRect(x: layout.canvas.width - margin * 0.40,
+                          y: layout.aperture.minY,
+                          width: thickness, height: layout.aperture.height)
+        }
+        let tone = textRGB(config, filmID: filmID)
+        context.setFillColor(red: tone.0, green: tone.1, blue: tone.2, alpha: 0.92)
+        context.fill(band)
+
+        // 刻痕：位置由 photoID 决定，预览与导出是同一组。
+        let base = baseRGB(config)
+        context.setFillColor(red: base.0, green: base.1, blue: base.2, alpha: 1)
+        var random = MFilmBorderRandom(seed: "edgecode-\(photoID)")
+        let length = layout.alongX ? band.width : band.height
+        var cursor: CGFloat = 0
+        while cursor < length {
+            cursor += length * random.range(0.012, 0.055)
+            let width = length * random.range(0.004, 0.026)
+            guard cursor + width < length else { break }
+            if layout.alongX {
+                context.fill(CGRect(x: band.minX + cursor, y: band.minY,
+                                    width: width, height: thickness))
+            } else {
+                context.fill(CGRect(x: band.minX, y: band.minY + cursor,
+                                    width: thickness, height: width))
+            }
+            cursor += width
+        }
+
+        let number = frameLabel(photoID: photoID, gauge: layout.gauge)
+        guard config.frameNumbers else { return }
+        let fontName = "HelveticaNeue-CondensedBold"
+        let fontSize = max(4, thickness * 0.82)
+        let textColor = CGColor(red: base.0, green: base.1, blue: base.2, alpha: 0.94)
+        if layout.alongX {
+            let alternate = number.hasSuffix("A") ? String(number.dropLast()) : number + "A"
+            drawText(context, text: number,
+                     origin: CGPoint(x: band.minX + length * 0.05,
+                                     y: band.maxY - thickness * 0.24),
+                     rotation: 0, fontSize: fontSize, color: textColor,
+                     tracking: fontSize * 0.10, fontName: fontName)
+            drawText(context, text: alternate,
+                     origin: CGPoint(x: band.minX + length * 0.52,
+                                     y: band.maxY - thickness * 0.24),
+                     rotation: 0, fontSize: fontSize, color: textColor,
+                     tracking: fontSize * 0.10, fontName: fontName)
+        } else {
+            drawText(context, text: number,
+                     origin: CGPoint(x: band.maxX - thickness * 0.24,
+                                     y: band.minY + length * 0.05 + fontSize),
+                     rotation: CGFloat.pi / 2, fontSize: fontSize, color: textColor,
+                     tracking: fontSize * 0.10, fontName: fontName)
         }
     }
 
