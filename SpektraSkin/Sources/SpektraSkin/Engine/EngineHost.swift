@@ -35,6 +35,9 @@ final class EngineHost: ObservableObject {
     private var originalImage: NSImage?
     private(set) var previewScale: Double = 0.25
     private let thumbnailQueue = DispatchQueue(label: "spektra.thumbnail", qos: .utility)
+    /// 换片解码队列：RAW 解码与显示图构建不在主线程做，token 丢弃过期加载。
+    private let imageLoadQueue = DispatchQueue(label: "spektra.image.load", qos: .userInitiated)
+    private var imageLoadToken = 0
 
     /// 渲染调度：参数停止变化 1s 后再提交，期间的新参数立即中断在途渲染。
     private var pendingRenderWork: DispatchWorkItem?
@@ -153,20 +156,32 @@ final class EngineHost: ObservableObject {
 
     private func loadImage(for photo: LibraryPhoto) {
         let url = store.originalURL(for: photo)
-        guard let loaded = try? ImageLoader.load(url: url) else {
-            statusMessage = "无法读取 \(photo.filename)"
-            return
+        imageLoadToken += 1
+        let token = imageLoadToken
+        imageLoadQueue.async { [weak self] in
+            guard let self else { return }
+            let loaded = try? ImageLoader.load(url: url)
+            let display = loaded.flatMap {
+                Self.displayImage(
+                    $0.image, colorSpace: $0.colorSpace,
+                    cctfDecoding: $0.cctfDecoding
+                )
+            }
+            DispatchQueue.main.async {
+                guard token == self.imageLoadToken else { return }
+                guard let loaded else {
+                    self.statusMessage = "无法读取 \(photo.filename)"
+                    return
+                }
+                self.loadedImage = loaded.image
+                self.loadedColorSpace = loaded.colorSpace
+                self.loadedCCTF = loaded.cctfDecoding
+                self.originalImage = display
+                self.renderPreview()
+                self.prewarmPreviewLUT()
+                self.generateThumbnail(for: photo, image: loaded.image)
+            }
         }
-        loadedImage = loaded.image
-        loadedColorSpace = loaded.colorSpace
-        loadedCCTF = loaded.cctfDecoding
-        originalImage = Self.displayImage(
-            loaded.image, colorSpace: loaded.colorSpace,
-            cctfDecoding: loaded.cctfDecoding
-        )
-        renderPreview()
-        prewarmPreviewLUT()
-        generateThumbnail(for: photo, image: loaded.image)
     }
 
     /// 换片后在后台预烘 LUT，首次拖滑杆不必等冷启动烘焙。
@@ -551,6 +566,7 @@ final class EngineHost: ObservableObject {
         guard selectedID != photoID || store.photos.count > 1 else {
             try? store.remove(id: photoID)
             selectedID = nil
+            imageLoadToken += 1
             loadedImage = nil
             previewImage = nil
             originalImage = nil
@@ -567,6 +583,7 @@ final class EngineHost: ObservableObject {
             if let next = store.photos.first {
                 select(photoID: next.id)
             } else {
+                imageLoadToken += 1
                 loadedImage = nil
                 previewImage = nil
                 originalImage = nil
@@ -1408,12 +1425,13 @@ final class EngineHost: ObservableObject {
                 var clarityContext: ClarityRenderContext?
                 if recipe.adaptive.enabled {
                     let encoded = GradeEngine.encodedSource(linear, recipe: recipe)
+                    let analysisMode: ClarityMode = origin == .direct ? .standalone : .film
                     let analysis = try AdaptiveClarityEngine.analyze(
-                        encoded, mode: .standalone
+                        encoded, mode: analysisMode
                     )
                     clarityContext = ClarityRenderContext(
                         analysis: analysis,
-                        mode: origin == .direct ? .standalone : .film,
+                        mode: analysisMode,
                         workingLongEdge: 0, validate: true
                     )
                 }

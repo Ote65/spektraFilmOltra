@@ -34,7 +34,10 @@ enum ImageExport {
         switch ext {
         case "tif", "tiff":
             let icc = iccProfile(colorSpace: colorSpace, cctfEncoding: cctfEncoding)
-            try TiffWriter.write(image: image, to: url, bitDepth: bitDepth, icc: icc,
+            // 线性输出（cctfEncoding=false）的像素允许 >1，16-bit 整数量化会把高光裁掉；
+            // 这种组合改按 32-bit float 写入，保住完整动态范围。
+            let bits = (!cctfEncoding && bitDepth == 16) ? 32 : bitDepth
+            try TiffWriter.write(image: image, to: url, bitDepth: bits, icc: icc,
                                  colorSpaceTag: colorSpaceTag(colorSpace, cctfEncoding),
                                  metadata: metadata)
         case "exr":

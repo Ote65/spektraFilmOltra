@@ -54,8 +54,16 @@ struct LibraryPhoto: Codable, Identifiable, Hashable {
 }
 
 /// 照片库：索引持久化 + 原图拷贝 + 缩略图路径。
+/// 主线程与后台缩略图/导出队列会并发访问，所有共享状态读写都在锁内。
 final class LibraryStore {
-    private(set) var photos: [LibraryPhoto] = []
+    private let lock = NSRecursiveLock()
+    private var _photos: [LibraryPhoto] = []
+    /// 线程安全快照：调用方拿到的是值类型拷贝，不会与内部数组并发读写。
+    var photos: [LibraryPhoto] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _photos
+    }
     let root: URL
     private var indexURL: URL { root.appendingPathComponent("index.json") }
     private var originalsURL: URL { root.appendingPathComponent("Originals", isDirectory: true) }
@@ -73,13 +81,15 @@ final class LibraryStore {
     }
 
     func reload() {
+        lock.lock()
+        defer { lock.unlock() }
         guard let data = try? Data(contentsOf: indexURL),
               let decoded = try? JSONDecoder().decode([LibraryPhoto].self, from: data) else {
-            photos = []
+            _photos = []
             return
         }
         // 显影台只接受 RAW；旧索引里的 JPEG/TIFF 不再进入库。
-        photos = decoded.filter {
+        _photos = decoded.filter {
             ImageLoader.rawSuffixes.contains(
                 URL(fileURLWithPath: $0.originalPath).pathExtension.lowercased()
             )
@@ -87,9 +97,15 @@ final class LibraryStore {
     }
 
     func save() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try saveLocked()
+    }
+
+    private func saveLocked() throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(photos)
+        let data = try encoder.encode(_photos)
         try data.write(to: indexURL)
     }
 
@@ -127,36 +143,53 @@ final class LibraryStore {
             isRaw: true,
             edit: edit
         )
-        photos.append(photo)
-        try save()
+        lock.lock()
+        defer { lock.unlock() }
+        _photos.append(photo)
+        try saveLocked()
         return photo
     }
 
     func update(_ photo: LibraryPhoto) throws {
-        if let index = photos.firstIndex(where: { $0.id == photo.id }) {
-            photos[index] = photo
-            try save()
+        lock.lock()
+        defer { lock.unlock() }
+        if let index = _photos.firstIndex(where: { $0.id == photo.id }) {
+            _photos[index] = photo
+            try saveLocked()
         }
     }
 
     func remove(id: String) throws {
-        guard let index = photos.firstIndex(where: { $0.id == id }) else { return }
-        let photo = photos[index]
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = _photos.firstIndex(where: { $0.id == id }) else { return }
+        let photo = _photos[index]
         try? FileManager.default.removeItem(atPath: photo.originalPath)
         if let thumbnail = photo.thumbnailPath {
             try? FileManager.default.removeItem(atPath: thumbnail)
         }
-        photos.remove(at: index)
-        try save()
+        _photos.remove(at: index)
+        try saveLocked()
     }
 
     func writeThumbnail(id: String, image: ImageRGB) throws {
-        guard let index = photos.firstIndex(where: { $0.id == id }) else { return }
-        let url = thumbnailsURL.appendingPathComponent("\(id).png")
-        try ImageExport.save(image, to: url, bitDepth: 8,
-                             colorSpace: photos[index].edit.io.outputColorSpace)
-        photos[index].thumbnailPath = url.path
-        try save()
+        // 编码在锁外做，写回索引时再拿锁并确认照片仍在库中。
+        let colorSpace: String
+        let url: URL
+        lock.lock()
+        guard let index = _photos.firstIndex(where: { $0.id == id }) else {
+            lock.unlock()
+            return
+        }
+        colorSpace = _photos[index].edit.io.outputColorSpace
+        url = thumbnailsURL.appendingPathComponent("\(id).png")
+        lock.unlock()
+        try ImageExport.save(image, to: url, bitDepth: 8, colorSpace: colorSpace)
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = _photos.firstIndex(where: { $0.id == id }) else { return }
+        _photos[index].thumbnailPath = url.path
+        try saveLocked()
     }
 
     static func pixelSize(url: URL) -> (width: Int, height: Int) {
