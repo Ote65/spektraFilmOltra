@@ -93,6 +93,8 @@ struct LibraryPhoto: Codable, Identifiable, Hashable {
     var quickBaselineData: Data? = nil
     /// 片边参数（移动端展示层配置，不参与核心显影，也不进交接图）。
     var borderData: Data? = nil
+    /// 裁切与校正几何（移动端调色台配置，作用于交接图本身，片边后再合成）。
+    var cropData: Data? = nil
 
     static func == (lhs: LibraryPhoto, rhs: LibraryPhoto) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }

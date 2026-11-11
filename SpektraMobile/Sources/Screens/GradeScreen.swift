@@ -18,6 +18,7 @@ struct GradeScreen: View {
     @State private var panelViewportHeight: CGFloat = 0
     @State private var drawerChrome: CGFloat = 0
     @State private var exportOpen = DebugLaunch.exportOpen
+    @State private var cropOpen = false
     @State private var showLUTImporter = false
     @State private var hslBand = 0
     @State private var gradingZone = 1
@@ -171,6 +172,28 @@ struct GradeScreen: View {
             case .failure:
                 onToast("LUT 导入失败")
             }
+        }
+        .sheet(isPresented: $cropOpen, onDismiss: { session.clearCropBase() }) {
+            ZStack {
+                MColor.app.ignoresSafeArea()
+                if let base = session.cropBaseImage {
+                    MCropEditor(
+                        base: base,
+                        initial: session.geometry,
+                        onCancel: { cropOpen = false },
+                        onDone: { geometry in
+                            cropOpen = false
+                            session.setGeometry(geometry)
+                        }
+                    )
+                } else {
+                    ProgressView()
+                        .tint(MColor.brass)
+                }
+            }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(MColor.app)
         }
     }
 
@@ -664,14 +687,15 @@ struct GradeScreen: View {
         // 阴影分两层：近处极淡、远处大半径，让边界是渐隐而不是一圈硬黑边。
         .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
         .shadow(color: .black.opacity(0.22), radius: 30, y: 12)
-        // 旋转 / 预览比例浮在 sheet 外面顶部，和原本撤销按钮同一行。
+        // 裁切 / 预览比例浮在 sheet 外面顶部，和原本撤销按钮同一行。
         .overlay(alignment: .top) {
             HStack(spacing: 6) {
-                MCircleIconButton(icon: "rotate.right", size: 10, frame: 28) {
+                MCircleIconButton(icon: "crop", size: 12, frame: 28) {
                     MHaptic.tick()
-                    session.rotateClockwise()
+                    session.prepareCropBase()
+                    cropOpen = true
                 }
-                .accessibilityLabel("顺时针旋转 90 度")
+                .accessibilityLabel("裁切与校正")
 
                 gradeScaleMenu
 
@@ -1209,7 +1233,15 @@ struct GradeScreen: View {
                                    options: datePositionOptions) { raw in
                             session.updateBorder { $0.datePosition = raw }
                         }
-                        MChoiceRow(label: "日期字体", value: dateStyleValue.label,
+                        MChoiceRow(label: "日期内容", value: dateModeValue.label,
+                                   options: dateModeOptions) { raw in
+                            session.updateBorder { $0.dateMode = raw }
+                        }
+                        MChoiceRow(label: "日期字体", value: dateFontValue.label,
+                                   options: dateFontOptions) { raw in
+                            session.updateBorder { $0.dateFont = raw }
+                        }
+                        MChoiceRow(label: "日期颜色", value: dateStyleValue.label,
                                    options: dateStyleOptions) { raw in
                             session.updateBorder { $0.dateStyle = raw }
                         }
@@ -1427,6 +1459,14 @@ struct GradeScreen: View {
         session.border.dateStyleValue
     }
 
+    private var dateModeValue: MFilmBorderDateMode {
+        session.border.dateModeValue
+    }
+
+    private var dateFontValue: MFilmBorderDateFont {
+        session.border.dateFontValue
+    }
+
     private var gaugeOptions: [MProOption] {
         MFilmBorderGauge.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
@@ -1453,6 +1493,14 @@ struct GradeScreen: View {
 
     private var dateStyleOptions: [MProOption] {
         MFilmBorderDateStyle.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateModeOptions: [MProOption] {
+        MFilmBorderDateMode.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateFontOptions: [MProOption] {
+        MFilmBorderDateFont.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
 
     private func borderPresetIsSelected(_ preset: MFilmBorderPreset) -> Bool {

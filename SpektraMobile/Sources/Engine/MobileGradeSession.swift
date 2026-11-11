@@ -31,18 +31,28 @@ final class MobileGradeSession: ObservableObject {
     @Published private(set) var previewAspect: CGFloat = 4.0 / 3.0
     /// 片边：只影响预览与导出，不写入调色配方。
     @Published private(set) var border = MFilmBorderConfig()
+    /// 裁切与校正几何：只作用于照片本身，片边在裁切完成后才合成。
+    @Published private(set) var geometry = MPhotoGeometry()
+    /// 裁切页取景底图：完整交接图的调色结果，不含任何几何变换。
+    @Published private(set) var cropBaseImage: CGImage?
     /// 调色台预览比例（相对 1600 交接图）：1/8、1/4、1/2、1/1。
     @Published private(set) var previewScale: Double
 
-    /// 片边日期戳的默认字样：拍摄日期（EXIF 缺失时为空，不画日期）。
+    /// 片边日期戳的默认字样：拍摄日期与时间（EXIF 缺失时为空，不画日期戳）。
     private let captureDateLabel: String
+    private let captureTimeLabel: String
 
     private let gradeQueue = DispatchQueue(label: "spektra.mobile.grade", qos: .userInitiated)
     private var source: ImageRGB?
+    /// 未经裁切/校正的完整交接图；几何变化时从它重新生成 source。
+    private var pristineSource: ImageRGB?
     /// 最近一帧「无片边」的调色结果 / 原片显示图；改片边时只重合成这两张。
     private var basePreviewCG: CGImage?
     private var originalBaseCG: CGImage?
+    /// 未经几何变换的原片显示图。
+    private var pristineOriginalCG: CGImage?
     private var borderPersistWork: DispatchWorkItem?
+    private var geometryPersistWork: DispatchWorkItem?
     /// 片边重合成单独一条队列：滑条拖动时只保留最新一帧，主线程只做赋值。
     private let borderQueue = DispatchQueue(label: "spektra.mobile.grade.border", qos: .userInitiated)
     /// 新的片边请求一来就取消上一帧合成，避免拖动滑条时任务排队造成延迟。
@@ -72,8 +82,9 @@ final class MobileGradeSession: ObservableObject {
         self.filename = photo.filename
         self.store = store
         self.develop = develop
-        self.captureDateLabel = MFilmBorderRenderer.captureDateLabel(
-            url: store.originalURL(for: photo))
+        let stamp = MFilmBorderRenderer.captureStamp(url: store.originalURL(for: photo))
+        self.captureDateLabel = stamp.date
+        self.captureTimeLabel = stamp.time
         let saved = UserDefaults.standard.double(forKey: Self.previewScaleKey)
         self.previewScale = saved >= 0.125 && saved <= 1.0 ? saved : 1.0
         self.presets = GradePresetStore.shared.all
@@ -81,6 +92,10 @@ final class MobileGradeSession: ObservableObject {
         if let data = photo.borderData,
            let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
             self.border = decoded.normalized()
+        }
+        if let data = photo.cropData,
+           let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
+            self.geometry = decoded.normalized()
         }
     }
 
@@ -94,6 +109,7 @@ final class MobileGradeSession: ObservableObject {
         errorMessage = nil
         let filmID = develop.filmID
         let borderConfig = border
+        let geometry = geometry
         develop.prepareHandoff(maxEdge: sourceEdge) { [weak self] image in
             guard let self else { return }
             guard let image else {
@@ -109,26 +125,31 @@ final class MobileGradeSession: ObservableObject {
             // 交接图是线性 ProPhoto；对比原图必须先转成线性 sRGB 再显示编码，
             // 否则会把 ProPhoto 当成 sRGB 直接编码，出现明显偏色。
             let display = PreviewLUTService.displayImage(fromLinear: linear)
-            let baseOriginal = PreviewRenderer.cgImage(from: display)
-            let framedOriginal = baseOriginal.map {
+            let pristineOriginal = PreviewRenderer.cgImage(from: display)
+            let warped = geometry.apply(to: linear)
+            let warpedOriginal = pristineOriginal.flatMap { geometry.apply(to: $0) }
+            let framedOriginal = warpedOriginal.map {
                 MFilmBorderRenderer.preview(
                     photo: $0, config: borderConfig, filmID: filmID, photoID: self.photoID,
-                    dateLabel: self.captureDateLabel
+                    dateLabel: self.captureDateLabel,
+                    timeLabel: self.captureTimeLabel
                 ) ?? $0
             }
             Task { @MainActor in
-                self.source = linear
+                self.pristineSource = linear
+                self.source = warped
                 self.sourceReady = true
                 self.sourceFailure = nil
                 self.errorMessage = nil
                 self.isRendering = false
                 self.phaseLabel = ""
-                self.originalBaseCG = baseOriginal
+                self.pristineOriginalCG = pristineOriginal
+                self.originalBaseCG = warpedOriginal ?? pristineOriginal
                 if let framedOriginal {
                     self.originalImage = MImage.make(cgImage: framedOriginal)
                     self.previewAspect = CGFloat(framedOriginal.width) / CGFloat(max(1, framedOriginal.height))
                 } else {
-                    self.previewAspect = CGFloat(image.width) / CGFloat(max(1, image.height))
+                    self.previewAspect = CGFloat(warped.width) / CGFloat(max(1, warped.height))
                 }
                 self.schedule(immediate: true)
             }
@@ -141,30 +162,91 @@ final class MobileGradeSession: ObservableObject {
         start()
     }
 
-    /// 顺时针旋转 90°：只转动现有交接图与预览帧，不重跑调色或交接渲染。
-    func rotateClockwise() {
-        guard !isExporting, let current = source else { return }
-        develop.rotateClockwise()
+    // MARK: - 裁切与校正
+
+    /// 裁切页取景底图：完整交接图按当前配方调色，但不带任何几何变换。
+    func prepareCropBase() {
+        guard let pristine = pristineSource, !isExporting else { return }
+        cropBaseImage = nil
+        let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
+        gradeQueue.async { [weak self] in
+            let result = try? GradeEngine.render(pristine, recipe: recipe)
+            let image = result.flatMap { PreviewRenderer.cgImage(from: $0.image) }
+            Task { @MainActor [weak self] in
+                guard let self, !self.isExporting else { return }
+                self.cropBaseImage = image
+            }
+        }
+    }
+
+    func clearCropBase() {
+        cropBaseImage = nil
+    }
+
+    /// 确认裁切：几何只作用在交接图本身，片边随后才合成，不会裁到片边。
+    func setGeometry(_ value: MPhotoGeometry) {
+        let target = value.normalized()
+        guard target != geometry else { return }
+        geometry = target
+        persistGeometrySoon()
+        guard sourceReady, !isExporting, let pristine = pristineSource else { return }
+
         token += 1
         pendingProxy?.cancel()
         pendingSettle?.cancel()
         proxyInFlight = false
-        isRendering = false
-        phaseLabel = ""
+        isRendering = true
+        phaseLabel = "应用裁切"
         phaseProgress = 0
-        source = current.rotatedClockwise(1)
-        basePreviewCG = basePreviewCG?.quarterTurnedClockwise
-        originalBaseCG = originalBaseCG?.quarterTurnedClockwise
-        if let base = basePreviewCG {
-            previewAspect = CGFloat(base.width) / CGFloat(max(1, base.height))
+
+        let original = pristineOriginalCG
+        let borderConfig = border
+        let filmID = develop.filmID
+        let photoID = self.photoID
+        let dateLabel = captureDateLabel
+        let timeLabel = captureTimeLabel
+
+        gradeQueue.async { [weak self] in
+            let warped = target.apply(to: pristine)
+            let warpedOriginal = original.flatMap { target.apply(to: $0) }
+            let framed = warpedOriginal.map {
+                MFilmBorderRenderer.preview(
+                    photo: $0, config: borderConfig, filmID: filmID, photoID: photoID,
+                    dateLabel: dateLabel, timeLabel: timeLabel
+                ) ?? $0
+            }
+            Task { @MainActor [weak self] in
+                guard let self, self.geometry == target else { return }
+                self.source = warped
+                self.originalBaseCG = warpedOriginal ?? original
+                if let framed {
+                    self.originalImage = MImage.make(cgImage: framed)
+                    self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
+                } else {
+                    self.previewAspect = CGFloat(warped.width) / CGFloat(max(1, warped.height))
+                }
+                self.isRendering = false
+                self.phaseLabel = ""
+                self.schedule(immediate: true)
+            }
         }
-        if let previewImage, let rotated = previewImage.quarterTurnedClockwise {
-            self.previewImage = rotated
-        }
-        if let originalImage, let rotated = originalImage.quarterTurnedClockwise {
-            self.originalImage = rotated
-        }
-        applyBorderToPreview()
+    }
+
+    func resetGeometry() {
+        setGeometry(MPhotoGeometry())
+    }
+
+    private func persistGeometrySoon() {
+        geometryPersistWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.persistGeometryNow() }
+        geometryPersistWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func persistGeometryNow() {
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        photo.cropData = try? JSONEncoder().encode(geometry)
+        try? store.update(photo)
     }
 
     func cancel() {
@@ -209,20 +291,21 @@ final class MobileGradeSession: ObservableObject {
         let filmID = develop.filmID
         let identifier = photoID
         let dateLabel = captureDateLabel
+        let timeLabel = captureTimeLabel
         borderQueue.async { [weak self] in
             // 排到队首时已有更新的请求就直接放弃，旧帧不再合成。
             guard !flag.isCancelled else { return }
             let framed = base.map {
                 MFilmBorderRenderer.preview(
                     photo: $0, config: config, filmID: filmID, photoID: identifier,
-                    dateLabel: dateLabel
+                    dateLabel: dateLabel, timeLabel: timeLabel
                 ) ?? $0
             }
             guard !flag.isCancelled else { return }
             let framedOriginal = original.map {
                 MFilmBorderRenderer.preview(
                     photo: $0, config: config, filmID: filmID, photoID: identifier,
-                    dateLabel: dateLabel
+                    dateLabel: dateLabel, timeLabel: timeLabel
                 ) ?? $0
             }
             guard !flag.isCancelled else { return }
@@ -372,6 +455,7 @@ final class MobileGradeSession: ObservableObject {
         let filmID = develop.filmID
         let photoID = self.photoID
         let dateLabel = captureDateLabel
+        let timeLabel = captureTimeLabel
         proxyInFlight = edge <= proxyEdge
         isRendering = true
         phaseLabel = edge <= proxyEdge ? "调色代理" : "调色精修"
@@ -387,7 +471,7 @@ final class MobileGradeSession: ObservableObject {
                 let framed = cgImage.map {
                     MFilmBorderRenderer.preview(
                         photo: $0, config: borderConfig, filmID: filmID, photoID: photoID,
-                        dateLabel: dateLabel
+                        dateLabel: dateLabel, timeLabel: timeLabel
                     ) ?? $0
                 }
                 Task { @MainActor [weak self] in
@@ -431,6 +515,7 @@ final class MobileGradeSession: ObservableObject {
         let borderConfig = border
         let filmID = develop.filmID
         let dateLabel = captureDateLabel
+        let timeLabel = captureTimeLabel
         let watermark = MWatermarkStore.load()
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
         // 片边会把成品放大一圈：开启片边时「原始」也按内存余量钳位，避免大图导出被 jetsam。
@@ -438,6 +523,7 @@ final class MobileGradeSession: ObservableObject {
             ? rawEdge
             : ExportEdge.clampToMemoryBudget(rawEdge)
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
+        let geometry = geometry
         let targetSpace: String
         let targetCCTF: Bool
         let ext: String
@@ -473,7 +559,8 @@ final class MobileGradeSession: ObservableObject {
             self.gradeQueue.async {
                 do {
                     let linear = GradeEngine.prepareSource(image)
-                    let result = try GradeEngine.render(linear, recipe: recipe)
+                    let warped = geometry.apply(to: linear)
+                    let result = try GradeEngine.render(warped, recipe: recipe)
                     if let lutError = result.lutError { throw lutError }
                     var output = Self.convertForExport(
                         result.image, colorSpace: targetSpace, cctfEncoding: targetCCTF)
@@ -491,7 +578,7 @@ final class MobileGradeSession: ObservableObject {
                             image: output, config: borderConfig,
                             filmID: filmID, photoID: exportPhotoID,
                             colorSpace: targetSpace, cctfEncoding: targetCCTF,
-                            dateLabel: dateLabel
+                            dateLabel: dateLabel, timeLabel: timeLabel
                         )
                     }
                     try FileManager.default.createDirectory(

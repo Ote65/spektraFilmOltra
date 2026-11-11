@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.4.0</string>
+	<string>0.4.1</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>4</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
@@ -32,6 +32,23 @@
 	<string>导入 RAW 需要读取相册里的原片：RAW+JPEG 成对照片和存放在 iCloud 的原片，只有按资源取回才能拿到 RAW 本体。</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
+	<key>UIAppFonts</key>
+	<array>
+		<string>Fonts/DSEG7Classic-Bold.ttf</string>
+		<string>Fonts/SpecialElite-Regular.ttf</string>
+		<string>Fonts/CourierPrime-Bold.ttf</string>
+		<string>Fonts/Caveat-Bold.ttf</string>
+		<string>Fonts/Kalam-Bold.ttf</string>
+		<string>Fonts/Doto.ttf</string>
+		<string>Fonts/Silkscreen-Regular.ttf</string>
+		<string>Fonts/VT323-Regular.ttf</string>
+		<string>Fonts/ZenDots-Regular.ttf</string>
+		<string>Fonts/ShareTechMono-Regular.ttf</string>
+		<string>Fonts/PressStart2P-Regular.ttf</string>
+		<string>Fonts/LaBelleAurore.ttf</string>
+		<string>Fonts/Yellowtail-Regular.ttf</string>
+		<string>Fonts/Rye-Regular.ttf</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>

@@ -35,6 +35,8 @@
 		5E4A3B27AE8A660896679EE6 /* MobileComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFEB333890C0D09618141435 /* MobileComponents.swift */; };
 		6067EE188061AFA44AE6E30E /* DevelopScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */; };
 		F1B0A0013C0DE00000000001 /* FilmBorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1B0A0013C0DE00000000002 /* FilmBorder.swift */; };
+		B1B2C3D4E5F60718293A4B5C /* MPhotoGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* MPhotoGeometry.swift */; };
+		D1B2C3D4E5F60718293A4B5C /* MCropEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1B2C3D4E5F60718293A4B5C /* MCropEditor.swift */; };
 		FA5E0000000000000000B0A1 /* SettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA5E0000000000000000B0A2 /* SettingsScreen.swift */; };
 		FA5E0000000000000000B0B1 /* Watermark.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA5E0000000000000000B0B2 /* Watermark.swift */; };
 		CA5E000000000000000000B1 /* CameraScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA5E000000000000000000A1 /* CameraScreen.swift */; };
@@ -49,6 +51,7 @@
 		7FBE023DEE657B516B606DA9 /* GradePresets.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4EBA2C45F380D5D15A5583D /* GradePresets.swift */; };
 		87C712CA8DD0AE217C0A440D /* Image.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40A7195B40EAD7727403CE40 /* Image.swift */; };
 		8F759AC446D918A0A40A420A /* Icons in Resources */ = {isa = PBXBuildFile; fileRef = 86B28476BAB837DB9934AAD3 /* Icons */; };
+		C1F0A7B2D3E4456789ABCD01 /* Fonts in Resources */ = {isa = PBXBuildFile; fileRef = D2E1B8C3F4A5567890ABCD02 /* Fonts */; };
 		90027013E8AB159B5EC8F830 /* RandomStats.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44162B0468A29666D0F6C547 /* RandomStats.swift */; };
 		9487BCC3787E5BC0264981FC /* ImageExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86299D672D14415C3265C71D /* ImageExport.swift */; };
 		99104313EFC7EB8271D51321 /* GamutCompression.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DDA9D4F7C66E69DA751CAB6 /* GamutCompression.swift */; };
@@ -118,6 +121,7 @@
 		7B80C451968757F5253F443A /* ColorMath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ColorMath.swift; sourceTree = "<group>"; };
 		86299D672D14415C3265C71D /* ImageExport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageExport.swift; sourceTree = "<group>"; };
 		86B28476BAB837DB9934AAD3 /* Icons */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Icons; path = ../SpektraMobile/Resources/Icons; sourceTree = SOURCE_ROOT; };
+		D2E1B8C3F4A5567890ABCD02 /* Fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Fonts; path = ../SpektraMobile/Resources/Fonts; sourceTree = SOURCE_ROOT; };
 		887678149B5B96B7D74B3335 /* Params.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Params.swift; sourceTree = "<group>"; };
 		890BCF63EE3D7458482705CC /* MobileRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRootView.swift; sourceTree = "<group>"; };
 		8BBC01B9DEC3CC008E8AA1CE /* RawDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RawDecoder.swift; sourceTree = "<group>"; };
@@ -153,6 +157,8 @@
 		FC0E0B7CF1C19335D215739A /* ParamsDigest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParamsDigest.swift; sourceTree = "<group>"; };
 		FFEB333890C0D09618141435 /* MobileComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileComponents.swift; sourceTree = "<group>"; };
 		F1B0A0013C0DE00000000002 /* FilmBorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilmBorder.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B5C /* MPhotoGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MPhotoGeometry.swift; sourceTree = "<group>"; };
+		C1B2C3D4E5F60718293A4B5C /* MCropEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCropEditor.swift; sourceTree = "<group>"; };
 		FA5E0000000000000000B0A2 /* SettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsScreen.swift; sourceTree = "<group>"; };
 		FA5E0000000000000000B0B2 /* Watermark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Watermark.swift; sourceTree = "<group>"; };
 		CA5E000000000000000000A1 /* CameraScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraScreen.swift; sourceTree = "<group>"; };
@@ -231,6 +237,7 @@
 				CA5E000000000000000000A1 /* CameraScreen.swift */,
 				BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */,
 				C0A755E3FD7A42CA434C6E5F /* GradeScreen.swift */,
+				C1B2C3D4E5F60718293A4B5C /* MCropEditor.swift */,
 				2B4C8A0F0875D1B13367B022 /* HomeScreen.swift */,
 				890BCF63EE3D7458482705CC /* MobileRootView.swift */,
 				FA5E0000000000000000B0A2 /* SettingsScreen.swift */,
@@ -282,6 +289,7 @@
 				5EEDAA0000000000000000A2 /* PhotoLibraryExport.swift */,
 				E536D899C0B961A72C903EA3 /* MobileEngine.swift */,
 				EDED726EC9328414B6BE600A /* MobileGradeSession.swift */,
+				A1B2C3D4E5F60718293A4B5C /* MPhotoGeometry.swift */,
 			);
 			path = Engine;
 			sourceTree = "<group>";
@@ -405,6 +413,7 @@
 			isa = PBXGroup;
 			children = (
 				86B28476BAB837DB9934AAD3 /* Icons */,
+				D2E1B8C3F4A5567890ABCD02 /* Fonts */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -471,6 +480,7 @@
 				66F8559ED2256B7A1577CB73 /* Assets.xcassets in Resources */,
 				41D2E463158102A3799C9AC8 /* Data in Resources */,
 				8F759AC446D918A0A40A420A /* Icons in Resources */,
+				C1F0A7B2D3E4456789ABCD01 /* Fonts in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -530,6 +540,8 @@
 				5EEDAA0000000000000000B2 /* PhotoLibraryExport.swift in Sources */,
 				54A36A910D1B727D9BDA0A2A /* MobileEngine.swift in Sources */,
 				FDBDA364A4E40B2B52CA1EBA /* MobileGradeSession.swift in Sources */,
+				B1B2C3D4E5F60718293A4B5C /* MPhotoGeometry.swift in Sources */,
+				D1B2C3D4E5F60718293A4B5C /* MCropEditor.swift in Sources */,
 				EFF0B4F2FD75234839FD939E /* MobileModels.swift in Sources */,
 				B4C2EC7271BA336EF9D527F3 /* MobileRootView.swift in Sources */,
 				0D62D52492D006019A76DE9F /* MobileTokens.swift in Sources */,

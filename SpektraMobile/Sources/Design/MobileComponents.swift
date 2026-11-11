@@ -1685,3 +1685,111 @@ enum MImageFit {
         )
     }
 }
+
+/// iOS 原相机同款刻度尺：中心指示固定，刻度随手势滚动，松手后按指数阻尼滑行。
+/// 相机曝光/色温与调色台裁切页共用，保证两处手感完全一致。
+struct MTickRuler: View {
+    let range: ClosedRange<Double>
+    let step: Double
+    @Binding var value: Double
+    var spacing: CGFloat = 13
+    var rulerHeight: CGFloat = 26
+    var haptics = false
+
+    @State private var dragStart: Double?
+    /// 连续滚动值（未量化）：刻度位置由它决定，读数由量化后的 `value` 决定。
+    @State private var scrollValue: Double?
+    @State private var inertia: Task<Void, Never>?
+
+    var body: some View {
+        GeometryReader { _ in
+            let span = range.upperBound - range.lowerBound
+            let current = scrollValue ?? value
+            let position = (current - range.lowerBound) / step
+            Canvas { context, size in
+                let centerX = size.width / 2
+                let half = Int(centerX / spacing) + 2
+                let center = Int(position.rounded())
+                let maxIndex = Int(span / step)
+                for index in (center - half)...(center + half) {
+                    guard index >= 0, index <= maxIndex else { continue }
+                    let x = centerX + (CGFloat(index) - CGFloat(position)) * spacing
+                    let distance = abs(x - centerX)
+                    let near = max(0, 1 - distance / (spacing * 4.2))
+                    let height: CGFloat = 9 + 17 * near * near
+                    let highlighted = distance < spacing / 2
+                    let rect = CGRect(x: x - 0.75, y: (size.height - height) / 2,
+                                      width: 1.5, height: height)
+                    context.fill(
+                        Path(roundedRect: rect, cornerRadius: 0.75),
+                        with: .color(highlighted
+                                     ? MColor.brass
+                                     : Color.white.opacity(0.26 + 0.22 * near))
+                    )
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { drag in
+                        inertia?.cancel()
+                        inertia = nil
+                        if dragStart == nil { dragStart = scrollValue ?? value }
+                        let base = dragStart ?? value
+                        let raw = base - Double(drag.translation.width / spacing) * step
+                        let clamped = min(max(raw, range.lowerBound), range.upperBound)
+                        scrollValue = clamped
+                        commit(clamped)
+                    }
+                    .onEnded { drag in
+                        let residual = drag.predictedEndTranslation.width - drag.translation.width
+                        dragStart = nil
+                        glide(residual: residual)
+                    }
+            )
+        }
+        .frame(height: rulerHeight)
+        .onChange(of: value) { _, newValue in
+            guard dragStart == nil, inertia == nil else { return }
+            scrollValue = newValue
+        }
+        .onDisappear { inertia?.cancel() }
+    }
+
+    private func commit(_ raw: Double) {
+        let quantized = min(max((raw / step).rounded() * step,
+                                range.lowerBound), range.upperBound)
+        if abs(quantized - value) > 1e-6 {
+            if haptics { MHaptic.tick() }
+            value = quantized
+        }
+    }
+
+    /// 惯性滑行：指数阻尼 + 边界收口，模仿 UIScrollView 的减速曲线。
+    private func glide(residual: CGFloat) {
+        guard abs(residual) > 3 else { return }
+        inertia?.cancel()
+        var remaining = residual
+        var last = Date()
+        inertia = Task { @MainActor in
+            while !Task.isCancelled {
+                let now = Date()
+                let dt = min(max(now.timeIntervalSince(last), 0.004), 0.05)
+                last = now
+                let decay = CGFloat(pow(0.93, dt * 60))
+                let delta = remaining * (1 - decay)
+                remaining *= decay
+                let base = scrollValue ?? value
+                let raw = base - Double(delta / spacing) * step
+                let clamped = min(max(raw, range.lowerBound), range.upperBound)
+                scrollValue = clamped
+                commit(clamped)
+                if abs(remaining) < 2
+                    || clamped == range.lowerBound
+                    || clamped == range.upperBound { break }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+            inertia = nil
+        }
+    }
+}

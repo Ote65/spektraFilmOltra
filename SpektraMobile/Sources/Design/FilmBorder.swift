@@ -325,7 +325,7 @@ enum MFilmBorderDatePosition: String, CaseIterable, Identifiable {
     }
 }
 
-/// 日期戳字体：三种胶片机常见的数码 / 打字机字型，加一种细白字。
+/// 日期戳颜色：字体由 `MFilmBorderDateFont` 单独选择，这里只决定颜色与发光方式。
 enum MFilmBorderDateStyle: String, CaseIterable, Identifiable {
     case amber
     case red
@@ -336,12 +336,77 @@ enum MFilmBorderDateStyle: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .amber: return "琥珀 LED"
+        case .amber: return "琥珀"
         case .red: return "数码红"
-        case .typewriter: return "打字机"
-        case .thin: return "细白"
+        case .typewriter: return "暖白"
+        case .thin: return "白"
         }
     }
+}
+
+/// 日期戳内容：只打日期、只打时间，或日期 + 时间。
+enum MFilmBorderDateMode: String, CaseIterable, Identifiable {
+    case date
+    case time
+    case dateTime
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .date: return "日期"
+        case .time: return "时间"
+        case .dateTime: return "日期 + 时间"
+        }
+    }
+}
+
+/// 日期戳字体。rawValue 就是字体的 PostScript 名，渲染时直接交给 Core Text。
+/// `.system` 沿用旧版的 Helvetica / Menlo / Courier，保证老工程打开后外观不变。
+enum MFilmBorderDateFont: String, CaseIterable, Identifiable {
+    case system = ""
+    case dseg7 = "DSEG7Classic-Bold"
+    case specialElite = "SpecialElite-Regular"
+    case courierPrime = "CourierPrime-Bold"
+    case caveat = "Caveat-Bold"
+    case kalam = "Kalam-Bold"
+    case doto = "DotoBlack-Regular"
+    case silkscreen = "Silkscreen-Regular"
+    case vt323 = "VT323-Regular"
+    case zenDots = "ZenDots-Regular"
+    case shareTechMono = "ShareTechMono-Regular"
+    case pressStart2P = "PressStart2P-Regular"
+    case laBelleAurore = "LaBelleAurore"
+    case yellowtail = "Yellowtail-Regular"
+    case rye = "Rye-Regular"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .system: return "系统"
+        case .dseg7: return "DSEG7"
+        case .specialElite: return "打字机"
+        case .courierPrime: return "Courier"
+        case .caveat: return "手写"
+        case .kalam: return "手写笔锋"
+        case .doto: return "圆点"
+        case .silkscreen: return "像素"
+        case .vt323: return "CRT"
+        case .zenDots: return "点阵"
+        case .shareTechMono: return "科技等宽"
+        case .pressStart2P: return "8-bit"
+        case .laBelleAurore: return "复古手写"
+        case .yellowtail: return "招牌手写"
+        case .rye: return "西部"
+        }
+    }
+
+    var postScriptName: String? {
+        self == .system ? nil : rawValue
+    }
+
+    var isDSEG7: Bool { self == .dseg7 }
 }
 
 /// 片边宽度的两种口径：
@@ -389,6 +454,8 @@ struct MFilmBorderConfig: Codable, Hashable {
     var dateStamp: Bool = false
     var datePosition: String = MFilmBorderDatePosition.bottomRight.rawValue
     var dateStyle: String = MFilmBorderDateStyle.amber.rawValue
+    var dateMode: String = MFilmBorderDateMode.date.rawValue
+    var dateFont: String = MFilmBorderDateFont.system.rawValue
     /// 留空时使用从原片 EXIF 读取到的拍摄日期。
     var dateText: String = ""
     // 做旧默认全关：干净扫描件才是参考图的方向。
@@ -406,7 +473,7 @@ struct MFilmBorderConfig: Codable, Hashable {
         case perf, perfScale, perfPitch, perfBrightness
         case baseTone, baseBrightness
         case edgeText, customText, textTone, textScale, frameNumbers, dxCode, notch
-        case dateStamp, datePosition, dateStyle, dateText
+        case dateStamp, datePosition, dateStyle, dateMode, dateFont, dateText
         case scratches, dust, fog
     }
 
@@ -437,6 +504,10 @@ struct MFilmBorderConfig: Codable, Hashable {
             ?? MFilmBorderDatePosition.bottomRight.rawValue
         dateStyle = try c.decodeIfPresent(String.self, forKey: .dateStyle)
             ?? MFilmBorderDateStyle.amber.rawValue
+        dateMode = try c.decodeIfPresent(String.self, forKey: .dateMode)
+            ?? MFilmBorderDateMode.date.rawValue
+        dateFont = try c.decodeIfPresent(String.self, forKey: .dateFont)
+            ?? MFilmBorderDateFont.system.rawValue
         dateText = try c.decodeIfPresent(String.self, forKey: .dateText) ?? ""
         scratches = try c.decodeIfPresent(Double.self, forKey: .scratches) ?? 0
         dust = try c.decodeIfPresent(Double.self, forKey: .dust) ?? 0
@@ -457,6 +528,14 @@ struct MFilmBorderConfig: Codable, Hashable {
 
     var dateStyleValue: MFilmBorderDateStyle {
         MFilmBorderDateStyle(rawValue: dateStyle) ?? .amber
+    }
+
+    var dateModeValue: MFilmBorderDateMode {
+        MFilmBorderDateMode(rawValue: dateMode) ?? .date
+    }
+
+    var dateFontValue: MFilmBorderDateFont {
+        MFilmBorderDateFont(rawValue: dateFont) ?? .system
     }
 
     var perfValue: MFilmBorderPerf {
@@ -487,6 +566,8 @@ struct MFilmBorderConfig: Codable, Hashable {
         }
         value.datePosition = value.datePositionValue.rawValue
         value.dateStyle = value.dateStyleValue.rawValue
+        value.dateMode = value.dateModeValue.rawValue
+        value.dateFont = value.dateFontValue.rawValue
         value.dateText = String(value.dateText.prefix(24))
         value.borderScale = min(max(value.borderScale, 0.4), 2.0)
         value.cornerScale = min(max(value.cornerScale, 0.0), 3.0)
@@ -673,7 +754,7 @@ enum MFilmBorderRenderer {
 
     static func preview(photo: CGImage, config: MFilmBorderConfig,
                         filmID: String, photoID: String,
-                        dateLabel: String = "") -> CGImage? {
+                        dateLabel: String = "", timeLabel: String = "") -> CGImage? {
         let value = config.normalized()
         guard value.enabled else { return photo }
         let layout = layout(for: CGSize(width: photo.width, height: photo.height), config: value)
@@ -689,7 +770,7 @@ enum MFilmBorderRenderer {
         context.interpolationQuality = .high
         draw(in: context, layout: layout, config: value,
              photo: photo, punch: false, filmID: filmID, photoID: photoID,
-             dateLabel: dateLabel)
+             dateLabel: dateLabel, timeLabel: timeLabel)
         return context.makeImage()
     }
 
@@ -700,7 +781,7 @@ enum MFilmBorderRenderer {
     static func composite(image: ImageRGB, config: MFilmBorderConfig,
                           filmID: String, photoID: String,
                           colorSpace: String, cctfEncoding: Bool,
-                          dateLabel: String = "") -> ImageRGB {
+                          dateLabel: String = "", timeLabel: String = "") -> ImageRGB {
         let value = config.normalized()
         guard value.enabled else { return image }
         let layout = layout(for: CGSize(width: image.width, height: image.height), config: value)
@@ -716,7 +797,7 @@ enum MFilmBorderRenderer {
         context.interpolationQuality = .high
         draw(in: context, layout: layout, config: value,
              photo: nil, punch: true, filmID: filmID, photoID: photoID,
-             dateLabel: dateLabel)
+             dateLabel: dateLabel, timeLabel: timeLabel)
         guard let buffer = context.data else { return image }
 
         var output = ImageRGB(width: width, height: height)
@@ -831,7 +912,7 @@ enum MFilmBorderRenderer {
     private static func draw(in context: CGContext, layout: MFilmBorderLayout,
                              config: MFilmBorderConfig, photo: CGImage?, punch: Bool,
                              filmID: String, photoID: String,
-                             dateLabel: String = "") {
+                             dateLabel: String = "", timeLabel: String = "") {
         let width = layout.canvas.width
         let height = layout.canvas.height
         context.saveGState()
@@ -873,7 +954,8 @@ enum MFilmBorderRenderer {
         context.restoreGState()
 
         // 日期戳压在画面内部，模拟日期后背；先于片边文字绘制，保证不会溢到片基上。
-        drawDateStamp(context, layout: layout, config: config, dateLabel: dateLabel)
+        drawDateStamp(context, layout: layout, config: config,
+                      dateLabel: dateLabel, timeLabel: timeLabel)
 
         let perfColor = perfRGB(config)
         drawPerforations(context, layout: layout, config: config, color: perfColor)
@@ -1656,74 +1738,115 @@ enum MFilmBorderRenderer {
 
     // MARK: 日期戳
 
-    /// 从原片 EXIF 读取拍摄日期，转成胶片日期后背的字样（26 11 3）。
-    static func captureDateLabel(url: URL) -> String {
+    /// 从原片 EXIF 读取拍摄日期与时间；缺少 EXIF 时退回文件创建时间。
+    static func captureStamp(url: URL) -> (date: String, time: String) {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
-                as? [String: Any] else { return "" }
+                as? [String: Any] else { return ("", "") }
         if let exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any],
            let text = exif[kCGImagePropertyExifDateTimeOriginal as String] as? String,
-           let label = dateLabel(fromExif: text) {
-            return label
+           let stamp = stamp(fromExif: text) {
+            return stamp
         }
         if let tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any],
            let text = tiff[kCGImagePropertyTIFFDateTime as String] as? String,
-           let label = dateLabel(fromExif: text) {
-            return label
+           let stamp = stamp(fromExif: text) {
+            return stamp
         }
-        // 部分相机 DNG 不带 DateTimeOriginal：退回文件创建日期，日期戳仍然可用。
-        if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate,
-           let label = dateLabel(from: created) {
-            return label
+        // 部分相机 DNG 不带 DateTimeOriginal：退回文件创建时间，日期戳仍然可用。
+        if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate {
+            return stamp(from: created)
         }
-        return ""
+        return ("", "")
     }
 
-    private static func dateLabel(from date: Date) -> String? {
-        let parts = Calendar.current.dateComponents([.year, .month, .day], from: date)
-        guard let year = parts.year, let month = parts.month, let day = parts.day else { return nil }
-        return "\(year % 100) \(month) \(day)"
+    private static func stamp(from date: Date) -> (date: String, time: String) {
+        let parts = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        guard let year = parts.year, let month = parts.month, let day = parts.day,
+              let hour = parts.hour, let minute = parts.minute else { return ("", "") }
+        return (
+            String(format: "%02d.%02d.%02d", year % 100, month, day),
+            String(format: "%02d:%02d", hour, minute)
+        )
     }
 
-    private static func dateLabel(fromExif text: String) -> String? {
+    private static func stamp(fromExif text: String) -> (date: String, time: String)? {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
         guard let date = formatter.date(from: text) else { return nil }
-        let parts = Calendar.current.dateComponents([.year, .month, .day], from: date)
-        guard let year = parts.year, let month = parts.month, let day = parts.day else { return nil }
-        return "\(year % 100) \(month) \(day)"
+        return stamp(from: date)
+    }
+
+    private struct DateStampRun {
+        let text: String
+        let x: CGFloat
+        let isDot: Bool
+        let dotSize: CGFloat
     }
 
     private static func drawDateStamp(_ context: CGContext, layout: MFilmBorderLayout,
-                                      config: MFilmBorderConfig, dateLabel: String) {
+                                      config: MFilmBorderConfig,
+                                      dateLabel: String, timeLabel: String) {
         guard config.dateStamp else { return }
-        let custom = config.dateText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let text = custom.isEmpty ? dateLabel.trimmingCharacters(in: .whitespacesAndNewlines) : custom
-        guard !text.isEmpty else { return }
         let style = config.dateStyleValue
         let position = config.datePositionValue
         let aperture = layout.aperture
         let shortSide = min(aperture.width, aperture.height)
         let fontSize = max(4, min(220, shortSide * 0.042))
-        let fontName: String
+        let legacyFont: String
         let color: (CGFloat, CGFloat, CGFloat)
         switch style {
         case .amber:
-            fontName = "HelveticaNeue-CondensedBold"
+            legacyFont = "HelveticaNeue-CondensedBold"
             color = (0.98, 0.70, 0.26)
         case .red:
-            fontName = "Menlo-Bold"
+            legacyFont = "Menlo-Bold"
             color = (0.96, 0.32, 0.22)
         case .typewriter:
-            fontName = "Courier-Bold"
+            legacyFont = "Courier-Bold"
             color = (0.95, 0.91, 0.82)
         case .thin:
-            fontName = "HelveticaNeue-Light"
+            legacyFont = "HelveticaNeue-Light"
             color = (0.97, 0.95, 0.89)
         }
-        let tracking = fontSize * (style == .thin ? 0.14 : 0.10)
-        let textWidthValue = textWidth(text, fontSize: fontSize, tracking: tracking, fontName: fontName)
+
+        let fontChoice = config.dateFontValue
+        let fontName: String
+        if let name = fontChoice.postScriptName, isFontAvailable(name) {
+            fontName = name
+        } else {
+            fontName = legacyFont
+        }
+        // 自定义字体保留原字距；旧系统字体沿用原来的 tracking。
+        let tracking = fontChoice == .system ? fontSize * (style == .thin ? 0.14 : 0.10) : 0
+        let custom = config.dateText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dateText = custom.isEmpty
+            ? dateLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            : custom
+        let timeText = timeLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let mode = config.dateModeValue
+        var primary = ""
+        var secondary = ""
+        switch mode {
+        case .date:
+            primary = dateText
+        case .time:
+            primary = timeText
+        case .dateTime:
+            primary = dateText
+            secondary = timeText
+        }
+        // 缺日期或时间时退回另一边，避免整块日期戳凭空消失。
+        if primary.isEmpty {
+            if mode == .time { primary = dateText }
+            if mode == .dateTime { primary = timeText; secondary = "" }
+        }
+        guard !primary.isEmpty || !secondary.isEmpty else { return }
+
+        let (runs, textWidthValue) = dateStampRuns(
+            primary: primary, secondary: secondary, isDSEG: fontChoice.isDSEG7,
+            fontName: fontName, fontSize: fontSize, tracking: tracking)
         let inset = max(6, shortSide * 0.045)
         let x: CGFloat
         let baseline: CGFloat
@@ -1755,12 +1878,88 @@ enum MFilmBorderRenderer {
             context.setShadow(offset: CGSize(width: 0, height: fontSize * 0.05),
                               blur: fontSize * 0.3, color: CGColor(gray: 0, alpha: 0.55))
         }
-        drawText(context, text: text,
-                 origin: CGPoint(x: x, y: baseline),
-                 rotation: 0, fontSize: fontSize, color: textColor,
-                 tracking: tracking, fontName: fontName)
+        for run in runs {
+            if run.isDot {
+                context.setFillColor(textColor)
+                context.fill(CGRect(x: x + run.x - run.dotSize / 2,
+                                    y: baseline - run.dotSize,
+                                    width: run.dotSize, height: run.dotSize))
+            } else if !run.text.isEmpty {
+                drawText(context, text: run.text,
+                         origin: CGPoint(x: x + run.x, y: baseline),
+                         rotation: 0, fontSize: fontSize, color: textColor,
+                         tracking: tracking, fontName: fontName)
+            }
+        }
         context.setShadow(offset: .zero, blur: 0, color: nil)
         context.restoreGState()
+    }
+
+    /// DSEG 的句点没有前进宽度，直接拼字符串会贴到左边数字。
+    /// 这里把日期拆成「数字组 + 居中方点」，方点落在前后数字真实笔画的中间。
+    private static func dateStampRuns(primary: String, secondary: String, isDSEG: Bool,
+                                      fontName: String, fontSize: CGFloat,
+                                      tracking: CGFloat) -> (runs: [DateStampRun], width: CGFloat) {
+        var runs: [DateStampRun] = []
+        var x: CGFloat = 0
+        if isDSEG, primary.contains(".") {
+            let groups = primary.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+            let gap = fontSize * 0.28
+            let dotSize = fontSize * 0.14
+            for (idx, group) in groups.enumerated() {
+                if !group.isEmpty {
+                    runs.append(DateStampRun(text: group, x: x, isDot: false, dotSize: 0))
+                    x += textWidth(group, fontSize: fontSize, tracking: tracking, fontName: fontName)
+                }
+                if idx < groups.count - 1 {
+                    var dotCenter = x + gap / 2
+                    if idx + 1 < groups.count, !group.isEmpty,
+                       let last = group.last, let first = groups[idx + 1].first {
+                        let lastInk = textInkBounds(String(last), fontSize: fontSize,
+                                                    tracking: tracking, fontName: fontName)
+                        let nextInk = textInkBounds(String(first), fontSize: fontSize,
+                                                    tracking: tracking, fontName: fontName)
+                        // lastInk 是相对“最后一个字符”自身起点的墨迹；x 是整组末尾。
+                        let lastCharWidth = textWidth(String(last), fontSize: fontSize,
+                                                      tracking: tracking, fontName: fontName)
+                        let left = x - lastCharWidth + lastInk.maxX
+                        let right = x + gap + nextInk.minX
+                        dotCenter = (left + right) / 2
+                    }
+                    runs.append(DateStampRun(text: "", x: dotCenter,
+                                             isDot: true, dotSize: dotSize))
+                    x += gap
+                }
+            }
+        } else if !primary.isEmpty {
+            runs.append(DateStampRun(text: primary, x: 0, isDot: false, dotSize: 0))
+            x = textWidth(primary, fontSize: fontSize, tracking: tracking, fontName: fontName)
+        }
+
+        if !secondary.isEmpty {
+            x += fontSize * (isDSEG ? 0.55 : 0.5)
+            runs.append(DateStampRun(text: secondary, x: x, isDot: false, dotSize: 0))
+            x += textWidth(secondary, fontSize: fontSize, tracking: tracking, fontName: fontName)
+        }
+        return (runs, x)
+    }
+
+    private static func isFontAvailable(_ name: String) -> Bool {
+        let font = CTFontCreateWithName(name as CFString, 12, nil)
+        let actual = CTFontCopyPostScriptName(font) as String
+        return actual.caseInsensitiveCompare(name) == .orderedSame
+    }
+
+    private static func textInkBounds(_ text: String, fontSize: CGFloat,
+                                      tracking: CGFloat, fontName: String) -> CGRect {
+        let font = CTFontCreateWithName(fontName as CFString, fontSize, nil)
+        let attributes: [NSAttributedString.Key: Any] = [
+            NSAttributedString.Key(kCTFontAttributeName as String): font,
+            NSAttributedString.Key(kCTKernAttributeName as String): tracking,
+        ]
+        let line = CTLineCreateWithAttributedString(
+            NSAttributedString(string: text, attributes: attributes))
+        return CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
     }
 
     // MARK: 文字内容

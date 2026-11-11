@@ -709,11 +709,6 @@ private struct MCaptureScaleBar: View {
     let onReset: () -> Void
     let onClose: () -> Void
 
-    @State private var dragStart: Double?
-    /// 连续滚动值（未量化）：刻度位置由它决定，读数由量化后的 `value` 决定。
-    @State private var scrollValue: Double?
-    @State private var inertia: Task<Void, Never>?
-
     var body: some View {
         HStack(spacing: 12) {
             Button(action: onClose) {
@@ -731,7 +726,8 @@ private struct MCaptureScaleBar: View {
                     .font(.mSans(22, .medium).monospacedDigit())
                     .foregroundStyle(MColor.text1)
 
-                ticks
+                MTickRuler(range: axis.range, step: axis.step, value: $value)
+                    .frame(height: 26)
             }
             .frame(maxWidth: .infinity)
 
@@ -747,95 +743,6 @@ private struct MCaptureScaleBar: View {
         }
         .padding(.horizontal, 16)
         .frame(height: 72)
-    }
-
-    /// iOS 原相机刻度尺：中心指示固定，刻度随手势滚动；越靠近中心刻度越长。
-    private var ticks: some View {
-        GeometryReader { _ in
-            let spacing: CGFloat = 13
-            let span = axis.range.upperBound - axis.range.lowerBound
-            let step = axis.step
-            let current = scrollValue ?? value
-            let position = (current - axis.range.lowerBound) / step
-            Canvas { context, size in
-                let centerX = size.width / 2
-                let half = Int(centerX / spacing) + 2
-                let center = Int(position.rounded())
-                let maxIndex = Int(span / step)
-                for index in (center - half)...(center + half) {
-                    guard index >= 0, index <= maxIndex else { continue }
-                    let x = centerX + (CGFloat(index) - CGFloat(position)) * spacing
-                    let distance = abs(x - centerX)
-                    let near = max(0, 1 - distance / (spacing * 4.2))
-                    let height: CGFloat = 9 + 17 * near * near
-                    let highlighted = distance < spacing / 2
-                    let rect = CGRect(x: x - 0.75, y: (size.height - height) / 2,
-                                      width: 1.5, height: height)
-                    context.fill(
-                        Path(roundedRect: rect, cornerRadius: 0.75),
-                        with: .color(highlighted
-                                     ? MColor.brass
-                                     : Color.white.opacity(0.26 + 0.22 * near))
-                    )
-                }
-            }
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { drag in
-                        inertia?.cancel()
-                        if dragStart == nil { dragStart = scrollValue ?? value }
-                        let base = dragStart ?? value
-                        let raw = base - Double(drag.translation.width / spacing) * step
-                        let clamped = min(max(raw, axis.range.lowerBound), axis.range.upperBound)
-                        scrollValue = clamped
-                        commit(clamped)
-                    }
-                    .onEnded { drag in
-                        // 松手后的剩余位移交给指数阻尼，读数跟着一起滑。
-                        let residual = (drag.predictedEndTranslation.width
-                                        - drag.translation.width)
-                        dragStart = nil
-                        glide(residual: residual, spacing: spacing, step: step)
-                    }
-            )
-        }
-        .frame(height: 26)
-    }
-
-    /// 连续滚动值量化成读数；跨档时由父视图触发一次轻震。
-    private func commit(_ raw: Double) {
-        let step = axis.step
-        let quantized = min(max((raw / step).rounded() * step,
-                                axis.range.lowerBound), axis.range.upperBound)
-        if abs(quantized - value) > 1e-6 { value = quantized }
-    }
-
-    /// 惯性滑行：指数阻尼 + 边界收口，模仿 UIScrollView 的减速曲线。
-    private func glide(residual: CGFloat, spacing: CGFloat, step: Double) {
-        guard abs(residual) > 3 else { return }
-        inertia?.cancel()
-        var remaining = residual
-        var last = Date()
-        inertia = Task { @MainActor in
-            while !Task.isCancelled {
-                let now = Date()
-                let dt = min(max(now.timeIntervalSince(last), 0.004), 0.05)
-                last = now
-                let decay = CGFloat(pow(0.93, dt * 60))
-                let delta = remaining * (1 - decay)
-                remaining *= decay
-                let base = scrollValue ?? value
-                let raw = base - Double(delta / spacing) * step
-                let clamped = min(max(raw, axis.range.lowerBound), axis.range.upperBound)
-                scrollValue = clamped
-                commit(clamped)
-                if abs(remaining) < 2
-                    || clamped == axis.range.lowerBound
-                    || clamped == axis.range.upperBound { break }
-                try? await Task.sleep(nanoseconds: 16_000_000)
-            }
-        }
     }
 }
 
