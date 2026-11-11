@@ -7,11 +7,18 @@ struct GradeScreen: View {
     let onBack: () -> Void
     let onGoHome: () -> Void
     let onToast: (String) -> Void
+    /// 分栏底部胶片条的数据源：库内全部照片（iPad 横屏切换照片用）。
+    let library: [MPhoto]
+    /// 点击胶片条缩略图时切换调色对象。
+    let onSwitchPhoto: (String) -> Void
 
     @Environment(\.mHousing) private var housingSetting
     private var housing: MHousingKind { MDeviceHousing.resolved(housingSetting) }
 
     @State private var recipe = MGradeRecipe()
+    /// 撤销栈：每一轮连续调参只记录一次改动前的状态（配方 + 裁切几何）。
+    @State private var undoStack: [MGradeUndoSnapshot] = []
+    @State private var lastChangeTime = Date.distantPast
     @State private var tabIndex = DebugLaunch.gradeTab
     @State private var drawerHeight: CGFloat = MMetric.drawerMin
     @State private var panelContentHeight: CGFloat = 0
@@ -58,52 +65,18 @@ struct GradeScreen: View {
 
     @Environment(\.mSafeInsets) private var insets
 
+    /// iPad 横屏：左画布 + 右参数栏。竖屏与分屏保持原来的单列布局。
+    private var isSplit: Bool { MLayout.usesSplit(insets.size) }
+
     var body: some View {
         ZStack(alignment: .bottom) {
             MColor.app
 
-            VStack(spacing: 0) {
-                navigationBar
-                    .opacity(chromeHidden ? 0 : 1)
-                    .allowsHitTesting(!chromeHidden)
-                    .animation(MMotion.quick, value: chromeHidden)
-                previewStage
-                    .frame(height: max(60, availableHeight - MMetric.navHeight - drawerHeight))
-                    .overlay {
-                        if cardVisible {
-                            MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear
-                                .onAppear { stageSize = geo.size }
-                                .onChange(of: geo.size) { _, newValue in stageSize = newValue }
-                        }
-                    )
-                Spacer(minLength: 0)
+            if isSplit {
+                splitLayout
+            } else {
+                stackedLayout
             }
-            .padding(.top, insets.top)
-
-            // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
-            drawer
-                .opacity(chromeHidden ? 0 : 1)
-                .allowsHitTesting(!chromeHidden)
-                .animation(MMotion.quick, value: chromeHidden)
-                .padding(.horizontal, MMetric.floatingPanelInset)
-                .frame(height: drawerHeight)
-                .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
-                    + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
-
-            toolbar
-                .opacity(chromeHidden ? 0 : 1)
-                .allowsHitTesting(!chromeHidden)
-                .animation(MMotion.quick, value: chromeHidden)
-
-            MBackSwipe(action: onBack)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .padding(.top, insets.top)
         }
         .background(MColor.app)
         .overlay {
@@ -133,17 +106,25 @@ struct GradeScreen: View {
             }
         }
         .overlay(alignment: .top) {
-            MHousingAura(
-                housing: housing,
-                isActive: session.isRendering || !session.sourceReady,
-                label: "显影中"
-            )
+            // iPad 开孔为 .none：与显影台同一守卫，避免顶部画出假光效。
+            if housing != .none {
+                MHousingAura(
+                    housing: housing,
+                    isActive: session.isRendering || !session.sourceReady,
+                    label: "显影中"
+                )
+            }
         }
         .onChange(of: stageSize) { _, _ in popCardIfReady() }
         .onChange(of: session.previewImage != nil) { _, hasImage in
             if hasImage { popCardIfReady() }
         }
-        .onChange(of: recipe) { _, newValue in
+        .onChange(of: isSplit) { _, split in
+            // 进入分栏后预设 / 边框移到左轨：右栏参数页签停在其上时回落到光影。
+            if split && (tabIndex == 0 || tabIndex == 4) { tabIndex = 1 }
+        }
+        .onChange(of: recipe) { oldValue, newValue in
+            pushUndo(oldValue)
             session.apply(newValue)
         }
         .onChange(of: session.lutFailure) { _, message in
@@ -183,8 +164,44 @@ struct GradeScreen: View {
                         onCancel: { cropOpen = false },
                         onDone: { geometry in
                             cropOpen = false
+                            // 裁切确认前压一步栈，撤销可以连同裁切一起回退。
+                            pushUndo(recipe, force: true)
                             session.setGeometry(geometry)
                         }
+                    )
+                } else if let failure = session.cropBaseFailure {
+                    // 底图失败不再无限转圈：给出原因与重试入口。
+                    VStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 22, weight: .light))
+                            .foregroundStyle(MColor.brassHigh)
+                        Text("裁切底图生成失败")
+                            .font(.mSans(12, .semibold))
+                            .foregroundStyle(MColor.text1)
+                        Text(failure)
+                            .font(.mSans(10, .regular))
+                            .foregroundStyle(MColor.text3)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            MHaptic.light()
+                            session.prepareCropBase()
+                        } label: {
+                            Text("重试")
+                                .font(.mSans(11, .semibold))
+                                .foregroundStyle(MColor.brassInk)
+                                .padding(.horizontal, 20)
+                                .frame(height: 32)
+                                .background(Capsule().fill(MColor.brass))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 18)
+                    .frame(maxWidth: 270)
+                    .mGlassSurface(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous),
+                        fallbackFill: MColor.surface2.opacity(0.96)
                     )
                 } else {
                     ProgressView()
@@ -195,6 +212,210 @@ struct GradeScreen: View {
             .presentationDragIndicator(.visible)
             .presentationBackground(MColor.app)
         }
+    }
+
+    // MARK: - 单列布局（iPhone / iPad 竖屏 / 分屏）
+
+    private var stackedLayout: some View {
+        Group {
+            VStack(spacing: 0) {
+                navigationBar
+                    .opacity(chromeHidden ? 0 : 1)
+                    .allowsHitTesting(!chromeHidden)
+                    .animation(MMotion.quick, value: chromeHidden)
+                previewStage
+                    .frame(height: max(60, availableHeight - MMetric.navHeight - drawerHeight))
+                    .overlay {
+                        if cardVisible {
+                            MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { stageSize = geo.size }
+                                .onChange(of: geo.size) { _, newValue in stageSize = newValue }
+                        }
+                    )
+                Spacer(minLength: 0)
+            }
+            .padding(.top, insets.top)
+
+            // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
+            drawer
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
+                .padding(.horizontal, MMetric.floatingPanelInset)
+                .frame(height: drawerHeight)
+                .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
+                    + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
+
+            toolbar(bottomPadding: 8 + insets.bottom)
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
+
+            MBackSwipe(action: onBack)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .padding(.top, insets.top)
+        }
+    }
+
+    // MARK: - 分栏布局（iPad 横屏，参考 macOS 三栏：LUT 边框轨 / 画布 / 调色参数）
+
+    private var splitLayout: some View {
+        VStack(spacing: 0) {
+            navigationBar
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
+
+            HStack(spacing: 0) {
+                gradeSideRail
+                    .frame(width: MLayout.sideRailWidth(for: insets.size))
+
+                Rectangle()
+                    .fill(MColor.hairline)
+                    .frame(width: 1)
+
+                VStack(spacing: 0) {
+                    previewStage
+                        .overlay {
+                            if cardVisible {
+                                MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear
+                                    .onAppear { stageSize = geo.size }
+                                    .onChange(of: geo.size) { _, newValue in stageSize = newValue }
+                            }
+                        )
+                        .frame(maxHeight: .infinity)
+
+                    if library.count > 1 {
+                        gradeFilmstrip
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .overlay(alignment: .leading) {
+                    MBackSwipe(action: onBack)
+                        .frame(width: 22)
+                }
+
+                Rectangle()
+                    .fill(MColor.hairline)
+                    .frame(width: 1)
+
+                VStack(spacing: 0) {
+                    // 调色参数页签在参数栏顶部（光影 / 色调 / 质感）。
+                    MSplitTabRow(
+                        titles: ["光影", "色调", "质感"],
+                        selection: gradeParamTabIndex,
+                        onSelect: { index in
+                            selectTab(gradeParamTabIndices[index])
+                        }
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.top, 10)
+
+                    // 裁切 / 预览比例：参数栏的固定工具行。
+                    drawerToolRow
+                        .padding(.horizontal, 12)
+                        .padding(.top, 8)
+
+                    gradeParamPanel
+                        .frame(maxHeight: .infinity)
+                        .padding(.bottom, insets.bottom)
+                }
+                .frame(width: MLayout.inspectorWidth(for: insets.size))
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .padding(.top, insets.top)
+    }
+
+    /// 分栏右栏的调色参数页 → tabIndex 的下标映射（预设 / 边框已移到左轨）。
+    private let gradeParamTabIndices = [1, 2, 3]
+    private var gradeParamTabIndex: Int { gradeParamTabIndices.firstIndex(of: tabIndex) ?? 0 }
+
+    @ViewBuilder private var gradeParamPanel: some View {
+        switch tabIndex {
+        case 2: colorPanel
+        case 3: texturePanel
+        default: lightPanel
+        }
+    }
+
+    /// 左轨：LUT 预设 / 边框切换（参考 macOS 的左侧预设栏）。
+    private var gradeSideRail: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 16) {
+                MSideRailTab(title: "预设", selected: tabIndex != 4) {
+                    withAnimation(MMotion.drawer) { tabIndex = 0 }
+                }
+                MSideRailTab(title: "边框", selected: tabIndex == 4) {
+                    withAnimation(MMotion.drawer) { tabIndex = 4 }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 42)
+
+            Group {
+                if tabIndex == 4 {
+                    borderPanel
+                } else {
+                    presetPanel
+                }
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .background(MColor.app)
+    }
+
+    /// 底部胶片条：横向缩略图切换照片（参考 macOS 的 Filmstrip）。
+    private var gradeFilmstrip: some View {
+        VStack(spacing: 0) {
+            MHairline()
+
+            ScrollView(.horizontal) {
+                // 懒加载：只为可见格子建视图、解缩略图，照片多时不会一次解全库。
+                LazyHStack(spacing: 8) {
+                    ForEach(library) { photo in
+                        Button {
+                            MHaptic.tick()
+                            onSwitchPhoto(photo.id)
+                        } label: {
+                            ZStack {
+                                Rectangle().fill(MColor.surface2)
+                                if let image = MPhotoImage.load(photo) {
+                                    image.resizable().scaledToFill()
+                                }
+                            }
+                            .frame(width: 64, height: 44)
+                            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .strokeBorder(
+                                        photo.id == session.photoID ? MColor.brass : MColor.hairline,
+                                        lineWidth: photo.id == session.photoID ? 1.6 : 1
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+            }
+            .scrollIndicators(.never)
+        }
+        .padding(.bottom, insets.bottom)
     }
 
     // MARK: - 预览就绪：白色画布弹出并显影成照片
@@ -278,6 +499,11 @@ struct GradeScreen: View {
                 .shadow(color: .black.opacity(0.75), radius: 3, y: 1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+
+            MCircleIconButton(icon: "arrow.counterclockwise", size: 13, frame: 32) {
+                resetAllGrade()
+            }
+            .accessibilityLabel("重置全部调整")
 
             MBrassPill(title: "导出", icon: "square.and.arrow.up", height: 32) {
                 withAnimation(MMotion.pill) { exportOpen = true }
@@ -638,12 +864,94 @@ struct GradeScreen: View {
         )
     }
 
+    // MARK: - 抽屉工具行
+
+    private var drawerToolRow: some View {
+        HStack(spacing: 6) {
+            MCircleIconButton(icon: "crop", size: 12, frame: 28) {
+                MHaptic.tick()
+                session.prepareCropBase()
+                cropOpen = true
+            }
+            .accessibilityLabel("裁切与校正")
+
+            gradeScaleMenu
+
+            Spacer(minLength: 0)
+
+            MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
+                undoGrade()
+            }
+            .opacity(undoStack.isEmpty ? 0.36 : 1)
+            .allowsHitTesting(!undoStack.isEmpty)
+            .accessibilityLabel("撤销")
+        }
+    }
+
+    // MARK: - 撤销 / 重置
+
+    /// 一步撤销快照：调色配方 + 裁切几何，两者一起回退才不会出现「参数回去了、裁切没回去」。
+    private struct MGradeUndoSnapshot {
+        let recipe: MGradeRecipe
+        let geometry: MPhotoGeometry
+    }
+
+    /// 按轮次合并：一轮连续调参只有第一次（新起点）才把改动前的状态压栈。
+    /// `force` 用于裁切确认、整体重置这类一次成型的动作。
+    private func pushUndo(_ previous: MGradeRecipe, force: Bool = false) {
+        let now = Date()
+        defer { lastChangeTime = now }
+        if !force, now.timeIntervalSince(lastChangeTime) <= 0.5 { return }
+        undoStack.append(MGradeUndoSnapshot(recipe: previous, geometry: session.geometry))
+        if undoStack.count > 40 { undoStack.removeFirst() }
+    }
+
+    private func undoGrade() {
+        guard let previous = undoStack.popLast() else { return }
+        session.syncLUTPath(name: previous.recipe.lutName)
+        // 撤回自身会触发 recipe 的 onChange，先刷新时间戳，避免撤回也被压栈。
+        lastChangeTime = Date()
+        withAnimation(MMotion.state) {
+            recipe = previous.recipe
+            restoreCurveFromRecipe()
+        }
+        if previous.geometry != session.geometry {
+            session.setGeometry(previous.geometry)
+        }
+    }
+
+    /// 只重置调色参数（色调页底部按钮）。
+    private func resetGrade() {
+        MHaptic.medium()
+        session.syncLUTPath(name: "无 LUT")
+        withAnimation(MMotion.state) {
+            recipe = MGradeRecipe()
+            resetCurve()
+        }
+        onToast("调色参数已重置")
+    }
+
+    /// 顶栏重置：让照片回到刚从显影台出来的状态 —— 调色参数与裁切几何全部复原。
+    private func resetAllGrade() {
+        MHaptic.medium()
+        pushUndo(recipe, force: true)
+        session.syncLUTPath(name: "无 LUT")
+        withAnimation(MMotion.state) {
+            recipe = MGradeRecipe()
+            resetCurve()
+        }
+        session.resetGeometry()
+        onToast("已重置全部调整")
+    }
+
     // MARK: - 抽屉
 
     private var drawer: some View {
         VStack(spacing: 0) {
-            MDrawerChevron(isExpanded: isDrawerExpanded, isVisible: !isLockedTab) {
-                toggleDrawer()
+            if !isSplit {
+                MDrawerChevron(isExpanded: isDrawerExpanded, isVisible: !isLockedTab) {
+                    toggleDrawer()
+                }
             }
 
             ZStack {
@@ -687,22 +995,13 @@ struct GradeScreen: View {
         // 阴影分两层：近处极淡、远处大半径，让边界是渐隐而不是一圈硬黑边。
         .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
         .shadow(color: .black.opacity(0.22), radius: 30, y: 12)
-        // 裁切 / 预览比例浮在 sheet 外面顶部，和原本撤销按钮同一行。
+        // 裁切 / 预览比例浮在 sheet 外面顶部，和原本撤销按钮同一行；分栏时移到参数栏顶部固定行。
         .overlay(alignment: .top) {
-            HStack(spacing: 6) {
-                MCircleIconButton(icon: "crop", size: 12, frame: 28) {
-                    MHaptic.tick()
-                    session.prepareCropBase()
-                    cropOpen = true
-                }
-                .accessibilityLabel("裁切与校正")
-
-                gradeScaleMenu
-
-                Spacer(minLength: 0)
+            if !isSplit {
+                drawerToolRow
+                    .padding(.horizontal, 10)
+                    .offset(y: -36)
             }
-            .padding(.horizontal, 10)
-            .offset(y: -36)
         }
         .onPreferenceChange(MPanelHeightKey.self) { height in
             panelContentHeight = height
@@ -716,6 +1015,8 @@ struct GradeScreen: View {
     /// 面板内容或可视高度变化后，把抽屉对齐到自适应高度。
     /// 布局回调里只赋值，不启动动画，避免 preference → 动画 → 布局的反馈环。
     private func syncDrawerToContent() {
+        // 分栏下面板高度由右栏自然分配，drawerHeight 不参与布局，别再写状态引发多余重绘。
+        guard !isSplit else { return }
         guard panelViewportHeight > 0, panelContentHeight > 0 else { return }
         let fit = fitHeight(for: panelContentHeight)
         let target: CGFloat = isLockedTab ? fit : min(drawerHeight, fit)
@@ -1048,12 +1349,7 @@ struct GradeScreen: View {
                 MParamSlider(label: "平衡", value: $recipe.grading.balance, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
 
                 resetButton("重置调色") {
-                    MHaptic.medium()
-                    withAnimation(MMotion.state) {
-                        recipe = MGradeRecipe()
-                        resetCurve()
-                    }
-                    onToast("调色参数已重置")
+                    resetGrade()
                 }
             }
             .padding(.horizontal, MMetric.pageMargin)
@@ -1549,7 +1845,7 @@ struct GradeScreen: View {
 
     // MARK: - 工具条
 
-    private var toolbar: some View {
+    private func toolbar(bottomPadding: CGFloat) -> some View {
         MGlassTabCapsule {
             ForEach(Array(toolItems.enumerated()), id: \.offset) { item in
                 Button {
@@ -1585,7 +1881,7 @@ struct GradeScreen: View {
                 .accessibilityAddTraits(tabIndex == item.offset ? [.isSelected] : [])
             }
         }
-        .padding(.bottom, 8 + insets.bottom)
+        .padding(.bottom, bottomPadding)
     }
 
     private var drawerShape: UnevenRoundedRectangle {

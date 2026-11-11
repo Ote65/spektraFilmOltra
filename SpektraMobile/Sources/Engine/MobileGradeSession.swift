@@ -35,6 +35,8 @@ final class MobileGradeSession: ObservableObject {
     @Published private(set) var geometry = MPhotoGeometry()
     /// 裁切页取景底图：完整交接图的调色结果，不含任何几何变换。
     @Published private(set) var cropBaseImage: CGImage?
+    /// 裁切底图生成失败的原因；非 nil 时裁切页展示错误与重试入口，而不是无限转圈。
+    @Published private(set) var cropBaseFailure: String?
     /// 调色台预览比例（相对 1600 交接图）：1/8、1/4、1/2、1/1。
     @Published private(set) var previewScale: Double
 
@@ -53,6 +55,15 @@ final class MobileGradeSession: ObservableObject {
     private var pristineOriginalCG: CGImage?
     private var borderPersistWork: DispatchWorkItem?
     private var geometryPersistWork: DispatchWorkItem?
+    /// 裁切取景底图的目标长边：取景只需要屏幕分辨率，压缩快照能显著降低拖动期采样成本。
+    private let cropBaseEdge = 1200
+    /// 生成快照时的配方与 LUT，用于下次进裁切页时判断能否直接复用。
+    private var cropBaseRecipe: MGradeRecipe?
+    private var cropBaseLUTPath: String?
+    /// 裁切几何重采样专用队列：整幅 apply 不堵调色预览所在的 gradeQueue。
+    private let geometryQueue = DispatchQueue(label: "spektra.mobile.grade.geometry", qos: .userInitiated)
+    /// 在算的几何帧取消标记：新几何请求一到就取消旧帧计算。
+    private var geometryFlag: MCancelFlag?
     /// 片边重合成单独一条队列：滑条拖动时只保留最新一帧，主线程只做赋值。
     private let borderQueue = DispatchQueue(label: "spektra.mobile.grade.border", qos: .userInitiated)
     /// 新的片边请求一来就取消上一帧合成，避免拖动滑条时任务排队造成延迟。
@@ -138,6 +149,11 @@ final class MobileGradeSession: ObservableObject {
             Task { @MainActor in
                 self.pristineSource = linear
                 self.source = warped
+                // 交接图重做后旧的裁切快照失效。
+                self.cropBaseImage = nil
+                self.cropBaseRecipe = nil
+                self.cropBaseLUTPath = nil
+                self.cropBaseFailure = nil
                 self.sourceReady = true
                 self.sourceFailure = nil
                 self.errorMessage = nil
@@ -165,31 +181,69 @@ final class MobileGradeSession: ObservableObject {
     // MARK: - 裁切与校正
 
     /// 裁切页取景底图：完整交接图按当前配方调色，但不带任何几何变换。
+    /// 所有失败路径都会回写 `cropBaseFailure`，保证裁切页有错误文案与重试入口。
+    /// 生成时先压到 `cropBaseEdge`：取景只需要屏幕分辨率，压缩快照换来拖动期的分钟级成本下降。
     func prepareCropBase() {
-        guard let pristine = pristineSource, !isExporting else { return }
+        cropBaseFailure = nil
+        guard let pristine = pristineSource else {
+            cropBaseFailure = "交接图还在准备中，稍后再试裁切。"
+            return
+        }
+        guard !isExporting else {
+            cropBaseFailure = "正在导出，完成后再试。"
+            return
+        }
+        // 同一配方下直接复用上一次的快照，第二次进裁切页不再等调色。
+        if cropBaseImage != nil, cropBaseRecipe == displayRecipe, cropBaseLUTPath == lutPath {
+            return
+        }
         cropBaseImage = nil
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
+        let uiRecipe = displayRecipe
+        let recipeKey = lutPath
+        let edge = cropBaseEdge
         gradeQueue.async { [weak self] in
-            let result = try? GradeEngine.render(pristine, recipe: recipe)
-            let image = result.flatMap { PreviewRenderer.cgImage(from: $0.image) }
+            var image: CGImage?
+            var failure: String?
+            do {
+                let input = GradeEngine.downsampleLinear(pristine, maxLongEdge: edge)
+                let result = try GradeEngine.render(input, recipe: recipe)
+                image = PreviewRenderer.cgImage(from: result.image)
+                if image == nil { failure = "裁切底图生成失败，请重试。" }
+            } catch {
+                failure = (error as? LUTParseError)?.errorDescription
+                    ?? "裁切底图生成失败，请重试。"
+            }
             Task { @MainActor [weak self] in
                 guard let self, !self.isExporting else { return }
                 self.cropBaseImage = image
+                self.cropBaseFailure = failure
+                if failure == nil {
+                    self.cropBaseRecipe = uiRecipe
+                    self.cropBaseLUTPath = recipeKey
+                }
             }
         }
     }
 
+    /// 关闭裁切页：只清错误态，保留已生成的压缩快照供下次直接复用。
     func clearCropBase() {
-        cropBaseImage = nil
+        cropBaseFailure = nil
     }
 
     /// 确认裁切：几何只作用在交接图本身，片边随后才合成，不会裁到片边。
+    /// 整幅重采样放在专用队列（不堵 gradeQueue 的调色预览），
+    /// 且带行级取消标记：新几何请求一到就取消旧帧计算，只保留最新一帧。
     func setGeometry(_ value: MPhotoGeometry) {
         let target = value.normalized()
         guard target != geometry else { return }
         geometry = target
         persistGeometrySoon()
         guard sourceReady, !isExporting, let pristine = pristineSource else { return }
+
+        geometryFlag?.cancel()
+        let flag = MCancelFlag()
+        geometryFlag = flag
 
         token += 1
         pendingProxy?.cancel()
@@ -206,9 +260,13 @@ final class MobileGradeSession: ObservableObject {
         let dateLabel = captureDateLabel
         let timeLabel = captureTimeLabel
 
-        gradeQueue.async { [weak self] in
-            let warped = target.apply(to: pristine)
-            let warpedOriginal = original.flatMap { target.apply(to: $0) }
+        geometryQueue.async { [weak self] in
+            let warped = target.apply(to: pristine) { flag.isCancelled }
+            guard !flag.isCancelled else { return }
+            let warpedOriginal = original.flatMap {
+                flag.isCancelled ? nil : target.apply(to: $0) { flag.isCancelled }
+            }
+            guard !flag.isCancelled else { return }
             let framed = warpedOriginal.map {
                 MFilmBorderRenderer.preview(
                     photo: $0, config: borderConfig, filmID: filmID, photoID: photoID,
@@ -216,7 +274,7 @@ final class MobileGradeSession: ObservableObject {
                 ) ?? $0
             }
             Task { @MainActor [weak self] in
-                guard let self, self.geometry == target else { return }
+                guard let self, self.geometry == target, !flag.isCancelled else { return }
                 self.source = warped
                 self.originalBaseCG = warpedOriginal ?? original
                 if let framed {
@@ -253,6 +311,7 @@ final class MobileGradeSession: ObservableObject {
         token += 1
         exportToken += 1
         borderFlag?.cancel()
+        geometryFlag?.cancel()
         pendingProxy?.cancel()
         pendingSettle?.cancel()
     }
@@ -387,6 +446,11 @@ final class MobileGradeSession: ObservableObject {
             displayRecipe.lutStrength = 0
         }
         schedule()
+    }
+
+    /// 按 LUT 名称回写会话内的 LUT 路径（撤销 / 重置配方时与 UI 的 lutName 保持同步）。
+    func syncLUTPath(name: String) {
+        lutPath = name == "无 LUT" ? "" : (luts.first { $0.name == name }?.path ?? "")
     }
 
     func applyPreset(_ preset: GradePreset) {

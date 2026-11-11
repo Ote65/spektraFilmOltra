@@ -262,6 +262,182 @@ struct MUnderlineTabs: View {
     }
 }
 
+// MARK: - 分栏页签（iPad 横屏）
+
+/// 左轨顶部的下划线页签：与 macOS 版的下划线 tab 同一语言。
+struct MSideRailTab: View {
+    let title: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Text(title)
+                    .font(.mSans(12.5, selected ? .semibold : .medium))
+                    .foregroundStyle(selected ? MColor.brass : MColor.text3)
+                Rectangle()
+                    .fill(selected ? MColor.brass : MColor.clear)
+                    .frame(height: 2)
+            }
+            .frame(minWidth: 46)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 分栏参数栏顶部的胶囊页签行：换页只换内容，不再压在画布底部。
+struct MSplitTabRow: View {
+    let titles: [String]
+    let selection: Int
+    let onSelect: (Int) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(titles.indices, id: \.self) { index in
+                Button {
+                    MHaptic.tick()
+                    onSelect(index)
+                } label: {
+                    Text(titles[index])
+                        .font(.mSans(11, selection == index ? .semibold : .medium))
+                        .foregroundStyle(selection == index ? MColor.brass : MColor.text3)
+                        .padding(.horizontal, 12)
+                        .frame(height: 30)
+                        .background(
+                            Capsule().fill(selection == index
+                                           ? MColor.brassWash
+                                           : MColor.surface2.opacity(0.6))
+                        )
+                        .overlay(
+                            Capsule().strokeBorder(
+                                selection == index ? MColor.brass.opacity(0.28) : MColor.hairline,
+                                lineWidth: 1
+                            )
+                        )
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+// MARK: - 直方图（分栏参数栏）
+
+/// RGB 直方图数据：每通道 64 桶的原始计数，视图内做联合归一化。
+struct MHistogramData: Equatable {
+    let red: [Double]
+    let green: [Double]
+    let blue: [Double]
+
+    static let empty = MHistogramData(
+        red: .init(repeating: 0, count: 64),
+        green: .init(repeating: 0, count: 64),
+        blue: .init(repeating: 0, count: 64)
+    )
+}
+
+/// 从屏幕图计算 RGB 直方图：先降采样到 160pt 宽的 RGBA8，再逐像素分桶。
+/// 与 macOS 版 Inspector 的直方图同一呈现口径（亮度/RGB 三条折线）。
+enum MHistogramSampler {
+    static func compute(_ image: MPlatformImage, bins: Int = 64) -> MHistogramData? {
+        #if os(macOS)
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        #else
+        guard let cg = image.cgImage else { return nil }
+        #endif
+        let width = 160
+        let height = max(1, Int((CGFloat(cg.height) / CGFloat(max(1, cg.width))) * CGFloat(width)))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        ctx.interpolationQuality = .low
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let data = ctx.data else { return nil }
+
+        let pixels = data.bindMemory(to: UInt8.self, capacity: width * height * 4)
+        var red = [Double](repeating: 0, count: bins)
+        var green = [Double](repeating: 0, count: bins)
+        var blue = [Double](repeating: 0, count: bins)
+        let shift = 8 - Int(log2(Double(bins)))
+
+        for index in 0..<(width * height) {
+            let offset = index * 4
+            red[Int(pixels[offset]) >> shift] += 1
+            green[Int(pixels[offset + 1]) >> shift] += 1
+            blue[Int(pixels[offset + 2]) >> shift] += 1
+        }
+        return MHistogramData(red: red, green: green, blue: blue)
+    }
+}
+
+/// 亮度/RGB 三色折线直方图：画法与 macOS 版 SkinHistogram 一致。
+struct MHistogram: View {
+    let data: MHistogramData
+
+    var body: some View {
+        Canvas { context, size in
+            for fraction in [0.25, 0.5, 0.75] {
+                var line = Path()
+                line.move(to: CGPoint(x: 0, y: size.height * fraction))
+                line.addLine(to: CGPoint(x: size.width, y: size.height * fraction))
+                context.stroke(line, with: .color(.white.opacity(0.045)), lineWidth: 1)
+            }
+
+            let sums = (0..<data.red.count).map { data.red[$0] + data.green[$0] + data.blue[$0] }
+            let maxValue = max(0.01, sums.max() ?? 1)
+
+            draw(data.red, color: Color(hex: 0xC0705E).opacity(0.58),
+                 maxValue: maxValue, context: context, size: size)
+            draw(data.green, color: Color(hex: 0x7E9B77).opacity(0.55),
+                 maxValue: maxValue, context: context, size: size)
+            draw(data.blue, color: Color(hex: 0x6D8BA7).opacity(0.55),
+                 maxValue: maxValue, context: context, size: size)
+        }
+        .frame(height: 52)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.black.opacity(0.16))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.035), lineWidth: 1)
+        )
+    }
+
+    private func draw(
+        _ values: [Double],
+        color: Color,
+        maxValue: Double,
+        context: GraphicsContext,
+        size: CGSize
+    ) {
+        guard values.count > 1 else { return }
+        var path = Path()
+        for (index, value) in values.enumerated() {
+            let x = size.width * CGFloat(index) / CGFloat(values.count - 1)
+            let y = size.height - 2 - CGFloat(value / maxValue) * (size.height - 4) * 0.92
+            if index == 0 {
+                path.move(to: CGPoint(x: x, y: y))
+            } else {
+                path.addLine(to: CGPoint(x: x, y: y))
+            }
+        }
+        context.stroke(
+            path,
+            with: .color(color),
+            style: StrokeStyle(lineWidth: 1.2, lineJoin: .round)
+        )
+    }
+}
+
 // MARK: - 分组标题
 
 struct MSectionHead: View {

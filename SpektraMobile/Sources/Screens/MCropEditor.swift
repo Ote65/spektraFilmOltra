@@ -1,4 +1,6 @@
 import CoreGraphics
+import CoreImage
+import Metal
 import SwiftUI
 
 /// 调色台的裁切与校正页。
@@ -26,18 +28,16 @@ struct MCropEditor: View {
         _preview = StateObject(wrappedValue: MCropPreviewRenderer(base: base))
     }
 
-    private var baseAspect: CGFloat {
-        CGFloat(base.width) / CGFloat(max(1, base.height))
-    }
-
-    /// 方向变换后的像素长宽比（奇数次 90° 旋转会翻转）。
+    /// 方向变换后的原画幅长宽比。取景框与固定比例都按它算，
+    /// 透视/旋转只会让照片向外溢出，不会改变画幅本身的尺寸。
     private var orientedAspect: CGFloat {
-        draft.quarterTurns % 2 == 0 ? baseAspect : 1 / baseAspect
+        let oriented = draft.orientedSize(sourceWidth: base.width, sourceHeight: base.height)
+        return CGFloat(oriented.width) / CGFloat(max(1, oriented.height))
     }
 
-    private var previewAspect: CGFloat {
-        guard let image = preview.image else { return orientedAspect }
-        return CGFloat(image.width) / CGFloat(max(1, image.height))
+    /// 校正后照片在归一化坐标里的外接框（可能比原画幅大）。
+    private var photoBounds: CGRect {
+        draft.warpBounds(sourceWidth: base.width, sourceHeight: base.height)
     }
 
     private var lockedRatio: CGFloat? {
@@ -79,16 +79,28 @@ struct MCropEditor: View {
 
     private var canvas: some View {
         GeometryReader { proxy in
-            let rect = MImageFit.rect(aspect: previewAspect, in: proxy.size, horizontalPadding: 18)
+            // 取景框锚定在原画幅上，尺寸固定；校正后的照片按外接框绘制，
+            // 超出原画幅的部分自然溢出画布（与系统相册、Lightroom 一致），
+            // 所以拖动透视/旋转时照片不会缩进画框里。
+            let frame = MImageFit.rect(aspect: orientedAspect, in: proxy.size,
+                                       horizontalPadding: 18)
+            let bounds = photoBounds
+            let photo = CGRect(
+                x: frame.minX + bounds.minX * frame.width,
+                y: frame.minY + bounds.minY * frame.height,
+                width: bounds.width * frame.width,
+                height: bounds.height * frame.height
+            )
             ZStack {
                 if let image = preview.image {
                     Image(decorative: image, scale: 1)
                         .resizable()
                         .interpolation(.high)
-                        .frame(width: rect.width, height: rect.height)
-                        .position(x: rect.midX, y: rect.midY)
+                        .frame(width: photo.width, height: photo.height)
+                        .position(x: photo.midX, y: photo.midY)
                     MCropFrame(
-                        imageRect: rect,
+                        imageRect: frame,
+                        photoRect: photo,
                         crop: Binding(get: { draft.crop }, set: { draft.crop = $0 }),
                         pixelRatio: lockedRatio,
                         orientedAspect: orientedAspect
@@ -100,6 +112,7 @@ struct MCropEditor: View {
             }
         }
         .padding(.top, 6)
+        .clipped()
     }
 
     // MARK: - 参数区
@@ -111,8 +124,7 @@ struct MCropEditor: View {
             case .crop:
                 ratioBar
             case .straighten:
-                rulerPanel(title: "水平", value: $draft.straighten,
-                           range: -45...45, step: 0.1, suffix: "°")
+                straightenPanel
             case .perspective:
                 perspectivePanel
             case .flip:
@@ -152,66 +164,51 @@ struct MCropEditor: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func rulerPanel(title: String, value: Binding<Double>,
-                            range: ClosedRange<Double>, step: Double, suffix: String) -> some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
-                Text(title)
-                    .font(.mSans(11, .medium))
-                    .foregroundStyle(MColor.text3)
-                Text(formatted(value.wrappedValue, suffix: suffix))
-                    .font(.mSans(13, .medium).monospacedDigit())
-                    .foregroundStyle(MColor.text1)
-                Spacer()
-                Button("复位") {
-                    withAnimation(MMotion.state) { value.wrappedValue = 0 }
-                }
-                .font(.mSans(11, .medium))
-                .foregroundStyle(MColor.text3)
+    /// 水平纠正：一条整轨滑杆，整条轨道 = 90°，拖满一屏就到 ±45°。
+    private var straightenPanel: some View {
+        VStack(spacing: 2) {
+            panelHeader(title: "水平") {
+                draft.straighten = 0
             }
-            .padding(.horizontal, 20)
 
-            MTickRuler(range: range, step: step, value: value, haptics: true)
+            MParamSlider(label: "角度", value: $draft.straighten, base: 0,
+                         range: -45...45, step: 1, decimals: 0, suffix: "°",
+                         compact: true)
                 .padding(.horizontal, 20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     private var perspectivePanel: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 8) {
-                Text("透视纠正")
-                    .font(.mSans(11, .medium))
-                    .foregroundStyle(MColor.text3)
-                Spacer()
-                Button("复位") {
-                    withAnimation(MMotion.state) {
-                        draft.perspectiveV = 0
-                        draft.perspectiveH = 0
-                    }
-                }
-                .font(.mSans(11, .medium))
-                .foregroundStyle(MColor.text3)
+        VStack(spacing: 2) {
+            panelHeader(title: "透视纠正") {
+                draft.perspectiveV = 0
+                draft.perspectiveH = 0
             }
-            .padding(.horizontal, 20)
 
-            perspectiveRow(title: "垂直", value: $draft.perspectiveV)
-            perspectiveRow(title: "水平", value: $draft.perspectiveH)
+            MParamSlider(label: "垂直", value: $draft.perspectiveV, base: 0,
+                         range: -100...100, step: 1, decimals: 0, suffix: "",
+                         compact: true)
+                .padding(.horizontal, 20)
+            MParamSlider(label: "水平", value: $draft.perspectiveH, base: 0,
+                         range: -100...100, step: 1, decimals: 0, suffix: "",
+                         compact: true)
+                .padding(.horizontal, 20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
-    private func perspectiveRow(title: String, value: Binding<Double>) -> some View {
-        HStack(spacing: 10) {
+    private func panelHeader(title: String, reset: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
             Text(title)
-                .font(.mSans(10, .medium))
+                .font(.mSans(11, .medium))
                 .foregroundStyle(MColor.text3)
-                .frame(width: 26, alignment: .leading)
-            Text(String(format: "%.0f", value.wrappedValue))
-                .font(.mSans(10, .medium).monospacedDigit())
-                .foregroundStyle(MColor.text2)
-                .frame(width: 30, alignment: .trailing)
-            MTickRuler(range: -100...100, step: 1, value: value, haptics: true)
+            Spacer()
+            Button("复位") {
+                withAnimation(MMotion.state) { reset() }
+            }
+            .font(.mSans(11, .medium))
+            .foregroundStyle(MColor.text3)
         }
         .padding(.horizontal, 20)
     }
@@ -322,7 +319,8 @@ struct MCropEditor: View {
     private func rotateClockwise() {
         MHaptic.tick()
         var rotated = draft.rotatedClockwise()
-        let aspect = rotated.quarterTurns % 2 == 0 ? baseAspect : 1 / baseAspect
+        let oriented = rotated.orientedSize(sourceWidth: base.width, sourceHeight: base.height)
+        let aspect = CGFloat(oriented.width) / CGFloat(max(1, oriented.height))
         // 原始比例与自由格式的取景框转过来仍然合法，保留用户已经拉好的框；
         // 固定比例（正方形/16:9…）转 90° 后比例会变成倒数，只能重新居中。
         if ratio != .free, ratio != .original,
@@ -339,10 +337,6 @@ struct MCropEditor: View {
             ratio = .original
             tool = .crop
         }
-    }
-
-    private func formatted(_ value: Double, suffix: String) -> String {
-        String(format: "%.1f%@", value, suffix)
     }
 
     static func centeredCrop(ratio: Double, orientedAspect: CGFloat) -> MPhotoGeometry.Crop {
@@ -408,7 +402,10 @@ private enum MRatio: String, CaseIterable, Identifiable {
 
 /// 归一化裁切框 + 手势。坐标全部相对“已校正画面”，与像素渲染同一套映射。
 private struct MCropFrame: View {
+    /// 原画幅（取景框坐标系）。
     let imageRect: CGRect
+    /// 校正后照片的实际显示区域，可能溢出原画幅。
+    let photoRect: CGRect
     @Binding var crop: MPhotoGeometry.Crop
     let pixelRatio: CGFloat?
     let orientedAspect: CGFloat
@@ -451,7 +448,7 @@ private struct MCropFrame: View {
 
     private var dimming: some View {
         Path { path in
-            path.addRect(imageRect)
+            path.addRect(photoRect)
             path.addRect(cropRect)
         }
         .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
@@ -628,39 +625,60 @@ private enum MCropHandle {
 
 // MARK: - 取景预览
 
-/// 裁切页的实时预览：在后台按同一套几何映射重采样，只保留最新一帧。
+/// 裁切页的实时预览：几何变换全部交给 Core Image（Metal），不再做 CPU 重采样。
+/// - 快照进内存时压到 1100 长边，之后每帧只构造一条 CIImage filter 链；
+/// - 单帧 GPU 渲染 1–2ms，拖动刻度时不需要节流、也不会积压；
+/// - 新请求一到立即取消旧帧，队列里不存在过期计算；
+/// - 裁切框变化不触发重算（预览始终是全幅 + 校正）。
+/// 真正的原图几何变换只在 `onDone` 之后由 `MobileGradeSession.setGeometry` 执行一次。
 final class MCropPreviewRenderer: ObservableObject {
     @Published private(set) var image: CGImage?
 
     private let queue = DispatchQueue(label: "spektra.mobile.crop.preview", qos: .userInitiated)
-    private var source: MRGBACopy.Buffer?
-    private var last: MPhotoGeometry?
-    private var token = 0
-    private let maxEdge = 1200
+    private let ciContext: CIContext
+    /// 只在 init 写入、只在 queue 上读取。
+    private var ciSource: CIImage?
+    /// 主线程持有：最近一次请求与在算帧的取消标记。
+    private var requested: MPhotoGeometry?
+    private var flag: MCancelFlag?
+    /// 压缩快照长边：取景只需要屏幕分辨率。
+    private let snapshotEdge = 1100
+    /// 每帧输出长边。GPU 单帧 1–2ms，直接用接近屏幕分辨率。
+    private let previewEdge = 1000
 
     init(base: CGImage) {
-        queue.async { [weak self] in
-            guard let buffer = MRGBACopy.read(base) else { return }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.source = buffer
-                self.render(MPhotoGeometry())
-            }
+        if let device = MTLCreateSystemDefaultDevice() {
+            ciContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
+        } else {
+            ciContext = CIContext(options: [.cacheIntermediates: false])
+        }
+        // 快照只读一次（约 10ms），之后所有帧都在这个缓冲上做 GPU 变换。
+        if let buffer = MRGBACopy.read(base, maxLongEdge: snapshotEdge),
+           let snapshot = MRGBACopy.makeImage(pixels: buffer.pixels,
+                                              width: buffer.width,
+                                              height: buffer.height) {
+            ciSource = CIImage(cgImage: snapshot)
         }
     }
 
-    /// 主线程调用；只比较方向/校正，纯裁切框变化不触发重采样。
+    /// 主线程调用；纯裁切框变化不触发重算。
     func render(_ geometry: MPhotoGeometry) {
-        guard let source else { return }
+        guard ciSource != nil else { return }
         let target = geometry.withoutCrop()
-        guard target != last else { return }
-        last = target
-        token += 1
-        let current = token
+        guard requested != target else { return }
+        requested = target
+        flag?.cancel()
+        let flag = MCancelFlag()
+        self.flag = flag
+        let edge = previewEdge
+        let context = ciContext
         queue.async { [weak self] in
-            let image = target.apply(buffer: source, maxLongEdge: self?.maxEdge ?? 1200)
-            DispatchQueue.main.async {
-                guard let self, self.token == current else { return }
+            guard let self, let source = self.ciSource else { return }
+            let output = target.previewCIImage(from: source, maxLongEdge: edge)
+            guard !flag.isCancelled else { return }
+            let image = context.createCGImage(output, from: output.extent)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.flag === flag, !flag.isCancelled, let image else { return }
                 self.image = image
             }
         }

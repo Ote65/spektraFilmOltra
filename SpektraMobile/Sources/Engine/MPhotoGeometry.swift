@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import Foundation
 
 /// 裁切与校正几何。只对交接图做像素重排，不参与显影/调色算法。
@@ -84,6 +85,33 @@ struct MPhotoGeometry: Codable, Equatable {
             : (max(1, sourceHeight), max(1, sourceWidth))
     }
 
+    /// 校正后画面在归一化坐标里的外接矩形。
+    /// 透视/旋转会把四角甩到原画幅之外，取景预览按这个外接框出图，
+    /// 照片就会像主流修图 App 一样向外扩展，而不是被压回原来的比例。
+    /// 最终输出仍以原画幅（裁切框）为准，外扩部分只用于取景展示。
+    func warpBounds(sourceWidth: Int, sourceHeight: Int) -> CGRect {
+        let oriented = orientedSize(sourceWidth: sourceWidth, sourceHeight: sourceHeight)
+        return warpBounds(orientedWidth: oriented.width, orientedHeight: oriented.height)
+    }
+
+    /// 已定向尺寸版本（GPU 路径的 CIImage 已经是旋转后的，不能再翻转一次）。
+    func warpBounds(orientedWidth: Int, orientedHeight: Int) -> CGRect {
+        guard abs(straighten) > 1e-6
+            || abs(perspectiveV) > 1e-6 || abs(perspectiveH) > 1e-6 else {
+            return CGRect(x: 0, y: 0, width: 1, height: 1)
+        }
+        let quad = warpQuad(width: Double(max(1, orientedWidth)),
+                            height: Double(max(1, orientedHeight)))
+        let xs = quad.map(\.x)
+        let ys = quad.map(\.y)
+        guard let minX = xs.min(), let maxX = xs.max(),
+              let minY = ys.min(), let maxY = ys.max() else {
+            return CGRect(x: 0, y: 0, width: 1, height: 1)
+        }
+        return CGRect(x: minX, y: minY,
+                      width: max(1e-6, maxX - minX), height: max(1e-6, maxY - minY))
+    }
+
     /// 输出尺寸。`maxLongEdge > 0` 时等比压到该长边内（裁切预览用）。
     func outputSize(sourceWidth: Int, sourceHeight: Int, maxLongEdge: Int? = nil) -> (width: Int, height: Int) {
         let oriented = orientedSize(sourceWidth: sourceWidth, sourceHeight: sourceHeight)
@@ -102,16 +130,11 @@ struct MPhotoGeometry: Codable, Equatable {
 
     // MARK: - 采样
 
-    /// 输出像素 → 源图像归一化坐标。
-    private func sourcePoint(
-        outputX: Int, outputY: Int, outputWidth: Int, outputHeight: Int,
-        orientedWidth: Int, orientedHeight: Int
-    ) -> CGPoint {
-        let u = crop.x + (Double(outputX) + 0.5) / Double(outputWidth) * crop.width
-        let v = crop.y + (Double(outputY) + 0.5) / Double(outputHeight) * crop.height
-        let warped = inverseWarp(orientedWidth: orientedWidth, orientedHeight: orientedHeight)
-            .map(CGPoint(x: u, y: v))
-        return sourcePoint(oriented: warped)
+    /// 归一化裁剪坐标 → 源图像归一化坐标。
+    /// `warp` 是调用方每帧构造一次的逆单应矩阵：它只依赖几何参数，
+    /// 绝不能回到逐采样点重建的老路（每帧数百万次 3×3 求逆）。
+    private func sourcePoint(u: Double, v: Double, warp: MHomography) -> CGPoint {
+        sourcePoint(oriented: warp.map(CGPoint(x: u, y: v)))
     }
 
     private func sourcePoint(oriented point: CGPoint) -> CGPoint {
@@ -138,14 +161,18 @@ struct MPhotoGeometry: Codable, Equatable {
         return MHomography.unitSquareToQuad(quad)?.inverted ?? .identity
     }
 
-    /// 单位方框 → 校正后的四边形。透视收边后再按覆盖倍率放大，保证输出没有空角。
+    /// 单位方框 → 校正后的四边形。
+    /// 透视把对应一侧**向外扩张**：源图该侧在输出中占得更宽，输出看到的就是该侧被放大，
+    /// 也就是把"上窄下宽"这类透视拉直。外扩保证输出画布始终落在四边形内部，
+    /// 不会出现黑边或边缘拖影；超出画布的部分自然被裁掉（与 Lightroom 一致）。
+    /// 旋转需要单独放大保证四角被覆盖，透视本身不做整体缩放。
     private func warpQuad(width: Double, height: Double) -> [CGPoint] {
         let pv = perspectiveV / 100
         let ph = perspectiveH / 100
-        let top = 1 - max(pv, 0) * 0.45
-        let bottom = 1 - max(-pv, 0) * 0.45
-        let left = 1 - max(ph, 0) * 0.45
-        let right = 1 - max(-ph, 0) * 0.45
+        let top = 1 + max(pv, 0) * 0.45
+        let bottom = 1 + max(-pv, 0) * 0.45
+        let right = 1 + max(ph, 0) * 0.45
+        let left = 1 + max(-ph, 0) * 0.45
 
         var points = [
             CGPoint(x: 0.5 - top / 2, y: 0.5 - left / 2),
@@ -165,46 +192,86 @@ struct MPhotoGeometry: Codable, Equatable {
             points[index] = CGPoint(x: 0.5 + rx / width, y: 0.5 + ry / height)
         }
 
+        // 只补偿旋转：旋转会把四角甩到画幅外，必须放大到刚好覆盖。
         let absSin = abs(sinA)
         let rotScale = max(cosA + (height / width) * absSin,
                            cosA + (width / height) * absSin)
-        let perspScale = 1 / max(0.05, min(top, bottom, left, right))
-        let scale = rotScale * perspScale
         for index in points.indices {
             points[index] = CGPoint(
-                x: 0.5 + (points[index].x - 0.5) * scale,
-                y: 0.5 + (points[index].y - 0.5) * scale
+                x: 0.5 + (points[index].x - 0.5) * rotScale,
+                y: 0.5 + (points[index].y - 0.5) * rotScale
             )
         }
         return points
     }
 
     /// 缩小时超采样次数，避免小裁切框预览出现锯齿。
-    private func sampleGrid(sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int) -> Int {
+    /// `maxGrid` 用来在拖动期把超采样降到 1（成本直接除以 9）。
+    private func sampleGrid(
+        sourceWidth: Int, sourceHeight: Int,
+        outputWidth: Int, outputHeight: Int, maxGrid: Int
+    ) -> Int {
         let scaleX = crop.width * Double(sourceWidth) / Double(max(1, outputWidth))
         let scaleY = crop.height * Double(sourceHeight) / Double(max(1, outputHeight))
         let factor = max(scaleX, scaleY)
-        return min(3, max(1, Int(ceil(factor - 0.001))))
+        return min(max(1, maxGrid), max(1, Int(ceil(factor - 0.001))))
     }
 
     // MARK: - ImageRGB
 
-    func apply(to image: ImageRGB) -> ImageRGB {
+    /// `shouldCancel` 每行检查一次；被取消时原样返回输入图，调用方必须自行丢弃结果
+    /// （用 `MCancelFlag` 判断是否已被取代）。
+    func apply(
+        to image: ImageRGB, maxGrid: Int = 3, shouldCancel: () -> Bool = { false }
+    ) -> ImageRGB {
         guard !isIdentity, image.width > 1, image.height > 1 else { return image }
         let oriented = orientedSize(sourceWidth: image.width, sourceHeight: image.height)
         let output = outputSize(sourceWidth: image.width, sourceHeight: image.height)
         let grid = sampleGrid(sourceWidth: oriented.width, sourceHeight: oriented.height,
-                              outputWidth: output.width, outputHeight: output.height)
+                              outputWidth: output.width, outputHeight: output.height,
+                              maxGrid: maxGrid)
         let sampleCount = Double(grid * grid)
         let sourceWidth = image.width
         let sourceHeight = image.height
         var result = [Float](repeating: 0, count: output.width * output.height * 3)
         let geometry = self
+        let warp = inverseWarp(orientedWidth: oriented.width, orientedHeight: oriented.height)
+        let stepX = crop.width * Double(sourceWidth) / Double(output.width)
+        let stepY = crop.height * Double(sourceHeight) / Double(output.height)
+        // 列 / 行的归一化采样坐标提到内层循环之外：每像素只做一次映射。
+        let columnU = (0..<output.width).map {
+            crop.x + (Double($0) + 0.5) / Double(output.width) * crop.width
+        }
+        let rowV = (0..<output.height).map {
+            crop.y + (Double($0) + 0.5) / Double(output.height) * crop.height
+        }
+        // 校正后画布四角可能落在源图外（两个方向同时透视时），与 GPU 预览一致填黑。
+        let outsideIsBlack = abs(straighten) > 1e-6
+            || abs(perspectiveV) > 1e-6 || abs(perspectiveH) > 1e-6
+        var cancelled = false
 
         image.data.withUnsafeBufferPointer { source in
             result.withUnsafeMutableBufferPointer { destination in
-                for y in 0..<output.height {
+                rowLoop: for y in 0..<output.height {
+                    if shouldCancel() {
+                        cancelled = true
+                        break rowLoop
+                    }
+                    let v = rowV[y]
                     for x in 0..<output.width {
+                        let point = geometry.sourcePoint(u: columnU[x], v: v, warp: warp)
+                        let baseX = point.x * Double(sourceWidth) - 0.5
+                        let baseY = point.y * Double(sourceHeight) - 0.5
+                        let index = (y * output.width + x) * 3
+                        if grid == 1 {
+                            let sampled = Self.sample(
+                                source, width: sourceWidth, height: sourceHeight,
+                                x: baseX, y: baseY, outsideIsBlack: outsideIsBlack)
+                            destination[index] = Float(sampled.0)
+                            destination[index + 1] = Float(sampled.1)
+                            destination[index + 2] = Float(sampled.2)
+                            continue
+                        }
                         var sumR = 0.0
                         var sumG = 0.0
                         var sumB = 0.0
@@ -212,23 +279,15 @@ struct MPhotoGeometry: Codable, Equatable {
                             for sx in 0..<grid {
                                 let offsetX = (Double(sx) + 0.5) / Double(grid) - 0.5
                                 let offsetY = (Double(sy) + 0.5) / Double(grid) - 0.5
-                                let point = geometry.sourcePoint(
-                                    outputX: x, outputY: y,
-                                    outputWidth: output.width, outputHeight: output.height,
-                                    orientedWidth: oriented.width, orientedHeight: oriented.height
-                                )
-                                let px = point.x * Double(sourceWidth) - 0.5
-                                    + offsetX * Double(sourceWidth) / Double(output.width) * geometry.crop.width
-                                let py = point.y * Double(sourceHeight) - 0.5
-                                    + offsetY * Double(sourceHeight) / Double(output.height) * geometry.crop.height
                                 let sampled = Self.sample(
-                                    source, width: sourceWidth, height: sourceHeight, x: px, y: py)
+                                    source, width: sourceWidth, height: sourceHeight,
+                                    x: baseX + offsetX * stepX, y: baseY + offsetY * stepY,
+                                    outsideIsBlack: outsideIsBlack)
                                 sumR += sampled.0
                                 sumG += sampled.1
                                 sumB += sampled.2
                             }
                         }
-                        let index = (y * output.width + x) * 3
                         destination[index] = Float(sumR / sampleCount)
                         destination[index + 1] = Float(sumG / sampleCount)
                         destination[index + 2] = Float(sumB / sampleCount)
@@ -236,12 +295,18 @@ struct MPhotoGeometry: Codable, Equatable {
                 }
             }
         }
+        if cancelled { return image }
         return ImageRGB(width: output.width, height: output.height, data: result)
     }
 
     private static func sample(
-        _ data: UnsafeBufferPointer<Float>, width: Int, height: Int, x: Double, y: Double
+        _ data: UnsafeBufferPointer<Float>, width: Int, height: Int, x: Double, y: Double,
+        outsideIsBlack: Bool = false
     ) -> (Double, Double, Double) {
+        if outsideIsBlack,
+           x < -0.5 || x > Double(width) - 0.5 || y < -0.5 || y > Double(height) - 0.5 {
+            return (0, 0, 0)
+        }
         let clampedX = min(max(x, 0), Double(width - 1))
         let clampedY = min(max(y, 0), Double(height - 1))
         let x0 = Int(clampedX)
@@ -267,17 +332,100 @@ struct MPhotoGeometry: Codable, Equatable {
         return (r, g, b)
     }
 
+    // MARK: - GPU 取景预览
+
+    /// 用 Core Image（Metal 后端）生成取景预览：几何变换全在 GPU，单帧 1–2ms。
+    /// 这是裁切页拖动时唯一走的路径——不再对像素做 CPU 重采样。
+    /// 预览始终是「全幅 + 校正」，裁切框只是叠加在本页 UI 上的取景框。
+    func previewCIImage(from snapshot: CIImage, maxLongEdge: Int) -> CIImage {
+        var image = snapshot
+        // 1. 定向：与 `sourcePoint(oriented:)` 同一语义，先旋转再镜像（翻转跟着屏幕）。
+        switch quarterTurns % 4 {
+        case 1: image = image.oriented(.right)
+        case 2: image = image.oriented(.down)
+        case 3: image = image.oriented(.left)
+        default: break
+        }
+        if flippedH { image = image.oriented(.upMirrored) }
+        if flippedV { image = image.oriented(.downMirrored) }
+        // 定向后把 extent 归零，后面所有坐标都从画布原点算。
+        let oriented = image.extent
+        image = image.transformed(
+            by: CGAffineTransform(translationX: -oriented.minX, y: -oriented.minY))
+
+        // 2. 输出画布：按校正后的外接框，而不是原画幅。
+        //    透视/旋转把四角甩出去时，画面会像主流修图 App 一样向外扩展。
+        let orientedWidth = max(1, Double(oriented.width))
+        let orientedHeight = max(1, Double(oriented.height))
+        let bounds = warpBounds(sourceWidth: Int(orientedWidth), sourceHeight: Int(orientedHeight))
+        let contentWidth = orientedWidth * bounds.width
+        let contentHeight = orientedHeight * bounds.height
+        let scale = min(1, Double(maxLongEdge) / max(contentWidth, contentHeight))
+        let outWidth = max(1, Int((contentWidth * scale).rounded()))
+        let outHeight = max(1, Int((contentHeight * scale).rounded()))
+        let canvas = CGRect(x: 0, y: 0, width: outWidth, height: outHeight)
+
+        // 3. 没有水平/透视校正时只缩放。
+        guard abs(straighten) > 1e-6
+            || abs(perspectiveV) > 1e-6 || abs(perspectiveH) > 1e-6 else {
+            return image
+                .transformed(by: CGAffineTransform(
+                    scaleX: CGFloat(outWidth) / oriented.width,
+                    y: CGFloat(outHeight) / oriented.height))
+                .cropped(to: canvas)
+        }
+
+        // 4. 单应：把源图四角送到 `warpQuad` 算出的位置（相对外接框）。
+        //    `warpQuad` 是 y-down 归一化坐标，CI 是 y-up，这里统一换成画布坐标。
+        let quad = warpQuad(width: orientedWidth, height: orientedHeight)
+        guard quad.count == 4, let filter = CIFilter(name: "CIPerspectiveTransform") else {
+            return image.cropped(to: canvas)
+        }
+        let targets = quad.map { point in
+            CGPoint(
+                x: (point.x - bounds.minX) / bounds.width * CGFloat(outWidth),
+                y: (1 - (point.y - bounds.minY) / bounds.height) * CGFloat(outHeight)
+            )
+        }
+        filter.setValue(image, forKey: kCIInputImageKey)
+        filter.setValue(CIVector(cgPoint: targets[0]), forKey: "inputTopLeft")
+        filter.setValue(CIVector(cgPoint: targets[1]), forKey: "inputTopRight")
+        filter.setValue(CIVector(cgPoint: targets[2]), forKey: "inputBottomRight")
+        filter.setValue(CIVector(cgPoint: targets[3]), forKey: "inputBottomLeft")
+        guard let warped = filter.outputImage else { return image.cropped(to: canvas) }
+        // perspScale 保证四边形覆盖整个画布，`cropped` 后 extent 恰好等于画布。
+        return warped.cropped(to: canvas)
+    }
+
+    /// GPU 路径出 CGImage（供 SwiftUI 显示）。
+    func previewImage(
+        from snapshot: CIImage, maxLongEdge: Int, context: CIContext
+    ) -> CGImage? {
+        let output = previewCIImage(from: snapshot, maxLongEdge: maxLongEdge)
+        // 用整数矩形出图：小数 extent 会让 CI 多做一次对齐重采样。
+        let extent = output.extent
+        let rect = CGRect(x: extent.minX.rounded(), y: extent.minY.rounded(),
+                          width: extent.width.rounded(), height: extent.height.rounded())
+        return context.createCGImage(output, from: rect)
+    }
+
     // MARK: - CGImage（预览、原片）
 
     /// 预览与裁切页都是 8-bit 屏幕图；与导出走同一套几何映射，避免取景框对不上。
-    func apply(to image: CGImage, maxLongEdge: Int? = nil) -> CGImage? {
+    /// `maxLongEdge` 会先把源图降采样再进几何，拖动期不必处理整幅快照。
+    func apply(to image: CGImage, maxLongEdge: Int? = nil, maxGrid: Int = 3,
+               shouldCancel: () -> Bool = { false }) -> CGImage? {
         guard !isIdentity else { return image }
-        guard let source = MRGBACopy.read(image) else { return nil }
-        return apply(buffer: source, maxLongEdge: maxLongEdge)
+        guard let source = MRGBACopy.read(image, maxLongEdge: maxLongEdge) else { return nil }
+        return apply(buffer: source, maxLongEdge: maxLongEdge,
+                     maxGrid: maxGrid, shouldCancel: shouldCancel)
     }
 
     /// 裁切页取景预览：源缓冲已经解好，拖动刻度时不重复读图。
-    func apply(buffer: MRGBACopy.Buffer, maxLongEdge: Int? = nil) -> CGImage? {
+    /// 单应矩阵每帧只构造一次（`warp`），每像素只做一次映射；
+    /// `maxGrid = 1` 时跳过超采样（拖动期快帧用），`shouldCancel` 取消时返回 nil。
+    func apply(buffer: MRGBACopy.Buffer, maxLongEdge: Int? = nil, maxGrid: Int = 3,
+               shouldCancel: () -> Bool = { false }) -> CGImage? {
         let source = buffer
         if isIdentity {
             return MRGBACopy.makeImage(pixels: source.pixels,
@@ -291,17 +439,49 @@ struct MPhotoGeometry: Codable, Equatable {
         }
         guard output.width > 0, output.height > 0 else { return nil }
         let grid = sampleGrid(sourceWidth: oriented.width, sourceHeight: oriented.height,
-                              outputWidth: output.width, outputHeight: output.height)
+                              outputWidth: output.width, outputHeight: output.height,
+                              maxGrid: maxGrid)
         let sampleCount = Double(grid * grid)
         var pixels = [UInt8](repeating: 255, count: output.width * output.height * 4)
         let geometry = self
         let sourceWidth = source.width
         let sourceHeight = source.height
+        let warp = inverseWarp(orientedWidth: oriented.width, orientedHeight: oriented.height)
+        let stepX = crop.width * Double(sourceWidth) / Double(output.width)
+        let stepY = crop.height * Double(sourceHeight) / Double(output.height)
+        let columnU = (0..<output.width).map {
+            crop.x + (Double($0) + 0.5) / Double(output.width) * crop.width
+        }
+        let rowV = (0..<output.height).map {
+            crop.y + (Double($0) + 0.5) / Double(output.height) * crop.height
+        }
+        let outsideIsBlack = abs(straighten) > 1e-6
+            || abs(perspectiveV) > 1e-6 || abs(perspectiveH) > 1e-6
+        var cancelled = false
 
         source.pixels.withUnsafeBufferPointer { input in
             pixels.withUnsafeMutableBufferPointer { destination in
-                for y in 0..<output.height {
+                rowLoop: for y in 0..<output.height {
+                    if shouldCancel() {
+                        cancelled = true
+                        break rowLoop
+                    }
+                    let v = rowV[y]
                     for x in 0..<output.width {
+                        let point = geometry.sourcePoint(u: columnU[x], v: v, warp: warp)
+                        let baseX = point.x * Double(sourceWidth) - 0.5
+                        let baseY = point.y * Double(sourceHeight) - 0.5
+                        let index = (y * output.width + x) * 4
+                        if grid == 1 {
+                            let sampled = Self.sample(
+                                input, width: sourceWidth, height: sourceHeight,
+                                x: baseX, y: baseY, outsideIsBlack: outsideIsBlack)
+                            destination[index] = UInt8(min(max(sampled.0, 0), 255).rounded())
+                            destination[index + 1] = UInt8(min(max(sampled.1, 0), 255).rounded())
+                            destination[index + 2] = UInt8(min(max(sampled.2, 0), 255).rounded())
+                            destination[index + 3] = 255
+                            continue
+                        }
                         var sumR = 0.0
                         var sumG = 0.0
                         var sumB = 0.0
@@ -309,23 +489,15 @@ struct MPhotoGeometry: Codable, Equatable {
                             for sx in 0..<grid {
                                 let offsetX = (Double(sx) + 0.5) / Double(grid) - 0.5
                                 let offsetY = (Double(sy) + 0.5) / Double(grid) - 0.5
-                                let point = geometry.sourcePoint(
-                                    outputX: x, outputY: y,
-                                    outputWidth: output.width, outputHeight: output.height,
-                                    orientedWidth: oriented.width, orientedHeight: oriented.height
-                                )
-                                let px = point.x * Double(sourceWidth) - 0.5
-                                    + offsetX * Double(sourceWidth) / Double(output.width) * geometry.crop.width
-                                let py = point.y * Double(sourceHeight) - 0.5
-                                    + offsetY * Double(sourceHeight) / Double(output.height) * geometry.crop.height
                                 let sampled = Self.sample(
-                                    input, width: sourceWidth, height: sourceHeight, x: px, y: py)
+                                    input, width: sourceWidth, height: sourceHeight,
+                                    x: baseX + offsetX * stepX, y: baseY + offsetY * stepY,
+                                    outsideIsBlack: outsideIsBlack)
                                 sumR += sampled.0
                                 sumG += sampled.1
                                 sumB += sampled.2
                             }
                         }
-                        let index = (y * output.width + x) * 4
                         destination[index] = UInt8(min(max(sumR / sampleCount, 0), 255).rounded())
                         destination[index + 1] = UInt8(min(max(sumG / sampleCount, 0), 255).rounded())
                         destination[index + 2] = UInt8(min(max(sumB / sampleCount, 0), 255).rounded())
@@ -334,12 +506,18 @@ struct MPhotoGeometry: Codable, Equatable {
                 }
             }
         }
+        if cancelled { return nil }
         return MRGBACopy.makeImage(pixels: pixels, width: output.width, height: output.height)
     }
 
     private static func sample(
-        _ data: UnsafeBufferPointer<UInt8>, width: Int, height: Int, x: Double, y: Double
+        _ data: UnsafeBufferPointer<UInt8>, width: Int, height: Int, x: Double, y: Double,
+        outsideIsBlack: Bool = false
     ) -> (Double, Double, Double) {
+        if outsideIsBlack,
+           x < -0.5 || x > Double(width) - 0.5 || y < -0.5 || y > Double(height) - 0.5 {
+            return (0, 0, 0)
+        }
         let clampedX = min(max(x, 0), Double(width - 1))
         let clampedY = min(max(y, 0), Double(height - 1))
         let x0 = Int(clampedX)
@@ -477,10 +655,17 @@ enum MRGBACopy {
         }
     }
 
-    static func read(_ image: CGImage) -> Buffer? {
-        let width = image.width
-        let height = image.height
+    /// 读取成 RGBA8 缓冲。`maxLongEdge` 不为空时在绘制阶段直接降采样，
+    /// 裁切取景用压缩快照，拖动时不必反复处理整幅交接图。
+    static func read(_ image: CGImage, maxLongEdge: Int? = nil) -> Buffer? {
+        var width = image.width
+        var height = image.height
         guard width > 0, height > 0 else { return nil }
+        if let maxLongEdge, maxLongEdge > 0, max(width, height) > maxLongEdge {
+            let scale = Double(maxLongEdge) / Double(max(width, height))
+            width = max(1, Int((Double(width) * scale).rounded()))
+            height = max(1, Int((Double(height) * scale).rounded()))
+        }
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
         let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         let created = pixels.withUnsafeMutableBytes { buffer -> Bool in

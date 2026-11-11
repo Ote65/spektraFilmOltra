@@ -259,13 +259,18 @@ struct SettingsScreen: View {
     }
 
     private var launchTitle: String {
-        (MobileSettings.MLaunchScreen(rawValue: launchScreen) ?? .home).title
+        // iPad 无相机功能：已存过「相机」的值显示时兜底回「访达」。
+        let value = MobileSettings.MLaunchScreen(rawValue: launchScreen) ?? .home
+        if MLayout.isPad && value == .camera { return MobileSettings.MLaunchScreen.home.title }
+        return value.title
     }
 
     private var launchOptions: [MProOption] {
-        MobileSettings.MLaunchScreen.allCases.map {
-            MProOption(value: $0.rawValue, label: $0.title)
-        }
+        MobileSettings.MLaunchScreen.allCases
+            .filter { !MLayout.isPad || $0 != .camera }
+            .map {
+                MProOption(value: $0.rawValue, label: $0.title)
+            }
     }
 
     // MARK: 水印

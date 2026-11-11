@@ -26,10 +26,10 @@ struct MobileRootView: View {
 
     init() {
         let args = ProcessInfo.processInfo.arguments
-        var start: MScreen = MobileSettings.launchScreen == .camera ? .camera : .home
+        var start: MScreen = (MobileSettings.launchScreen == .camera && !MLayout.isPad) ? .camera : .home
         if let index = args.firstIndex(of: "--screen"), args.indices.contains(index + 1) {
             switch args[index + 1] {
-            case "camera": start = .camera
+            case "camera": start = MLayout.isPad ? .home : .camera
             case "develop": start = .develop
             case "grade": start = .grade
             default: break
@@ -104,8 +104,13 @@ struct MobileRootView: View {
                     entry: gradeEntry,
                     onBack: { closeGrade() },
                     onGoHome: goHome,
-                    onToast: showToast
+                    onToast: showToast,
+                    library: engine.photos,
+                    onSwitchPhoto: switchGradePhoto
                 )
+                // 胶片条换照片时整块重建：recipe / 撤销栈 / 曲线点都属于上一张，
+                // 跟着新 session 一起归零，避免旧参数和旧裁切被写进新照片。
+                .id(grade.photoID)
                 .transition(.move(edge: .trailing))
                 .zIndex(2)
             }
@@ -144,6 +149,19 @@ struct MobileRootView: View {
             }
         }
         .animation(MMotion.push, value: screen)
+        .background {
+            // 旋转 / 分屏 / 台前调度都会改变窗口尺寸：跟着刷新安全区，分栏与单列才能实时切换。
+            GeometryReader { proxy in
+                Color.clear
+                    .preference(key: MWindowSizeKey.self, value: proxy.size)
+            }
+        }
+        .onPreferenceChange(MWindowSizeKey.self) { size in
+            guard size.width > 1, size.height > 1 else { return }
+            guard abs(size.width - metrics.width) > 1 || abs(size.height - metrics.height) > 1 else { return }
+            let current = MScreenMetrics.current()
+            metrics = MSafeInsets(top: current.top, bottom: current.bottom, size: size)
+        }
         .task {
             guard !debugOpened else { return }
             debugOpened = true
@@ -158,7 +176,15 @@ struct MobileRootView: View {
                       current.top, current.bottom, housing.rawValue,
                       NSCoder.string(for: opening))
             }
-            guard let first = engine.photos.first else { return }
+            // 调试直达：先扫相册，第一张 RAW 未入库时自动取回入库（等效于点开主页卡片）。
+            guard screen == .develop || screen == .grade else { return }
+            await engine.refreshAssets()
+            var first = engine.assets.first?.photo ?? engine.photos.first
+            if first == nil, let asset = engine.assets.first,
+               let photoID = await engine.importAsset(assetID: asset.id) {
+                first = engine.photos.first(where: { $0.id == photoID })
+            }
+            guard let first else { return }
             // 首帧直达：此时窗口还没完成第一次布局，带 transition 插入会让视图停在屏幕外。
             switch screen {
             case .develop:
@@ -188,6 +214,8 @@ struct MobileRootView: View {
     // MARK: - 导航
 
     private func openCamera() {
+        // iPad 版不提供相机：只从相册导入与显影。
+        guard !MLayout.isPad else { return }
         withAnimation(MMotion.push) { screen = .camera }
     }
 
@@ -255,6 +283,15 @@ struct MobileRootView: View {
         }
     }
 
+    /// 调色台底部的胶片条切换照片：换一张继续调，保持同一入口与交接待性。
+    private func switchGradePhoto(_ photoID: String) {
+        guard photoID != grade?.photoID else { return }
+        engine.closeGrade()
+        withAnimation(MMotion.push) {
+            grade = engine.openGrade(photoID: photoID, entry: gradeEntry)
+        }
+    }
+
     private func closeGrade() {
         engine.closeGrade()
         resetFlight()
@@ -273,6 +310,11 @@ struct MobileRootView: View {
 
     private func beginSuck(image: MPlatformImage?, from rect: CGRect, photoID: String,
                            insets: MSafeInsets) {
+        // iPad 没有开孔，照片飞向一条细线读不出意义；分栏里直接切换即可。
+        guard !MLayout.isPad else {
+            openGrade(photoID, entry: .handoff, returningTo: .develop)
+            return
+        }
         guard flightPhase == .idle else { return }
         guard let image, rect.width > 1, rect.height > 1 else {
             openGrade(photoID, entry: .handoff, returningTo: .develop)
@@ -320,5 +362,13 @@ struct MobileRootView: View {
             guard token == toastToken else { return }
             withAnimation(MMotion.state) { toast = nil }
         }
+    }
+}
+
+/// 根视图窗口尺寸：旋转、分屏与台前调度都会触发，用于刷新真实安全区。
+private struct MWindowSizeKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
     }
 }

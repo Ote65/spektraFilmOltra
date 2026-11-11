@@ -304,10 +304,9 @@ struct HomeScreen: View {
 
     private var photoGrid: some View {
         LazyVGrid(
-            columns: [
-                GridItem(.flexible(), spacing: 12),
-                GridItem(.flexible(), spacing: 12),
-            ],
+            columns: (0..<MLayout.gridColumns(for: insets.width)).map { _ in
+                GridItem(.flexible(), spacing: 12)
+            },
             alignment: .leading,
             spacing: 18
         ) {
@@ -371,7 +370,10 @@ struct HomeScreen: View {
                 .buttonStyle(MPressStyle(scale: 0.94))
             }
 
-            cameraEntry
+            // iPad 不做相机功能，入口直接隐藏。
+            if !MLayout.isPad {
+                cameraEntry
+            }
         }
         .frame(height: 46)
         .padding(.horizontal, MMetric.pageMargin)
