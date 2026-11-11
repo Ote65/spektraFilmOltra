@@ -910,6 +910,9 @@ final class MobileDevelopSession: ObservableObject {
         p.saturation = edit.filmRender.dirCouplers.active
             ? clamp(edit.filmRender.dirCouplers.inhibitionInterlayer, 0.35, 1.8)
             : 1
+        p.highlightSoften = edit.printRender.densityCurvesMorph.active
+            ? clamp(edit.printRender.densityCurvesMorph.developerExhaustion / 0.6, 0, 1)
+            : 0
         p.clarity = clamp((quickIntents["scanner_clarity"] ?? 0) / 100, -1, 1)
         return p
     }
@@ -981,6 +984,14 @@ final class MobileDevelopSession: ObservableObject {
         applyQuickMapping(id: id, q: q, edit: &edit)
     }
 
+    /// 「影调反差」与「高光柔和」共用 densityCurvesMorph.active：
+    /// 任一快速轴非零时保持开启，全部归零才回落到基线状态。
+    private func morphIsActive(baseline morph: PrintCurvesMorphParams) -> Bool {
+        if abs(quickIntents["tonal_contrast"] ?? 0) > 1e-9 { return true }
+        if abs(quickIntents["highlight_softening"] ?? 0) > 1e-9 { return true }
+        return morph.active
+    }
+
     private func applyQuickMapping(id: String, q: Double, edit: inout PhotoEdit) {
         switch id {
         case "camera_exposure":
@@ -997,7 +1008,16 @@ final class MobileDevelopSession: ObservableObject {
             let morph = baseline.printRender.densityCurvesMorph
             edit.printRender.densityCurvesMorph.gammaFactor = clamp(
                 morph.gammaFactor * (1 + 0.35 * q / 100), 0.5, 2.0)
-            edit.printRender.densityCurvesMorph.active = q != 0 ? true : morph.active
+            edit.printRender.densityCurvesMorph.active = morphIsActive(baseline: morph)
+        case "highlight_softening":
+            // 直接复用专业模式「高光柔和」(developer_exhaustion)：
+            // 拉伸密度曲线的 Gumbel 肩部，中高调被压暗、肩顶更长，高光层次更密而不死白。
+            // 快速满量程只开到 0.6，保留专业页剩余的纵深。
+            let morph = baseline.printRender.densityCurvesMorph
+            let t = clamp(q / 100, 0, 1)
+            edit.printRender.densityCurvesMorph.developerExhaustion = clamp(
+                morph.developerExhaustion + 0.6 * t, 0, 1)
+            edit.printRender.densityCurvesMorph.active = morphIsActive(baseline: morph)
         case "color_density":
             let b = baseline.filmRender.dirCouplers.inhibitionInterlayer
             edit.filmRender.dirCouplers.inhibitionInterlayer = clamp(

@@ -51,6 +51,10 @@ enum MobileCatalog {
                        range: -2...2, step: 0.05, decimals: 2, suffix: "", base: 0, value: 0),
             MQuickAxis(id: "tonal_contrast", label: "影调反差", group: "光调",
                        range: -100...100, step: 1, decimals: 0, suffix: "", base: 0, value: 0),
+            // 单向轴：0 = 胶片原始肩部，向右逐步延长高光肩部（物理量是显影疲劳，
+            // 专业页同名参数 0–1；快速页只开放到 0.6，避免拖满就发灰）。
+            MQuickAxis(id: "highlight_softening", label: "高光柔和", group: "光调",
+                       range: 0...100, step: 1, decimals: 0, suffix: "", base: 0, value: 0),
         ]),
         MQuickGroup(id: "color", title: "色彩", axes: [
             MQuickAxis(id: "color_density", label: "色彩浓度", group: "色彩",

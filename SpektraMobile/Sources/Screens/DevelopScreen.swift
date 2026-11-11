@@ -33,6 +33,10 @@ struct DevelopScreen: View {
     @State private var lastDragT: CGSize = .zero
     @State private var exportOpen = DebugLaunch.exportOpen
     @State private var stageSize: CGSize = .zero
+    // 分栏右栏的直方图：随预览图刷新，后台采样不阻塞显影渲染。
+    @State private var histogram = MHistogramData.empty
+    @State private var histogramToken = 0
+    @State private var histogramInFlight = false
     // 首帧就绪前先弹出一块白色画布，再显影渐变成照片
     @State private var cardRect: CGRect = .zero
     @State private var cardOpacity: Double = 1
@@ -51,54 +55,18 @@ struct DevelopScreen: View {
     /// 真实可用画布高度：由根视图注入的设备安全区算出，不再写死 852/54/34。
     private var availableHeight: CGFloat { insets.contentHeight }
 
+    /// iPad 横屏：左画布 + 右参数栏。竖屏与分屏保持原来的单列布局。
+    private var isSplit: Bool { MLayout.usesSplit(insets.size) }
+
     var body: some View {
         ZStack(alignment: .bottom) {
             MColor.app
 
-            VStack(spacing: 0) {
-                ZStack(alignment: .top) {
-                    previewStage
-                        .frame(height: max(96, availableHeight - drawerHeight))
-                        .overlay {
-                            if cardVisible {
-                                MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                        .background(
-                            GeometryReader { geo in
-                                Color.clear
-                                    .onAppear { stageSize = geo.size }
-                                    .onChange(of: geo.size) { _, newValue in stageSize = newValue }
-                            }
-                        )
-                    floatingChrome
-                        .opacity(chromeHidden ? 0 : 1)
-                        .allowsHitTesting(!chromeHidden)
-                        .animation(MMotion.quick, value: chromeHidden)
-                }
-                Spacer(minLength: 0)
+            if isSplit {
+                splitLayout
+            } else {
+                stackedLayout
             }
-            .padding(.top, insets.top)
-
-            // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
-            drawer
-                .opacity(chromeHidden ? 0 : 1)
-                .allowsHitTesting(!chromeHidden)
-                .animation(MMotion.quick, value: chromeHidden)
-                .padding(.horizontal, MMetric.floatingPanelInset)
-                .frame(height: drawerHeight)
-                .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
-                    + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
-
-            tabBar
-                .opacity(chromeHidden ? 0 : 1)
-                .allowsHitTesting(!chromeHidden)
-                .animation(MMotion.quick, value: chromeHidden)
-
-            MBackSwipe(action: onBack)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .padding(.top, insets.top)
         }
         .background(MColor.app)
         .overlay {
@@ -140,6 +108,357 @@ struct DevelopScreen: View {
         .onChange(of: session.previewImage != nil) { _, hasImage in
             if hasImage { popCardIfReady() }
         }
+        .onChange(of: isSplit) { _, split in
+            // 进入分栏后右栏页签只剩光调/色彩/细节：停在预设或胶片页时回落到光调。
+            if split && (page == 0 || page == 1) { page = 2 }
+            // 直方图只在分栏可见：切入时补算当前预览，切回单列释放数据。
+            if split {
+                refreshHistogram(session.previewImage)
+            } else {
+                histogram = .empty
+            }
+        }
+        .onChange(of: session.previewImage) { _, image in
+            refreshHistogram(image)
+        }
+    }
+
+    /// 后台采样预览图的 RGB 直方图；token 保证只采纳最新一帧。
+    /// 只在分栏计算，且同一时刻只跑一个任务，避免单列白算与拖动期任务堆积。
+    private func refreshHistogram(_ image: MPlatformImage?) {
+        histogramToken += 1
+        let token = histogramToken
+        guard let image else {
+            histogram = .empty
+            return
+        }
+        guard isSplit, !histogramInFlight else { return }
+        histogramInFlight = true
+        Task.detached(priority: .utility) {
+            let data = MHistogramSampler.compute(image) ?? .empty
+            await MainActor.run {
+                histogramInFlight = false
+                guard token == histogramToken else { return }
+                histogram = data
+            }
+        }
+    }
+
+    // MARK: - 单列布局（iPhone / iPad 竖屏 / 分屏）
+
+    private var stackedLayout: some View {
+        Group {
+            VStack(spacing: 0) {
+                ZStack(alignment: .top) {
+                    previewStage
+                        .frame(height: max(96, availableHeight - drawerHeight))
+                        .overlay {
+                            if cardVisible {
+                                MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear
+                                    .onAppear { stageSize = geo.size }
+                                    .onChange(of: geo.size) { _, newValue in stageSize = newValue }
+                            }
+                        )
+                    floatingChrome
+                        .opacity(chromeHidden ? 0 : 1)
+                        .allowsHitTesting(!chromeHidden)
+                        .animation(MMotion.quick, value: chromeHidden)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.top, insets.top)
+
+            // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
+            drawer
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
+                .padding(.horizontal, MMetric.floatingPanelInset)
+                .frame(height: drawerHeight)
+                .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
+                    + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
+
+            tabBar(bottomPadding: 8 + insets.bottom)
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
+
+            MBackSwipe(action: onBack)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .padding(.top, insets.top)
+        }
+    }
+
+    // MARK: - 分栏布局（iPad 横屏，参考 macOS 三栏：胶片轨 / 画布 / 参数栏）
+
+    private var splitLayout: some View {
+        HStack(spacing: 0) {
+            filmStockRail
+                .frame(width: MLayout.sideRailWidth(for: insets.size))
+
+            Rectangle()
+                .fill(MColor.hairline)
+                .frame(width: 1)
+
+            ZStack(alignment: .top) {
+                previewStage
+                    .overlay {
+                        if cardVisible {
+                            MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { stageSize = geo.size }
+                                .onChange(of: geo.size) { _, newValue in stageSize = newValue }
+                        }
+                    )
+
+                floatingChrome
+                    .opacity(chromeHidden ? 0 : 1)
+                    .allowsHitTesting(!chromeHidden)
+                    .animation(MMotion.quick, value: chromeHidden)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .leading) {
+                MBackSwipe(action: onBack)
+                    .frame(width: 22)
+            }
+
+            Rectangle()
+                .fill(MColor.hairline)
+                .frame(width: 1)
+
+            VStack(spacing: 0) {
+                // 快速 / 专业：模式选择从画布悬浮移到参数栏顶部（参考 macOS Inspector）。
+                HStack(spacing: 10) {
+                    MModeCapsule(titles: ["快速", "专业"], mode: $mode)
+                        .overlay { capsuleProgressRing }
+                        .animation(MMotion.quick, value: session.phaseLabel)
+                        .accessibilityLabel("显影模式")
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+
+                // 直方图：macOS 编辑页同款卡片，显影参数调整时观察影调分布。
+                splitHistogramCard
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+
+                // 参数页签在顶部（预设 / 胶片相纸都在左轨）。
+                MSplitTabRow(
+                    titles: ["光调", "色彩", "细节"],
+                    selection: splitPageIndex,
+                    onSelect: { index in
+                        withAnimation(MMotion.state) { page = splitPageIndices[index] }
+                    }
+                )
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+
+                // 旋转 / 预览比例 / 撤销：参数栏的固定工具行。
+                drawerToolRow
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+
+                // 启动即横屏时 onChange 不会触发：渲染侧直接把预设/胶片页兜底成光调。
+                splitPageContent
+                    .frame(maxHeight: .infinity)
+                    .padding(.bottom, insets.bottom)
+            }
+            .frame(width: MLayout.inspectorWidth(for: insets.size))
+        }
+        .padding(.top, insets.top)
+    }
+
+    /// 分栏右栏的参数页 → 原 page 状态的下标映射（预设与胶片页已移到左轨）。
+    private let splitPageIndices = [2, 3, 4]
+    private var splitPageIndex: Int { splitPageIndices.firstIndex(of: page) ?? 0 }
+
+    /// 分栏右栏永远渲染这三个参数页：page 停在预设/胶片页时显示光调。
+    @ViewBuilder private var splitPageContent: some View {
+        switch splitPageIndex {
+        case 1: colorPage
+        case 2: detailPage
+        default: tonePage
+        }
+    }
+
+    /// 直方图卡片：标题行 + RGB 折线，数据随预览图刷新。
+    private var splitHistogramCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("直方图").mLabel(8, color: MColor.text3)
+                Spacer(minLength: 8)
+                Text("亮度 / RGB").mMeta(7.5, color: MColor.text4)
+            }
+            MHistogram(data: histogram)
+        }
+    }
+
+    /// 左轨：显影预设 / 胶片 / 相纸切换 + 竖排列表（参考 macOS 预设栏）。
+    @State private var railTab = 0
+
+    private var filmStockRail: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                MSideRailTab(title: "预设", selected: railTab == 0) {
+                    withAnimation(MMotion.state) { railTab = 0 }
+                }
+                MSideRailTab(title: "胶片", selected: railTab == 1) {
+                    withAnimation(MMotion.state) { railTab = 1 }
+                }
+                MSideRailTab(title: "相纸", selected: railTab == 2) {
+                    withAnimation(MMotion.state) { railTab = 2 }
+                }
+                Spacer(minLength: 0)
+                Text(railCountLabel)
+                    .mMeta(8.5, color: MColor.text4)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 42)
+
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 2) {
+                    switch railTab {
+                    case 0:
+                        ForEach(MobileDevelopPresets.all) { preset in
+                            developPresetRow(preset)
+                        }
+                    case 1:
+                        ForEach(MobileCatalog.films) { film in filmRow(film) }
+
+                        MHairline()
+                            .padding(.vertical, 10)
+
+                        MToggleRow(label: "黑白模式",
+                                   isOn: Binding(
+                                    get: { session.isMonochrome },
+                                    set: { session.setMonochrome($0) }
+                                   ),
+                                   compact: true)
+
+                        if mode == 1 {
+                            proGroupsView(2)
+                            resetButton("重置专业参数", action: resetPro)
+                        }
+                    default:
+                        ForEach(MobileCatalog.papers) { paper in paperRow(paper) }
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 6)
+                .padding(.bottom, insets.bottom + 12)
+            }
+            .scrollIndicators(.never)
+        }
+        .background(MColor.app)
+    }
+
+    private var railCountLabel: String {
+        switch railTab {
+        case 0: return "\(MobileDevelopPresets.all.count) 个"
+        case 1: return "\(MobileCatalog.films.count) 种"
+        default: return "\(MobileCatalog.papers.count) 种"
+        }
+    }
+
+    private func filmRow(_ film: MFilm) -> some View {
+        let selected = film.id == session.filmID
+        return Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) { session.setFilm(film.id) }
+        } label: {
+            HStack(spacing: 10) {
+                MFilmStockIcon(film: film, size: 30)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(selected ? MColor.brassWash : MColor.surface2.opacity(0.6))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(selected ? MColor.brass.opacity(0.5) : MColor.hairline,
+                                          lineWidth: 1)
+                    )
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(film.name)
+                        .font(.mSans(12, selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? MColor.brass : MColor.text1)
+                        .lineLimit(1)
+                    Text("\(film.brand) · \(film.kind)")
+                        .mMeta(8, color: MColor.text4)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(MColor.brass)
+                }
+            }
+            .padding(.horizontal, 6)
+            .frame(height: 50)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func paperRow(_ paper: MPaper) -> some View {
+        let selected = paper.id == session.paperID
+        return Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) { session.setPaper(paper.id) }
+        } label: {
+            HStack(spacing: 10) {
+                MPaperStockIcon(paper: paper, size: 28)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(selected ? MColor.brassWash : MColor.surface2.opacity(0.6))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(selected ? MColor.brass.opacity(0.5) : MColor.hairline,
+                                          lineWidth: 1)
+                    )
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(paper.name)
+                        .font(.mSans(12, selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? MColor.brass : MColor.text1)
+                        .lineLimit(1)
+                    Text(paper.note)
+                        .mMeta(8, color: MColor.text4)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(MColor.brass)
+                }
+            }
+            .padding(.horizontal, 6)
+            .frame(height: 50)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 开孔光效
@@ -165,12 +484,15 @@ struct DevelopScreen: View {
         .frame(height: 34)
         .padding(.horizontal, 14)
         .overlay(alignment: .center) {
-            MModeCapsule(titles: ["快速", "专业"], mode: $mode)
-                .overlay { capsuleProgressRing }
-                .overlay(alignment: .bottom) { capsuleProgressText }
-                .offset(y: session.isRendering ? 16 : 0)
-                .animation(MMotion.drawer, value: session.isRendering)
-                .animation(MMotion.quick, value: session.phaseLabel)
+            // 分栏下快速/专业移到参数栏顶部：画布顶部只留返回与调色入口。
+            if !isSplit {
+                MModeCapsule(titles: ["快速", "专业"], mode: $mode)
+                    .overlay { capsuleProgressRing }
+                    .overlay(alignment: .bottom) { capsuleProgressText }
+                    .offset(y: session.isRendering ? 16 : 0)
+                    .animation(MMotion.drawer, value: session.isRendering)
+                    .animation(MMotion.quick, value: session.phaseLabel)
+            }
         }
         .padding(.top, 10)
         // 顶部按钮下面铺一层从上到下的黑色渐隐：放大后照片从控件下方经过时，模式胶囊与文件信息仍然可读。
@@ -586,12 +908,37 @@ struct DevelopScreen: View {
         )
     }
 
+    // MARK: - 抽屉工具行
+
+    private var drawerToolRow: some View {
+        HStack(spacing: 6) {
+            MCircleIconButton(icon: "rotate.right", size: 10, frame: 28) {
+                MHaptic.tick()
+                session.rotateClockwise()
+            }
+            .accessibilityLabel("顺时针旋转 90 度")
+
+            previewScaleMenu
+
+            Spacer(minLength: 0)
+
+            MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
+                session.undo()
+            }
+            .opacity(session.canUndo ? 1 : 0.36)
+            .allowsHitTesting(session.canUndo)
+            .accessibilityLabel("撤销")
+        }
+    }
+
     // MARK: - 抽屉
 
     private var drawer: some View {
         VStack(spacing: 0) {
-            MDrawerChevron(isExpanded: isDrawerExpanded, isVisible: !isLockedTab) {
-                toggleDrawer()
+            if !isSplit {
+                MDrawerChevron(isExpanded: isDrawerExpanded, isVisible: !isLockedTab) {
+                    toggleDrawer()
+                }
             }
 
             ZStack {
@@ -632,26 +979,11 @@ struct DevelopScreen: View {
         .shadow(color: .black.opacity(0.22), radius: 30, y: 12)
         // 旋转 / 预览比例 / 撤销浮在 sheet 外面顶部，和原本撤销按钮同一行。
         .overlay(alignment: .top) {
-            HStack(spacing: 6) {
-                MCircleIconButton(icon: "rotate.right", size: 10, frame: 28) {
-                    MHaptic.tick()
-                    session.rotateClockwise()
-                }
-                .accessibilityLabel("顺时针旋转 90 度")
-
-                previewScaleMenu
-
-                Spacer(minLength: 0)
-
-                MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
-                    session.undo()
-                }
-                .opacity(session.canUndo ? 1 : 0.36)
-                .allowsHitTesting(session.canUndo)
-                .accessibilityLabel("撤销")
+            if !isSplit {
+                drawerToolRow
+                    .padding(.horizontal, 10)
+                    .offset(y: -36)
             }
-            .padding(.horizontal, 10)
-            .offset(y: -36)
         }
         .onPreferenceChange(MPanelHeightKey.self) { height in
             panelContentHeight = height
@@ -664,6 +996,8 @@ struct DevelopScreen: View {
 
     /// 内容高度变化后：短页锁成单档（并贴合内容），长页只负责收掉多余留白。
     private func syncDrawerToContent() {
+        // 分栏下面板高度由右栏自然分配，drawerHeight 不参与布局，别再写状态引发多余重绘。
+        guard !isSplit else { return }
         guard panelViewportHeight > 0, panelContentHeight > 0 else { return }
         let fit = fitHeight(for: panelContentHeight)
         let target: CGFloat
@@ -899,6 +1233,7 @@ struct DevelopScreen: View {
                     quickSlider("camera_exposure")
                     quickSlider("print_brightness")
                     quickSlider("tonal_contrast")
+                    quickSlider("highlight_softening")
 
                     if scanFilmMode {
                         Text(printOnlyQuickNote)
@@ -1176,7 +1511,7 @@ struct DevelopScreen: View {
 
     // MARK: - 底部页签
 
-    private var tabBar: some View {
+    private func tabBar(bottomPadding: CGFloat) -> some View {
         MGlassTabCapsule {
             ForEach(Array(pageItems.enumerated()), id: \.offset) { item in
                 Button {
@@ -1189,7 +1524,7 @@ struct DevelopScreen: View {
             }
         }
         // iOS 26 悬浮玻璃胶囊：不再贴边铺一条实底，而是留出左右与底部的呼吸。
-        .padding(.bottom, 8 + insets.bottom)
+        .padding(.bottom, bottomPadding)
     }
 
     private var drawerShape: UnevenRoundedRectangle {
@@ -1258,9 +1593,9 @@ struct DevelopScreen: View {
         session.proToggles["scan_film"] ?? false
     }
 
-    /// 与参考 `PRINT_ONLY_AXES` 对齐：印相明暗、影调反差（色盘 Y/M 单独处理）。
+    /// 与参考 `PRINT_ONLY_AXES` 对齐：印相明暗、影调反差、高光柔和（色盘 Y/M 单独处理）。
     private var printOnlyQuickAxes: Set<String> {
-        ["print_brightness", "tonal_contrast"]
+        ["print_brightness", "tonal_contrast", "highlight_softening"]
     }
 
     private let printOnlyQuickNote = "正片扫描模式：管线跳过印相阶段，本项不参与成像"
