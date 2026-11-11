@@ -510,12 +510,18 @@ struct MParamSlider: View {
     var suffix: String = ""
     var isEnabled: Bool = true
     var compact: Bool = false
+    /// 吸附点：拖到附近自动回到该值（0 = 默认状态），并给出一次吸附触感。
+    var snapTarget: Double? = nil
+    /// 吸附半径（数值单位）；不填时按 1.5 个步进算。
+    var snapDistance: Double? = nil
 
     @State private var dragging = false
     @State private var lastTick: Double = 0
     /// 按下时的锚点：值按「位移增量」换算，而不是手指的绝对位置。
     @State private var dragStartValue: Double = 0
     @State private var dragStartX: CGFloat = 0
+    /// 当前是否吸附在 `snapTarget` 上：用来做迟滞，避免在边界来回抖。
+    @State private var snapActive = false
 
     var body: some View {
         // 栅格化布局：每个单元 = 标签区 + 滑轨区，所有滑轨严格等间距。
@@ -620,10 +626,29 @@ struct MParamSlider: View {
                 let delta = Double((gesture.location.x - dragStartX) / width) * span
                 let raw = dragStartValue + delta
                 let stepped = step > 0 ? (raw / step).rounded() * step : raw
-                let clamped = min(range.upperBound, max(range.lowerBound, stepped))
+                var clamped = min(range.upperBound, max(range.lowerBound, stepped))
+                // 吸附：进入半径后锁在默认值上；迟滞 1.4 倍，避免在边界来回抖。
+                var didSnap = false
+                if let target = snapTarget {
+                    let radius = snapDistance ?? max(abs(step) * 1.5, 0.5)
+                    let near = abs(clamped - target) <= (snapActive ? radius * 1.4 : radius)
+                    if near {
+                        clamped = target
+                        if !snapActive {
+                            snapActive = true
+                            didSnap = true
+                        }
+                    } else {
+                        snapActive = false
+                    }
+                }
                 if abs(clamped - value) > 1e-9 {
                     value = clamped
-                    if abs(clamped - lastTick) >= max(step, 1e-9) {
+                    if didSnap {
+                        // 吸附瞬间只给一次更明确的触感，不再叠步进 tick。
+                        lastTick = clamped
+                        MHaptic.light()
+                    } else if abs(clamped - lastTick) >= max(step, 1e-9) {
                         lastTick = clamped
                         MHaptic.tick()
                     }
@@ -631,6 +656,7 @@ struct MParamSlider: View {
             }
             .onEnded { _ in
                 dragging = false
+                snapActive = false
                 lastTick = value
             }
     }
@@ -663,13 +689,14 @@ struct MParamSlider: View {
 struct MToggleRow: View {
     let label: String
     @Binding var isOn: Bool
+    var isEnabled: Bool = true
     var compact: Bool = false
 
     var body: some View {
         HStack {
             Text(label)
                 .font(.mSans(compact ? 11 : 12.5))
-                .foregroundStyle(MColor.text2)
+                .foregroundStyle(isEnabled ? MColor.text2 : MColor.text4)
             Spacer()
             Button {
                 MHaptic.tick()
@@ -687,9 +714,11 @@ struct MToggleRow: View {
                             .frame(width: compact ? 16 : 18, height: compact ? 16 : 18)
                             .padding(.horizontal, 3)
                     }
+                    .opacity(isEnabled ? 1 : 0.4)
                     .contentShape(Capsule())
             }
             .buttonStyle(.plain)
+            .disabled(!isEnabled)
         }
         .frame(height: compact ? 42 : 48)
     }

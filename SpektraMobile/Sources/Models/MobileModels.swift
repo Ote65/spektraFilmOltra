@@ -40,7 +40,7 @@ struct MPhoto: Identifiable, Hashable {
     }
 }
 
-/// 主页网格项：一条来自系统相册的 RAW 资产。
+/// 主页网格项：一条来自系统相册的照片资产（RAW 或编码图）。
 /// 相册里有、但还没入库的照片 `photo` 为 nil；点开时再按需取原片入库。
 struct MLibraryAsset: Identifiable, Hashable {
     /// `PHAsset.localIdentifier`
@@ -51,9 +51,29 @@ struct MLibraryAsset: Identifiable, Hashable {
     let photo: MPhoto?
     /// 相册资产本体：未入库时靠它取相册缩略图，入库时取原片。
     let phAsset: PHAsset?
+    /// 是否为拍摄图：RAW 或带相机 EXIF 的编码图；网络保存的图片为 false。
+    var isCaptured: Bool = true
 
     var isImported: Bool { photo != nil }
     var isGraded: Bool { photo?.isGraded ?? false }
+
+    var isRawFormat: Bool {
+        ImageLoader.rawSuffixes.contains((filename as NSString).pathExtension.lowercased())
+    }
+
+    /// 卡片左上角的格式角标：显影质量从 RAW 到编码图差别很大，标出来更诚实。
+    var formatLabel: String {
+        let ext = (filename as NSString).pathExtension.lowercased()
+        if ImageLoader.rawSuffixes.contains(ext) { return "RAW" }
+        switch ext {
+        case "jpg", "jpeg": return "JPEG"
+        case "heic", "heif": return "HEIC"
+        case "tif", "tiff": return "TIFF"
+        case "png": return "PNG"
+        case "webp": return "WEBP"
+        default: return ext.isEmpty ? "IMG" : ext.uppercased()
+        }
+    }
 
     static func == (lhs: MLibraryAsset, rhs: MLibraryAsset) -> Bool {
         lhs.id == rhs.id && lhs.photo?.id == rhs.photo?.id

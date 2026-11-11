@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Photos
+import ImageIO
 import UniformTypeIdentifiers
 
 /// 移动端状态中枢：照片库、导入、缩略图、显影/调色会话。
@@ -27,7 +28,7 @@ final class MobileEngine: ObservableObject {
     let store: LibraryStore
 
     @Published private(set) var photos: [MPhoto] = []
-    /// 主页网格的数据源：相册里所有带 RAW 本体的照片（已入库的会带上编辑信息）。
+    /// 主页网格的数据源：设置关闭时只收带 RAW 本体的照片；打开「支持 JPEG」后映射整个相册（滤掉截屏与视频）。
     @Published private(set) var assets: [MLibraryAsset] = []
     @Published private(set) var assetPhase: AssetPhase = .idle
     @Published private(set) var developSession: MobileDevelopSession?
@@ -64,7 +65,14 @@ final class MobileEngine: ObservableObject {
     // MARK: - 照片库
 
     func refreshPhotos() {
+        // 关掉「支持 JPEG」时，库里已导入的编码图只是不在主页露出，记录本身保留。
+        let allowNonRaw = MobileSettings.allowNonRaw
         photos = store.photos
+            .filter {
+                allowNonRaw || ImageLoader.rawSuffixes.contains(
+                    URL(fileURLWithPath: $0.originalPath).pathExtension.lowercased()
+                )
+            }
             .sorted { $0.importedAt > $1.importedAt }
             .map(makePhoto)
         relinkAssets()
@@ -72,8 +80,10 @@ final class MobileEngine: ObservableObject {
 
     // MARK: - 相册 RAW
 
-    /// 扫描系统相册，只保留真正带 RAW 本体的资产，并把已入库的编辑记录接上。
-    /// 主页打开就调这个：不需要先「导入」，相册里的 RAW 直接可浏览。
+    /// 扫描系统相册，并把已入库的编辑记录接上。
+    /// 默认只保留真正带 RAW 本体的资产；打开「支持 JPEG」后映射整个相册，
+    /// 仅滤掉截屏与视频（视频本身就不在 `.image` 查询里）。
+    /// 主页打开就调这个：不需要先「导入」，相册里的照片直接可浏览。
     func refreshAssets() async {
         assetPhase = .scanning
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
@@ -82,7 +92,7 @@ final class MobileEngine: ObservableObject {
             assetPhase = .denied
             return
         }
-        let scanned = await Self.scanRawAssets()
+        let scanned = await Self.scanAssets(includeAllPhotos: MobileSettings.allowNonRaw)
         let byName = Dictionary(
             store.photos.map { ($0.filename, $0) },
             uniquingKeysWith: { first, _ in first }
@@ -92,7 +102,8 @@ final class MobileEngine: ObservableObject {
                 id: item.asset.localIdentifier,
                 filename: item.filename,
                 photo: byName[item.filename].map(makePhoto),
-                phAsset: item.asset
+                phAsset: item.asset,
+                isCaptured: item.captured
             )
         }
         assetPhase = .ready
@@ -110,14 +121,16 @@ final class MobileEngine: ObservableObject {
         assets = assets.map { asset in
             guard let photo = byName[asset.filename] else {
                 return MLibraryAsset(id: asset.id, filename: asset.filename,
-                                     photo: nil, phAsset: asset.phAsset)
+                                     photo: nil, phAsset: asset.phAsset,
+                                     isCaptured: asset.isCaptured)
             }
             return MLibraryAsset(id: asset.id, filename: asset.filename,
-                                 photo: makePhoto(photo), phAsset: asset.phAsset)
+                                 photo: makePhoto(photo), phAsset: asset.phAsset,
+                                 isCaptured: asset.isCaptured)
         }
     }
 
-    /// 点开一张还没入库的相册 RAW：取回原片（iCloud 上也允许下载）→ 入库。
+    /// 点开一张还没入库的相册照片：取回原片（iCloud 上也允许下载）→ 入库。
     /// 返回可用的 photoID；失败返回 nil。
     func importAsset(assetID: String) async -> String? {
         guard importingAssetID == nil else { return nil }
@@ -127,7 +140,10 @@ final class MobileEngine: ObservableObject {
         guard let asset = PHAsset.fetchAssets(
             withLocalIdentifiers: [assetID], options: nil
         ).firstObject else { return nil }
-        guard let resource = Self.rawResource(for: asset) else { return nil }
+        guard let resource = Self.importResource(for: asset,
+                                                 includeAllPhotos: MobileSettings.allowNonRaw) else {
+            return nil
+        }
 
         importingAssetID = assetID
         defer { importingAssetID = nil }
@@ -174,26 +190,117 @@ final class MobileEngine: ObservableObject {
         return report.firstID
     }
 
-    private static func scanRawAssets() async -> [(asset: PHAsset, filename: String)] {
+    private static func scanAssets(includeAllPhotos: Bool)
+        async -> [(asset: PHAsset, filename: String, captured: Bool)] {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let options = PHFetchOptions()
                 options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
                 let result = PHAsset.fetchAssets(with: .image, options: options)
-                var found: [(asset: PHAsset, filename: String)] = []
+                var candidates: [(asset: PHAsset, filename: String)] = []
                 result.enumerateObjects { asset, _, _ in
-                    guard let resource = self.rawResource(for: asset) else { return }
-                    found.append((asset, resource.originalFilename))
+                    guard let resource = importResource(for: asset,
+                                                        includeAllPhotos: includeAllPhotos) else {
+                        return
+                    }
+                    candidates.append((asset, resource.originalFilename))
+                }
+                let captured = classifyCapture(candidates.map(\.asset),
+                                               includeAllPhotos: includeAllPhotos)
+                let found = zip(candidates, captured).map { item, isCaptured in
+                    (asset: item.asset, filename: item.filename, captured: isCaptured)
                 }
                 continuation.resume(returning: found)
             }
         }
     }
 
-    private static func rawResource(for asset: PHAsset) -> PHAssetResource? {
-        PHAssetResource.assetResources(for: asset).first {
+    /// 取这张资产用于入库的本体：优先 RAW；打开「支持 JPEG」时退回原照片本体。
+    /// 截屏在映射整个相册时被排除。
+    private static func importResource(for asset: PHAsset,
+                                       includeAllPhotos: Bool) -> PHAssetResource? {
+        let resources = PHAssetResource.assetResources(for: asset)
+        if let raw = resources.first(where: {
             UTType($0.uniformTypeIdentifier)?.conforms(to: .rawImage) == true
+        }) {
+            return raw
         }
+        guard includeAllPhotos,
+              !asset.mediaSubtypes.contains(.photoScreenshot) else { return nil }
+        return resources.first { $0.type == .fullSizePhoto }
+            ?? resources.first { $0.type == .photo }
+    }
+
+    // MARK: - 拍摄图判定
+
+    /// 相机 EXIF 判定缓存：键 = `PHAsset.localIdentifier`，值 = 是否手机/相机拍摄。
+    private static var captureCache: [String: Bool] = [:]
+    private static let captureCacheLock = NSLock()
+
+    /// 逐张判定是否拍摄图：RAW 直接算；编码图看相机 EXIF（厂商/机型/光圈/曝光时间）。
+    /// 读不到元数据（iCloud 未下载、解析失败）时按「拍摄图」保留，避免误藏真照片。
+    private static func classifyCapture(_ assets: [PHAsset], includeAllPhotos: Bool) -> [Bool] {
+        guard includeAllPhotos, !assets.isEmpty else {
+            return assets.map { _ in true }
+        }
+        var results = [Bool](repeating: true, count: assets.count)
+        let cursor = NSLock()
+        var next = 0
+        let workers = min(4, assets.count)
+        // 元数据读取是文件 IO：串行在几千张相册上会明显拖慢扫描，这里限并发 4 路。
+        results.withUnsafeMutableBufferPointer { buffer in
+            DispatchQueue.concurrentPerform(iterations: workers) { _ in
+                while true {
+                    cursor.lock()
+                    let index = next
+                    next += 1
+                    cursor.unlock()
+                    guard index < assets.count else { return }
+                    buffer[index] = isCameraCapture(asset: assets[index])
+                }
+            }
+        }
+        return results
+    }
+
+    private static func isCameraCapture(asset: PHAsset) -> Bool {
+        // RAW 一定来自相机。
+        if PHAssetResource.assetResources(for: asset).contains(where: {
+            UTType($0.uniformTypeIdentifier)?.conforms(to: .rawImage) == true
+        }) {
+            return true
+        }
+        let key = asset.localIdentifier
+        captureCacheLock.lock()
+        let cached = captureCache[key]
+        captureCacheLock.unlock()
+        if let cached { return cached }
+
+        var captured = true
+        let options = PHImageRequestOptions()
+        options.isSynchronous = true
+        options.isNetworkAccessAllowed = false
+        PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) {
+            data, _, _, _ in
+            guard let data,
+                  let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                    as? [String: Any] else { return }
+            let tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any]
+            let exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any]
+            let make = (tiff?[kCGImagePropertyTIFFMake as String] as? String)?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            let model = (tiff?[kCGImagePropertyTIFFModel as String] as? String)?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            let hasExposure = exif?[kCGImagePropertyExifFNumber as String] != nil
+                || exif?[kCGImagePropertyExifExposureTime as String] != nil
+            captured = !make.isEmpty || !model.isEmpty || hasExposure
+        }
+
+        captureCacheLock.lock()
+        captureCache[key] = captured
+        captureCacheLock.unlock()
+        return captured
     }
 
     @discardableResult
@@ -204,7 +311,8 @@ final class MobileEngine: ObservableObject {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
-                let photo = try store.importPhoto(from: url)
+                let photo = try store.importPhoto(from: url,
+                                                  allowingEncoded: MobileSettings.allowNonRaw)
                 report.imported += 1
                 report.firstID = report.firstID ?? photo.id
                 generateThumbnail(for: photo)
@@ -346,7 +454,12 @@ final class MobileEngine: ObservableObject {
     }
 
     private func warmThumbnails() {
+        let allowNonRaw = MobileSettings.allowNonRaw
         for photo in store.photos where photo.thumbnailPath == nil {
+            // 关掉「支持 JPEG」时编码图不在主页显示，不必为它们提前解码。
+            guard allowNonRaw || ImageLoader.rawSuffixes.contains(
+                URL(fileURLWithPath: photo.originalPath).pathExtension.lowercased()
+            ) else { continue }
             generateThumbnail(for: photo)
         }
     }
@@ -360,7 +473,8 @@ final class MobileEngine: ObservableObject {
         thumbnailQueue.async { [weak self] in
             guard let self else { return }
             guard let loaded = try? ImageLoader.load(url: url, maxSize: 320, rawOptions: options,
-                                                     rotationTurns: edit.rotationTurns),
+                                                     rotationTurns: edit.rotationTurns,
+                                                     allowEncoded: true),
                   var params = try? edit.runtimeParams() else { return }
             params.io.inputColorSpace = loaded.colorSpace
             params.io.inputCCTFDecoding = loaded.cctfDecoding

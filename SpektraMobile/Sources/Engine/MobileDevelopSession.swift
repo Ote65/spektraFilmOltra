@@ -49,6 +49,8 @@ final class MobileDevelopSession: ObservableObject {
 
     let photoID: String
     let filename: String
+    /// 输入是否为 RAW：JPEG/HEIC/PNG 没有可调的 RAW 解码参数（白平衡/镜头校正）。
+    let isRawInput: Bool
     private let store: LibraryStore
     /// 原图路径：导出与交接按需重新解码，预览不常驻全分辨率。
     private var originalURL: URL = URL(fileURLWithPath: "/dev/null")
@@ -121,6 +123,9 @@ final class MobileDevelopSession: ObservableObject {
     init(photo: LibraryPhoto, store: LibraryStore) {
         self.photoID = photo.id
         self.filename = photo.filename
+        self.isRawInput = ImageLoader.rawSuffixes.contains(
+            (photo.filename as NSString).pathExtension.lowercased()
+        )
         self.store = store
         self.originalLongEdge = max(photo.width, photo.height)
         let saved = UserDefaults.standard.double(forKey: Self.previewScaleKey)
@@ -194,7 +199,7 @@ final class MobileDevelopSession: ObservableObject {
         renderToken += 1
         renderer.invalidate()
         isRendering = true
-        phaseLabel = "读取 RAW"
+        phaseLabel = isRawInput ? "读取 RAW" : "读取照片"
         phaseProgress = 0
         // 解码参数在主线程取好，后台队列只做像素工作。
         let options = rawOptions()
@@ -204,7 +209,7 @@ final class MobileDevelopSession: ObservableObject {
             do {
                 let loaded = try ImageLoader.load(
                     url: originalURL, maxSize: maxSize, rawOptions: options,
-                    rotationTurns: rotation)
+                    rotationTurns: rotation, allowEncoded: true)
                 let preview = Resize.longEdge(loaded.image, maxSize: maxSize)
                 let display = Self.displayImage(preview, colorSpace: loaded.colorSpace,
                                                 cctfDecoding: loaded.cctfDecoding)
@@ -666,7 +671,7 @@ final class MobileDevelopSession: ObservableObject {
             // 导出按目标长边重新解码原图：预览缓存是缩小版，不能拿它放大。
             guard let loaded = try? ImageLoader.load(
                 url: sourceURL, maxSize: requested, rawOptions: options,
-                rotationTurns: rotation) else {
+                rotationTurns: rotation, allowEncoded: true) else {
                 Task { @MainActor [weak self] in
                     self?.isExporting = false
                     self?.exportLabel = ""
@@ -752,7 +757,7 @@ final class MobileDevelopSession: ObservableObject {
             var source = previewImage
             if maxEdge > previewEdge,
                let loaded = try? ImageLoader.load(url: url, maxSize: maxEdge, rawOptions: options,
-                                                  rotationTurns: rotation) {
+                                                  rotationTurns: rotation, allowEncoded: true) {
                 source = loaded.image
                 params.io.inputColorSpace = loaded.colorSpace
                 params.io.inputCCTFDecoding = loaded.cctfDecoding

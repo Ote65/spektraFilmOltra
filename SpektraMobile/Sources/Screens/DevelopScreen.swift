@@ -1416,6 +1416,7 @@ struct DevelopScreen: View {
                     step: step,
                     decimals: decimals,
                     suffix: suffix,
+                    isEnabled: proRowEnabled(row.id),
                     compact: true
                 )
             case .toggle(let isOn):
@@ -1425,15 +1426,17 @@ struct DevelopScreen: View {
                         get: { session.proToggles[row.id] ?? isOn },
                         set: { session.applyProToggle(row.id, $0) }
                     ),
+                    isEnabled: proRowEnabled(row.id),
                     compact: true
                 )
             case .choice(let options, let fallback):
                 let current = session.choiceValue(row.id)
                 let currentLabel = options.first(where: { $0.value == current })?.label ?? fallback
+                let enabled = proRowEnabled(row.id)
                 HStack {
                     Text(row.label)
                         .font(.rowLabel)
-                        .foregroundStyle(MColor.text2)
+                        .foregroundStyle(enabled ? MColor.text2 : MColor.text4)
                     Spacer()
                     Menu {
                         ForEach(options, id: \.value) { option in
@@ -1448,16 +1451,28 @@ struct DevelopScreen: View {
                         HStack(spacing: 4) {
                             Text(currentLabel)
                                 .font(.mSans(10.5, .medium))
-                                .foregroundStyle(current == fallback ? MColor.text2 : MColor.brass)
+                                .foregroundStyle(enabled
+                                                 ? (current == fallback ? MColor.text2 : MColor.brass)
+                                                 : MColor.text4)
                             Image(systemName: "chevron.down")
                                 .font(.system(size: 7, weight: .semibold))
                                 .foregroundStyle(MColor.text4)
                         }
                     }
+                    .disabled(!enabled)
                 }
                 .frame(height: 50)
             }
         }
+    }
+
+    /// RAW 专属的解码项：非 RAW 输入（JPEG/HEIC/PNG）没有任何效果，置灰避免被当成 bug。
+    private static let rawOnlyRows: Set<String> = [
+        "white_balance", "white_balance_temperature", "white_balance_tint", "lens_correction",
+    ]
+
+    private func proRowEnabled(_ id: String) -> Bool {
+        session.isRawInput || !Self.rawOnlyRows.contains(id)
     }
 
     private func quickSectionHead(

@@ -19,7 +19,10 @@ enum ImageLoader {
         "rwl", "srf", "sr2",
     ]
     static let linearSuffixes: Set<String> = ["exr", "hdr"]
-    static let encodedSuffixes: Set<String> = ["png", "tif", "tiff", "bmp", "webp"]
+    static let encodedSuffixes: Set<String> = [
+        "png", "tif", "tiff", "bmp", "webp", "jpg", "jpeg", "heic", "heif",
+    ]
+    /// 默认拒绝的编码图；iOS 设置里打开「支持 JPEG」后由调用方传入 allowEncoded 放行。
     static let rejectedSuffixes: Set<String> = ["jpg", "jpeg"]
 
     static let iccMappings: [(String, String)] = [
@@ -62,8 +65,10 @@ enum ImageLoader {
     /// - Parameter rotationTurns: 用户手动旋转，0–3 表示顺时针 90° 的倍数。
     static func load(url: URL, maxSize: Int? = nil,
                      rawOptions: RawDecoder.Options = RawDecoder.Options(),
-                     rotationTurns: Int = 0) throws -> LoadedImage {
-        var loaded = try decode(url: url, maxSize: maxSize, rawOptions: rawOptions)
+                     rotationTurns: Int = 0,
+                     allowEncoded: Bool = false) throws -> LoadedImage {
+        var loaded = try decode(url: url, maxSize: maxSize, rawOptions: rawOptions,
+                                allowEncoded: allowEncoded)
         let turns = ((rotationTurns % 4) + 4) % 4
         if turns != 0 {
             loaded.image = loaded.image.rotatedClockwise(turns)
@@ -92,10 +97,11 @@ enum ImageLoader {
     }
 
     private static func decode(url: URL, maxSize: Int?,
-                               rawOptions: RawDecoder.Options) throws -> LoadedImage {
+                               rawOptions: RawDecoder.Options,
+                               allowEncoded: Bool) throws -> LoadedImage {
         let detected = detectColorSpace(url: url)
         let suffix = url.pathExtension.lowercased()
-        if rejectedSuffixes.contains(suffix) {
+        if !allowEncoded, rejectedSuffixes.contains(suffix) {
             throw NSError(domain: "Spektrafilm.ImageLoader", code: 3,
                           userInfo: [NSLocalizedDescriptionKey:
                             "显影台不支持 JPEG 输入：\(url.lastPathComponent)"])

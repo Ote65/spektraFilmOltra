@@ -128,12 +128,9 @@ final class LibraryStore {
             photos = []
             return
         }
-        // 显影台只接受 RAW；旧索引里的 JPEG/TIFF 不再进入库。
-        photos = decoded.filter {
-            ImageLoader.rawSuffixes.contains(
-                URL(fileURLWithPath: $0.originalPath).pathExtension.lowercased()
-            )
-        }
+        // 索引里的记录一律保留：关掉「支持 JPEG」时由展示层隐藏，
+        // 重新打开后编辑记录还在，不能在这里按扩展名把记录丢掉。
+        photos = decoded
     }
 
     func save() throws {
@@ -203,10 +200,17 @@ final class LibraryStore {
         let cctfDecoding: Bool
     }
 
-    /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。
-    func stageImport(from source: URL) throws -> StagedImport {
+    /// 允许入库的扩展名：默认仅 RAW；打开「支持 JPEG」后再加常见编码图。
+    static func accepts(_ source: URL, allowingEncoded: Bool) -> Bool {
         let ext = source.pathExtension.lowercased()
-        guard ImageLoader.rawSuffixes.contains(ext) else {
+        if ImageLoader.rawSuffixes.contains(ext) { return true }
+        return allowingEncoded && ImageLoader.encodedSuffixes.contains(ext)
+    }
+
+    /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。
+    func stageImport(from source: URL, allowingEncoded: Bool = false) throws -> StagedImport {
+        let ext = source.pathExtension.lowercased()
+        guard Self.accepts(source, allowingEncoded: allowingEncoded) else {
             throw NSError(domain: "Spektrafilm.Library", code: 2,
                           userInfo: [NSLocalizedDescriptionKey:
                             "显影台只支持 RAW，拒绝导入 \(source.lastPathComponent)"])
@@ -247,7 +251,9 @@ final class LibraryStore {
             thumbnailPath: nil,
             width: staged.width,
             height: staged.height,
-            isRaw: true,
+            isRaw: ImageLoader.rawSuffixes.contains(
+                URL(fileURLWithPath: staged.originalPath).pathExtension.lowercased()
+            ),
             edit: edit,
             initialEditData: try? JSONEncoder().encode(edit)
         )
@@ -257,9 +263,9 @@ final class LibraryStore {
     }
 
     @discardableResult
-    func importPhoto(from source: URL) throws -> LibraryPhoto {
+    func importPhoto(from source: URL, allowingEncoded: Bool = false) throws -> LibraryPhoto {
         let ext = source.pathExtension.lowercased()
-        guard ImageLoader.rawSuffixes.contains(ext) else {
+        guard Self.accepts(source, allowingEncoded: allowingEncoded) else {
             throw NSError(domain: "Spektrafilm.Library", code: 2,
                           userInfo: [NSLocalizedDescriptionKey:
                             "显影台只支持 RAW，拒绝导入 \(source.lastPathComponent)"])
@@ -292,7 +298,7 @@ final class LibraryStore {
             thumbnailPath: nil,
             width: dimensions.width,
             height: dimensions.height,
-            isRaw: true,
+            isRaw: ImageLoader.rawSuffixes.contains(ext),
             edit: edit,
             initialEditData: try? JSONEncoder().encode(edit)
         )

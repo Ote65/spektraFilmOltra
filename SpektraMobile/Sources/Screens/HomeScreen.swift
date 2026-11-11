@@ -23,6 +23,7 @@ struct HomeScreen: View {
     /// 重置调色的二次确认目标。
     @State private var resetTarget: MPhoto?
     @FocusState private var searchFocused: Bool
+    @AppStorage(MobileSettings.allowNonRawKey) private var allowNonRaw = false
     @Environment(\.mSafeInsets) private var insets
 
     var body: some View {
@@ -80,8 +81,16 @@ struct HomeScreen: View {
             handleFolderImport(result)
         }
         .task {
-            // 主页默认就是「相册里所有 RAW」，不再需要先点导入。
+            // 主页默认就是「相册」，不再需要先点导入。
+            // 打开「支持 JPEG」时默认只显示拍摄图，避免网络保存的图片混进网格。
+            if allowNonRaw { filter = .capture }
             await engine.refreshAssets()
+        }
+        .onChange(of: allowNonRaw) { _, isOn in
+            // 设置里切换「支持 JPEG」后立刻按新范围重扫相册，并同步库里照片的可见性。
+            filter = isOn ? .capture : .all
+            engine.refreshPhotos()
+            Task { await engine.refreshAssets() }
         }
         .task {
             guard !didDebugOpen else { return }
@@ -215,7 +224,7 @@ struct HomeScreen: View {
             }
 
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\(visibleAssets.count) 张 RAW · \(gradedCount) 张已调色")
+                Text("\(visibleAssets.count) 张\(allowNonRaw ? "照片" : "RAW") · \(gradedCount) 张已调色")
                     .mMeta(10, color: MColor.text3)
 
                 Spacer(minLength: 0)
@@ -232,7 +241,7 @@ struct HomeScreen: View {
     private var filterRow: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 7) {
-                ForEach(HomeFilter.allCases) { item in
+                ForEach(HomeFilter.chips(allowNonRaw: allowNonRaw)) { item in
                     MFilterChip(
                         title: item.title,
                         tone: item.tone,
@@ -792,7 +801,7 @@ struct HomeScreen: View {
         .frame(height: 50)
     }
 
-    /// 空态：没权限 / 没 RAW / 还在扫描，三种情况说清下一步。
+    /// 空态：没权限 / 没可显影的照片 / 还在扫描，三种情况说清下一步。
     @ViewBuilder
     private var emptyHint: some View {
         if visibleAssets.isEmpty {
@@ -802,7 +811,7 @@ struct HomeScreen: View {
                     ProgressView()
                         .progressViewStyle(.circular)
                         .tint(MColor.text4)
-                    Text("正在扫描相册里的 RAW…")
+                    Text(allowNonRaw ? "正在扫描相册…" : "正在扫描相册里的 RAW…")
                         .mMeta(10.5, color: MColor.text3)
                 case .denied:
                     Image(systemName: "lock")
@@ -811,7 +820,7 @@ struct HomeScreen: View {
                     Text("没有相册读取权限")
                         .font(.mSans(11.5, .medium))
                         .foregroundStyle(MColor.text2)
-                    Text("授权后主页会直接显示相册里所有 RAW")
+                    Text(allowNonRaw ? "授权后主页会直接显示相册里的照片" : "授权后主页会直接显示相册里所有 RAW")
                         .mMeta(10, color: MColor.text4)
                     Button {
                         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
@@ -830,10 +839,10 @@ struct HomeScreen: View {
                     Image(systemName: "photo.on.rectangle.angled")
                         .font(.system(size: 22, weight: .regular))
                         .foregroundStyle(MColor.text4)
-                    Text("相册里没有 RAW 照片")
+                    Text(allowNonRaw ? "相册里没有可显影的照片" : "相册里没有 RAW 照片")
                         .font(.mSans(11.5, .medium))
                         .foregroundStyle(MColor.text2)
-                    Text("可以用「导入」从文件夹里挑 RAW")
+                    Text(allowNonRaw ? "可以用「导入」从文件夹里挑照片" : "可以用「导入」从文件夹里挑 RAW")
                         .mMeta(10, color: MColor.text4)
                 }
             }
@@ -845,14 +854,22 @@ struct HomeScreen: View {
 
     // MARK: - 从文件夹导入
 
-    /// 导入按钮指向文件系统：可以选文件夹（递归取里面的 RAW），也可以直接多选 RAW 文件。
+    /// 可导入的扩展名：关闭「支持 JPEG」时仅 RAW，打开后再加上常见编码图。
+    private var importableSuffixes: Set<String> {
+        MobileSettings.allowNonRaw
+            ? ImageLoader.rawSuffixes.union(ImageLoader.encodedSuffixes)
+            : ImageLoader.rawSuffixes
+    }
+
+    /// 导入按钮指向文件系统：可以选文件夹（递归取里面的照片），也可以直接多选文件。
     private func handleFolderImport(_ result: Result<[URL], Error>) {
         switch result {
         case .failure:
             return
         case .success(let urls):
             guard !urls.isEmpty else { return }
-            var raws: [URL] = []
+            let allowed = importableSuffixes
+            var files: [URL] = []
             var scoped: [URL] = []
             for url in urls {
                 if url.startAccessingSecurityScopedResource() { scoped.append(url) }
@@ -861,25 +878,28 @@ struct HomeScreen: View {
                     continue
                 }
                 if isDirectory.boolValue {
-                    raws.append(contentsOf: Self.rawFiles(in: url))
-                } else if ImageLoader.rawSuffixes.contains(url.pathExtension.lowercased()) {
-                    raws.append(url)
+                    files.append(contentsOf: Self.photoFiles(in: url, allowed: allowed))
+                } else if allowed.contains(url.pathExtension.lowercased()) {
+                    files.append(url)
                 }
             }
             defer { for url in scoped { url.stopAccessingSecurityScopedResource() } }
-            guard !raws.isEmpty else {
-                onToast("选中的位置里没有 RAW 文件")
+            guard !files.isEmpty else {
+                onToast(MobileSettings.allowNonRaw
+                        ? "选中的位置里没有可导入的照片"
+                        : "选中的位置里没有 RAW 文件")
                 return
             }
-            let report = engine.importPhotos(raws)
+            let report = engine.importPhotos(files)
+            let unit = MobileSettings.allowNonRaw ? "张照片" : "张 RAW"
             onToast(report.imported > 0
-                    ? "已导入 \(report.imported) 张 RAW"
+                    ? "已导入 \(report.imported) \(unit)"
                     : (report.reason.isEmpty ? "导入失败" : report.reason))
         }
     }
 
-    /// 递归列出目录下的 RAW 文件（跳过隐藏文件与包）。
-    private static func rawFiles(in folder: URL) -> [URL] {
+    /// 递归列出目录下的可导入文件（跳过隐藏文件与包）。
+    private static func photoFiles(in folder: URL, allowed: Set<String>) -> [URL] {
         guard let enumerator = FileManager.default.enumerator(
             at: folder,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -887,7 +907,7 @@ struct HomeScreen: View {
         ) else { return [] }
         var found: [URL] = []
         for case let file as URL in enumerator
-        where ImageLoader.rawSuffixes.contains(file.pathExtension.lowercased()) {
+        where allowed.contains(file.pathExtension.lowercased()) {
             found.append(file)
         }
         return found
@@ -895,21 +915,24 @@ struct HomeScreen: View {
 
     // MARK: - 数据
 
-    /// 相册里所有 RAW；没有相册权限时退化为已入库照片。
+    /// 相册里所有照片；没有相册权限时退化为已入库照片。
     private var sourceAssets: [MLibraryAsset] {
         engine.assetPhase == .ready
             ? engine.assets
             : engine.photos.map {
-                MLibraryAsset(id: $0.id, filename: $0.filename, photo: $0, phAsset: nil)
+                MLibraryAsset(id: $0.id, filename: $0.filename, photo: $0, phAsset: nil,
+                              isCaptured: $0.isRaw)
             }
     }
 
-    /// 主页可见数据源：在相册 RAW 上叠加筛选与搜索。
+    /// 主页可见数据源：在相册资产上叠加筛选与搜索。
     private var visibleAssets: [MLibraryAsset] {
         var filtered = sourceAssets.filter { asset in
             let photo = asset.photo
             switch filter {
             case .all: return true
+            case .capture: return asset.isCaptured
+            case .raw: return asset.isRawFormat
             case .favorite: return engine.isFavorite(asset)
             case .graded: return photo?.isGraded ?? false
             case .label(let label): return photo?.color == label
@@ -1063,7 +1086,7 @@ private struct MPhotoCard: View {
                 )
 
                 HStack(alignment: .top) {
-                    Text("RAW")
+                    Text(asset.formatLabel)
                         .font(.mSans(7.5, .semibold))
                         .tracking(0.8)
                         .foregroundStyle(MColor.text1.opacity(0.9))
@@ -1165,7 +1188,9 @@ private struct MPhotoCard: View {
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
         }
-        .frame(height: 128)
+        // 卡片锁定比例：iPhone 上原本是 165×128 的横幅；改为按列宽等比缩放，
+        // iPad 大列宽 / 窗口缩放时不再被压扁。
+        .aspectRatio(165 / 128, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: MRadius.card, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: MRadius.card, style: .continuous)
@@ -1214,20 +1239,24 @@ private struct MAssetThumb: View {
 
 // MARK: - 筛选 / 排序
 
-enum HomeFilter: Identifiable, Hashable, CaseIterable {
-    case all, favorite, graded, label(MColorLabel)
+enum HomeFilter: Identifiable, Hashable {
+    case all, capture, favorite, graded, raw, label(MColorLabel)
 
     var id: String { title }
 
-    static var allCases: [HomeFilter] {
-        [.all, .favorite, .graded]
+    /// 「拍摄 / RAW」只在打开「支持 JPEG」后出现，关闭时仍是原来的三项。
+    static func chips(allowNonRaw: Bool) -> [HomeFilter] {
+        allowNonRaw ? [.all, .capture, .favorite, .graded, .raw]
+                    : [.all, .favorite, .graded]
     }
 
     var title: String {
         switch self {
         case .all: return "全部"
+        case .capture: return "拍摄"
         case .favorite: return "收藏"
         case .graded: return "已调色"
+        case .raw: return "RAW"
         case .label(let label): return label.title
         }
     }

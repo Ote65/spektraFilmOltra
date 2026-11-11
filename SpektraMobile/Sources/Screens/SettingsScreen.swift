@@ -6,6 +6,8 @@ import UniformTypeIdentifiers
 /// 设置项直接落 UserDefaults：显影会话、导出面板与启动页读同一份值。
 enum MobileSettings {
     static let predictivePreviewKey = "mobile.preview.predictive"
+    /// 允许导入并显影 JPEG/HEIC/PNG 等编码图；关闭时主页只映射相册里的 RAW。
+    static let allowNonRawKey = "mobile.import.allowNonRaw"
     static let defaultExportFormatKey = "mobile.export.defaultFormatIndex"
     static let defaultExportEdgeKey = "mobile.export.defaultEdgeIndex"
     static let defaultExportQualityKey = "mobile.export.defaultQualityIndex"
@@ -31,6 +33,10 @@ enum MobileSettings {
 
     static var predictivePreviewEnabled: Bool {
         UserDefaults.standard.object(forKey: predictivePreviewKey) as? Bool ?? true
+    }
+
+    static var allowNonRaw: Bool {
+        UserDefaults.standard.object(forKey: allowNonRawKey) as? Bool ?? false
     }
 
     static var defaultExportFormatIndex: Int {
@@ -68,6 +74,7 @@ struct SettingsScreen: View {
     var previewURL: URL? = nil
 
     @AppStorage(MobileSettings.predictivePreviewKey) private var predictivePreview = true
+    @AppStorage(MobileSettings.allowNonRawKey) private var allowNonRaw = false
     @AppStorage(MobileSettings.defaultExportFormatKey) private var exportFormat = 0
     @AppStorage(MobileSettings.defaultExportEdgeKey) private var exportEdge = 0
     @AppStorage(MobileSettings.defaultExportQualityKey) private var exportQuality = 1
@@ -87,6 +94,7 @@ struct SettingsScreen: View {
                 navigationBar
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 0) {
+                        inputSection
                         exportSection
                         previewSection
                         launchSection
@@ -161,12 +169,25 @@ struct SettingsScreen: View {
         .frame(height: MMetric.navHeight)
     }
 
+    // MARK: 输入
+
+    private var inputSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            MSectionHead(title: "输入")
+                .padding(.top, 8)
+
+            MToggleRow(label: "支持 JPEG", isOn: $allowNonRaw, compact: true)
+
+            hairline
+        }
+    }
+
     // MARK: 导出
 
     private var exportSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             MSectionHead(title: "导出")
-                .padding(.top, 8)
+                .padding(.top, 18)
 
             MChoiceRow(label: "文件类型", value: exportFormatTitle,
                        options: formatOptions) { raw in

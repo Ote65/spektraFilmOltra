@@ -45,7 +45,7 @@ final class ExportQueue {
                 }
                 let original = URL(fileURLWithPath: photo.originalPath)
                 var params = try photo.makeParams()
-                let loaded = try ImageLoader.load(url: original)
+                let loaded = try ImageLoader.load(url: original, allowEncoded: true)
                 params.io.inputColorSpace = loaded.colorSpace
                 params.io.inputCCTFDecoding = loaded.cctfDecoding
                 let colorSpace = request.colorSpace ?? params.io.outputColorSpace
