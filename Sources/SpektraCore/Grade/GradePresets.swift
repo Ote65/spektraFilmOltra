@@ -164,11 +164,20 @@ final class GradePresetStore {
             ])
         }
         let target = lutDirectory.appendingPathComponent(source.lastPathComponent)
+        var copied = false
         if source.standardizedFileURL != target.standardizedFileURL {
             if FileManager.default.fileExists(atPath: target.path) {
                 try FileManager.default.removeItem(at: target)
             }
             try FileManager.default.copyItem(at: source, to: target)
+            copied = true
+        }
+        do {
+            // 解析校验通过才入库，避免列表里留下“导入成功但点击无效果”的无效 LUT。
+            try GradeEngine.preloadCube(path: target.path)
+        } catch {
+            if copied { try? FileManager.default.removeItem(at: target) }
+            throw error
         }
         return GradeLUTEntry(name: target.deletingPathExtension().lastPathComponent, path: target.path)
     }

@@ -26,6 +26,8 @@ final class MobileGradeSession: ObservableObject {
     @Published private(set) var luts: [GradeLUTEntry] = []
     @Published private(set) var isExporting = false
     @Published private(set) var lastSavedURL: URL?
+    /// 配方引用的 LUT 解析失败时的提示；同一原因只提示一次，切换 LUT 后自动清空。
+    @Published private(set) var lutFailure: String?
     @Published private(set) var previewAspect: CGFloat = 4.0 / 3.0
     /// 片边：只影响预览与导出，不写入调色配方。
     @Published private(set) var border = MFilmBorderConfig()
@@ -315,10 +317,10 @@ final class MobileGradeSession: ObservableObject {
     }
 
     @discardableResult
-    func importLUT(url: URL) -> GradeLUTEntry? {
+    func importLUT(url: URL) throws -> GradeLUTEntry {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        guard let entry = try? GradePresetStore.shared.importLUT(from: url) else { return nil }
+        let entry = try GradePresetStore.shared.importLUT(from: url)
         luts = GradePresetStore.shared.luts()
         setLUT(entry: entry)
         return entry
@@ -380,6 +382,7 @@ final class MobileGradeSession: ObservableObject {
                 let result = try GradeEngine.render(
                     input, recipe: recipe,
                     shouldCancel: { flag.isCancelled })
+                let lutMessage = result.lutError?.errorDescription
                 let cgImage = PreviewRenderer.cgImage(from: result.image)
                 let framed = cgImage.map {
                     MFilmBorderRenderer.preview(
@@ -390,6 +393,7 @@ final class MobileGradeSession: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self, self.activeFlag === flag, let framed else { return }
                     self.basePreviewCG = cgImage
+                    self.lutFailure = lutMessage
                     if self.border == borderConfig {
                         self.previewImage = MImage.make(cgImage: framed)
                         self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
@@ -470,6 +474,7 @@ final class MobileGradeSession: ObservableObject {
                 do {
                     let linear = GradeEngine.prepareSource(image)
                     let result = try GradeEngine.render(linear, recipe: recipe)
+                    if let lutError = result.lutError { throw lutError }
                     var output = Self.convertForExport(
                         result.image, colorSpace: targetSpace, cctfEncoding: targetCCTF)
                     // 水印属于照片本身：先压进画面，再合成片边，避免盖到片基与边字上。

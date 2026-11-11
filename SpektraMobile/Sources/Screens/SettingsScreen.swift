@@ -432,15 +432,25 @@ struct SettingsScreen: View {
             onToast("LUT 导入失败")
         case .success(let urls):
             var imported = 0
+            var firstError: Error?
             for url in urls {
                 let scoped = url.startAccessingSecurityScopedResource()
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                if (try? GradePresetStore.shared.importLUT(from: url)) != nil {
+                do {
+                    try GradePresetStore.shared.importLUT(from: url)
                     imported += 1
+                } catch {
+                    if firstError == nil { firstError = error }
                 }
             }
             luts = GradePresetStore.shared.luts()
-            onToast(imported > 0 ? "已导入 \(imported) 个 LUT" : "LUT 导入失败")
+            if imported > 0 {
+                onToast("已导入 \(imported) 个 LUT")
+            } else if let error = firstError {
+                onToast(error.localizedDescription)
+            } else {
+                onToast("LUT 导入失败")
+            }
         }
     }
 

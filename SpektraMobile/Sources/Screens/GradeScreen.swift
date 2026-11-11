@@ -122,7 +122,9 @@ struct GradeScreen: View {
                     onExport: { format, edge, quality, done in
                         session.export(format: format, longEdgeIndex: edge,
                                        jpegQuality: quality) { result in
-                            if case .failure = result { onToast("导出失败") }
+                            if case .failure(let error) = result {
+                                onToast((error as? LUTParseError)?.errorDescription ?? "导出失败")
+                            }
                             done(result)
                         }
                     }
@@ -143,6 +145,10 @@ struct GradeScreen: View {
         .onChange(of: recipe) { _, newValue in
             session.apply(newValue)
         }
+        .onChange(of: session.lutFailure) { _, message in
+            // 只在失败原因发生变化时提示一次，避免每次调参渲染重复弹窗。
+            if let message { onToast(message) }
+        }
         .onChange(of: curvePoints) { _, _ in
             syncCurve()
         }
@@ -154,12 +160,13 @@ struct GradeScreen: View {
             switch result {
             case .success(let urls):
                 guard let url = urls.first else { return }
-                if let entry = session.importLUT(url: url) {
+                do {
+                    let entry = try session.importLUT(url: url)
                     recipe.lutName = entry.name
                     recipe.lutStrength = 60
                     onToast("已导入 \(entry.name)")
-                } else {
-                    onToast("LUT 导入失败")
+                } catch {
+                    onToast(error.localizedDescription)
                 }
             case .failure:
                 onToast("LUT 导入失败")
