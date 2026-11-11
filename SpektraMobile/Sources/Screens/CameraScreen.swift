@@ -1,14 +1,17 @@
 import SwiftUI
+import Combine
 #if os(iOS)
 import AVFoundation
 #endif
 
 /// 拍摄页：4:3 取景 + iOS 风格快门。
 ///
-/// 只做两件事：拍一张 RAW（DNG），然后写进系统相册。
-/// 不入库、也不跳显影台 —— 主页会自己扫描相册里的 RAW。
+/// 拍一张 RAW（DNG）→ 交给根视图入库 → 直接进入这张照片的显影台；
+/// 相册写入在后台继续，成功后清理临时文件。
 struct CameraScreen: View {
     let onClose: () -> Void
+    /// 拍完把 DNG 交给根视图：入库并进入这张照片的显影台。
+    let onCaptured: (URL) -> Void
 
     @StateObject private var camera = MCameraSession()
     @Environment(\.mSafeInsets) private var insets
@@ -19,6 +22,15 @@ struct CameraScreen: View {
     @State private var focusToken = 0
     @State private var hint: String?
     @State private var hintToken = 0
+    /// 展开刻度条的那一个轴；nil 时显示三个快捷按钮。
+    @State private var activeAxis: MCaptureAxis?
+    @State private var scaleValue: Double = 0
+    /// 长按锁定后停留在取景框上的位置（视图归一化坐标）。
+    @State private var lockMark: CGPoint?
+    @State private var exposureBase: Double = 0
+    @State private var exposureDragTotal: CGFloat = 0
+    /// 横屏拿手机时把锁定标记的文字转正，始终相对重力方向水平。
+    @State private var badgeAngle: Double = 0
 
     var body: some View {
         ZStack {
@@ -29,7 +41,8 @@ struct CameraScreen: View {
                 Spacer(minLength: 0)
                 viewfinder
                 controlRow
-                    .padding(.top, 26)
+                    .frame(height: 72)
+                    .padding(.top, 22)
                 Spacer(minLength: 20)
                 bottomRow
             }
@@ -53,12 +66,20 @@ struct CameraScreen: View {
             camera.refreshPermission()
         }
         .onChange(of: camera.lastShot?.id) { _, _ in
-            saveLastShot()
+            handleShot()
         }
         .onChange(of: camera.message) { _, value in
             guard let value, !value.isEmpty else { return }
             showHint(value)
             camera.clearMessage()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
+            switch UIDevice.current.orientation {
+            case .landscapeLeft: badgeAngle = 90
+            case .landscapeRight: badgeAngle = -90
+            case .portraitUpsideDown: badgeAngle = 180
+            default: badgeAngle = 0
+            }
         }
     }
 
@@ -110,7 +131,10 @@ struct CameraScreen: View {
             preview
 
             GeometryReader { geo in
-                if let mark = focusMark {
+                if let mark = lockMark {
+                    MAELockBadge(exposure: camera.exposureBias, rotation: badgeAngle)
+                        .position(x: mark.x * geo.size.width, y: mark.y * geo.size.height)
+                } else if let mark = focusMark {
                     MFocusReticle()
                         .id(focusToken)
                         .position(x: mark.x * geo.size.width, y: mark.y * geo.size.height)
@@ -126,7 +150,8 @@ struct CameraScreen: View {
 
             noticeCard
         }
-        .aspectRatio(4.0 / 3.0, contentMode: .fit)
+        // 传感器是 4:3，竖着拿就是 3:4：取景框按 3:4 才和默认相机一致，不会上下裁掉一大截。
+        .aspectRatio(3.0 / 4.0, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -139,10 +164,34 @@ struct CameraScreen: View {
     private var preview: some View {
         #if os(iOS)
         if camera.permission == .authorized, camera.unusableReason == nil {
-            MCameraPreview(session: camera.session) { devicePoint, viewPoint in
-                camera.focus(at: devicePoint)
-                mark(at: viewPoint)
-            }
+            MCameraPreview(
+                session: camera.session,
+                onTap: { devicePoint, viewPoint in
+                    if camera.isExposureLocked { camera.releaseLock() }
+                    // 重新对焦 = 回到自动曝光，清掉上一次滑动留下的补偿。
+                    camera.setExposureBias(0)
+                    camera.focus(at: devicePoint)
+                    lockMark = nil
+                    mark(at: viewPoint)
+                },
+                onLongPress: { devicePoint, viewPoint in
+                    MHaptic.medium()
+                    exposureDragTotal = 0
+                    exposureBase = camera.exposureBias
+                    camera.lockFocusAndExposure(at: devicePoint)
+                    withAnimation(MMotion.quick) { lockMark = viewPoint }
+                },
+                onDragBegin: {
+                    exposureDragTotal = 0
+                    exposureBase = camera.exposureBias
+                },
+                onISODrag: { delta in
+                    // 无论是否锁定 AE/AF，滑动都是调整曝光（ISO 与快门由相机分配）。
+                    exposureDragTotal += delta
+                    let bias = exposureBase + Double(exposureDragTotal / 120)
+                    camera.setExposureBias(bias)
+                }
+            )
         } else {
             standby
         }
@@ -201,37 +250,84 @@ struct CameraScreen: View {
 
     // MARK: - 色温 / 曝光 / 闪光
 
+    @ViewBuilder
     private var controlRow: some View {
-        HStack(spacing: 30) {
-            MCaptureControl(
-                icon: "thermometer.medium",
-                label: camera.temperatureLabel,
-                active: camera.temperature != nil,
-                enabled: camera.isRawReady
-            ) {
-                MHaptic.tick()
-                camera.cycleTemperature()
-            }
+        if let axis = activeAxis {
+            MCaptureScaleBar(
+                axis: axis,
+                value: Binding(
+                    get: { scaleValue },
+                    set: { new in
+                        scaleValue = new
+                        apply(axis: axis, value: new)
+                    }
+                ),
+                onReset: {
+                    MHaptic.tick()
+                    switch axis {
+                    case .temperature: camera.setTemperature(nil)
+                    case .exposure: camera.setExposureBias(0)
+                    }
+                    withAnimation(MMotion.quick) { activeAxis = nil }
+                },
+                onClose: {
+                    withAnimation(MMotion.quick) { activeAxis = nil }
+                }
+            )
+            .id(axis.rawValue)
+            .transition(.opacity)
+        } else {
+            HStack(spacing: 30) {
+                axisButton(
+                    .temperature,
+                    icon: "thermometer.medium",
+                    label: camera.temperatureLabel,
+                    active: camera.temperature != nil
+                )
 
-            MCaptureControl(
-                icon: "sun.max",
-                label: camera.exposureLabel,
-                active: abs(camera.exposureBias) > 0.01,
-                enabled: camera.isRawReady
-            ) {
-                MHaptic.tick()
-                camera.cycleExposure()
-            }
+                axisButton(
+                    .exposure,
+                    icon: "sun.max",
+                    label: camera.exposureLabel,
+                    active: abs(camera.exposureBias) > 0.01
+                )
 
-            MCaptureControl(
-                icon: camera.flash.symbol,
-                label: camera.flash.title,
-                active: camera.flash != .off,
-                enabled: camera.isRawReady && camera.hasFlash
-            ) {
-                MHaptic.tick()
-                camera.cycleFlash()
+                MCaptureControl(
+                    icon: camera.flash.symbol,
+                    label: camera.flash.title,
+                    active: camera.flash != .off,
+                    enabled: camera.isRawReady && camera.hasFlash
+                ) {
+                    MHaptic.tick()
+                    camera.cycleFlash()
+                }
             }
+            .transition(.opacity)
+        }
+    }
+
+    private func axisButton(_ axis: MCaptureAxis, icon: String,
+                            label: String, active: Bool) -> some View {
+        MCaptureControl(icon: icon, label: label, active: active, enabled: camera.isRawReady) {
+            MHaptic.tick()
+            scaleValue = axis.seedValue(temperature: camera.temperature,
+                                        exposure: camera.exposureBias)
+            withAnimation(MMotion.quick) { activeAxis = axis }
+        }
+    }
+
+    private func apply(axis: MCaptureAxis, value: Double) {
+        switch axis {
+        case .temperature:
+            let kelvin = Int((value / 100).rounded()) * 100
+            guard kelvin != camera.temperature else { return }
+            MHaptic.tick()
+            camera.setTemperature(kelvin)
+        case .exposure:
+            let ev = (value * 10).rounded() / 10
+            guard abs(ev - camera.exposureBias) > 0.001 else { return }
+            MHaptic.tick()
+            camera.setExposureBias(ev)
         }
     }
 
@@ -394,17 +490,13 @@ struct CameraScreen: View {
         camera.capture()
     }
 
-    /// 拍完只写系统相册；入库交给主页的相册扫描。
-    private func saveLastShot() {
+    /// 拍完直接入库并跳到显影台；相册写入在后台继续，成功后删临时文件。
+    private func handleShot() {
         guard let shot = camera.lastShot else { return }
+        onCaptured(shot.url)
         PhotoLibraryExport.save(shot.url) { outcome in
-            switch outcome {
-            case .saved:
-                // 只有写进相册后才删临时文件：失败时先留着，别把刚拍的 RAW 一起丢了。
+            if case .saved = outcome {
                 try? FileManager.default.removeItem(at: shot.url)
-                showHint("已保存到相册")
-            case .denied: showHint("没有相册写入权限，照片没能保存")
-            case .failed: showHint("保存到相册失败")
             }
         }
     }
@@ -440,22 +532,32 @@ struct CameraScreen: View {
 // MARK: - 取景预览
 
 #if os(iOS)
-/// AVCaptureVideoPreviewLayer 的 SwiftUI 容器；点击时把「设备坐标 + 视图归一化坐标」一起交出去。
+/// AVCaptureVideoPreviewLayer 的 SwiftUI 容器；点击对焦，长按锁定 AE/AF，按住上下拖动改 ISO。
 struct MCameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     let onTap: (CGPoint, CGPoint) -> Void
+    let onLongPress: (CGPoint, CGPoint) -> Void
+    let onDragBegin: () -> Void
+    let onISODrag: (CGFloat) -> Void
 
     func makeUIView(context: Context) -> MPreviewView {
         let view = MPreviewView()
         view.previewLayer.session = session
         view.previewLayer.videoGravity = .resizeAspectFill
-        view.onTap = onTap
+        apply(to: view)
         return view
     }
 
     func updateUIView(_ uiView: MPreviewView, context: Context) {
         uiView.previewLayer.session = session
-        uiView.onTap = onTap
+        apply(to: uiView)
+    }
+
+    private func apply(to view: MPreviewView) {
+        view.onTap = onTap
+        view.onLongPress = onLongPress
+        view.onDragBegin = onDragBegin
+        view.onISODrag = onISODrag
     }
 }
 
@@ -467,30 +569,301 @@ final class MPreviewView: UIView {
     }
 
     var onTap: ((CGPoint, CGPoint) -> Void)?
+    var onLongPress: ((CGPoint, CGPoint) -> Void)?
+    var onDragBegin: (() -> Void)?
+    var onISODrag: ((CGFloat) -> Void)?
+
+    private var lastTranslation: CGPoint = .zero
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTap(_:))))
+
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.35
+        addGestureRecognizer(longPress)
+
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.maximumNumberOfTouches = 1
+        addGestureRecognizer(pan)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
+    }
+
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
         let point = gesture.location(in: self)
-        let devicePoint = previewLayer.captureDevicePointConverted(fromLayerPoint: point)
-        let normalized = CGPoint(
+        onTap?(devicePoint(point), normalized(point))
+    }
+
+    @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            let point = gesture.location(in: self)
+            onLongPress?(devicePoint(point), normalized(point))
+        default:
+            break
+        }
+    }
+
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            lastTranslation = .zero
+            onDragBegin?()
+        case .changed:
+            let translation = gesture.translation(in: self)
+            let delta = verticalDelta(
+                dx: translation.x - lastTranslation.x,
+                dy: translation.y - lastTranslation.y
+            )
+            lastTranslation = translation
+            onISODrag?(delta)
+        case .ended, .cancelled, .failed:
+            lastTranslation = .zero
+        default:
+            break
+        }
+    }
+
+    /// 手指位移换算成「沿重力向上为正」的调节量：
+    /// 竖屏是屏幕上下，横屏是屏幕左右（此时重力方向落在屏幕横向）。
+    private func verticalDelta(dx: CGFloat, dy: CGFloat) -> CGFloat {
+        switch UIDevice.current.orientation {
+        case .portraitUpsideDown: return dy
+        case .landscapeLeft: return dx
+        case .landscapeRight: return -dx
+        default: return -dy
+        }
+    }
+
+    private func devicePoint(_ point: CGPoint) -> CGPoint {
+        previewLayer.captureDevicePointConverted(fromLayerPoint: point)
+    }
+
+    private func normalized(_ point: CGPoint) -> CGPoint {
+        CGPoint(
             x: min(max(point.x / max(1, bounds.width), 0), 1),
             y: min(max(point.y / max(1, bounds.height), 0), 1)
         )
-        onTap?(devicePoint, normalized)
     }
 }
 #endif
 
 // MARK: - 零件
+
+/// 相机页可展开为刻度条的两个连续轴。
+private enum MCaptureAxis: String, Identifiable {
+    case temperature
+    case exposure
+
+    var id: String { rawValue }
+
+    var range: ClosedRange<Double> {
+        switch self {
+        case .temperature: return 2000...8000
+        case .exposure: return -2...2
+        }
+    }
+
+    var step: Double {
+        switch self {
+        case .temperature: return 100
+        case .exposure: return 0.1
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .temperature: return "thermometer.medium"
+        case .exposure: return "sun.max"
+        }
+    }
+
+    func label(_ value: Double) -> String {
+        switch self {
+        case .temperature: return "\(Int(value.rounded()))K"
+        case .exposure: return String(format: "%.1f", value)
+        }
+    }
+
+    func seedValue(temperature: Int?, exposure: Double) -> Double {
+        switch self {
+        case .temperature: return Double(temperature ?? 5600)
+        case .exposure: return exposure
+        }
+    }
+}
+
+/// iPhone 原相机式刻度条：顶部读数，下面一排竖线，当前值金色高亮。
+private struct MCaptureScaleBar: View {
+    let axis: MCaptureAxis
+    @Binding var value: Double
+    let onReset: () -> Void
+    let onClose: () -> Void
+
+    @State private var dragStart: Double?
+    /// 连续滚动值（未量化）：刻度位置由它决定，读数由量化后的 `value` 决定。
+    @State private var scrollValue: Double?
+    @State private var inertia: Task<Void, Never>?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: onClose) {
+                Image(systemName: axis.icon)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(MColor.brassInk)
+                    .frame(width: 40, height: 40)
+                    .background(Circle().fill(MColor.brass))
+            }
+            .buttonStyle(MPressStyle(scale: 0.92))
+            .accessibilityLabel("收起刻度")
+
+            VStack(spacing: 8) {
+                Text(axis.label(value))
+                    .font(.mSans(22, .medium).monospacedDigit())
+                    .foregroundStyle(MColor.text1)
+
+                ticks
+            }
+            .frame(maxWidth: .infinity)
+
+            Button(action: onReset) {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(MColor.text3)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.white.opacity(0.06)))
+            }
+            .buttonStyle(MPressStyle(scale: 0.92))
+            .accessibilityLabel("复位")
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 72)
+    }
+
+    /// iOS 原相机刻度尺：中心指示固定，刻度随手势滚动；越靠近中心刻度越长。
+    private var ticks: some View {
+        GeometryReader { _ in
+            let spacing: CGFloat = 13
+            let span = axis.range.upperBound - axis.range.lowerBound
+            let step = axis.step
+            let current = scrollValue ?? value
+            let position = (current - axis.range.lowerBound) / step
+            Canvas { context, size in
+                let centerX = size.width / 2
+                let half = Int(centerX / spacing) + 2
+                let center = Int(position.rounded())
+                let maxIndex = Int(span / step)
+                for index in (center - half)...(center + half) {
+                    guard index >= 0, index <= maxIndex else { continue }
+                    let x = centerX + (CGFloat(index) - CGFloat(position)) * spacing
+                    let distance = abs(x - centerX)
+                    let near = max(0, 1 - distance / (spacing * 4.2))
+                    let height: CGFloat = 9 + 17 * near * near
+                    let highlighted = distance < spacing / 2
+                    let rect = CGRect(x: x - 0.75, y: (size.height - height) / 2,
+                                      width: 1.5, height: height)
+                    context.fill(
+                        Path(roundedRect: rect, cornerRadius: 0.75),
+                        with: .color(highlighted
+                                     ? MColor.brass
+                                     : Color.white.opacity(0.26 + 0.22 * near))
+                    )
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { drag in
+                        inertia?.cancel()
+                        if dragStart == nil { dragStart = scrollValue ?? value }
+                        let base = dragStart ?? value
+                        let raw = base - Double(drag.translation.width / spacing) * step
+                        let clamped = min(max(raw, axis.range.lowerBound), axis.range.upperBound)
+                        scrollValue = clamped
+                        commit(clamped)
+                    }
+                    .onEnded { drag in
+                        // 松手后的剩余位移交给指数阻尼，读数跟着一起滑。
+                        let residual = (drag.predictedEndTranslation.width
+                                        - drag.translation.width)
+                        dragStart = nil
+                        glide(residual: residual, spacing: spacing, step: step)
+                    }
+            )
+        }
+        .frame(height: 26)
+    }
+
+    /// 连续滚动值量化成读数；跨档时由父视图触发一次轻震。
+    private func commit(_ raw: Double) {
+        let step = axis.step
+        let quantized = min(max((raw / step).rounded() * step,
+                                axis.range.lowerBound), axis.range.upperBound)
+        if abs(quantized - value) > 1e-6 { value = quantized }
+    }
+
+    /// 惯性滑行：指数阻尼 + 边界收口，模仿 UIScrollView 的减速曲线。
+    private func glide(residual: CGFloat, spacing: CGFloat, step: Double) {
+        guard abs(residual) > 3 else { return }
+        inertia?.cancel()
+        var remaining = residual
+        var last = Date()
+        inertia = Task { @MainActor in
+            while !Task.isCancelled {
+                let now = Date()
+                let dt = min(max(now.timeIntervalSince(last), 0.004), 0.05)
+                last = now
+                let decay = CGFloat(pow(0.93, dt * 60))
+                let delta = remaining * (1 - decay)
+                remaining *= decay
+                let base = scrollValue ?? value
+                let raw = base - Double(delta / spacing) * step
+                let clamped = min(max(raw, axis.range.lowerBound), axis.range.upperBound)
+                scrollValue = clamped
+                commit(clamped)
+                if abs(remaining) < 2
+                    || clamped == axis.range.lowerBound
+                    || clamped == axis.range.upperBound { break }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+        }
+    }
+}
+
+/// 长按后的 AE/AF 锁定标记：黄色方框 + 当前曝光补偿，滑动时数值实时变化。
+private struct MAELockBadge: View {
+    let exposure: Double
+    let rotation: Double
+    @State private var appeared = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .strokeBorder(Color.yellow.opacity(0.9), lineWidth: 1)
+                .frame(width: 56, height: 56)
+            Text("AE/AF 锁定 · \(String(format: "%+.1f", exposure)) EV")
+                .font(.mSans(9, .semibold).monospacedDigit())
+                .foregroundStyle(Color.yellow)
+        }
+        .rotationEffect(.degrees(rotation))
+        .scaleEffect(appeared ? 1 : 1.25)
+        .opacity(appeared ? 1 : 0)
+        .onAppear {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.75)) {
+                appeared = true
+            }
+        }
+    }
+}
 
 private struct MCaptureControl: View {
     let icon: String

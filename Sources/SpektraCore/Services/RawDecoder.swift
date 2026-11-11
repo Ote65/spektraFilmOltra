@@ -40,6 +40,8 @@ enum RawDecoder {
         }
         filter.isDraftModeEnabled = options.draftMode
         filter.isLensCorrectionEnabled = options.lensCorrection
+        // 手机横屏拍摄时 DNG 只有 EXIF orientation 记录方向；不设这一步输出会躺倒。
+        filter.orientation = ImageLoader.exifOrientation(url: url)
         filter.boostAmount = 0
         filter.boostShadowAmount = 0
         if let maxSize = options.maxSize {

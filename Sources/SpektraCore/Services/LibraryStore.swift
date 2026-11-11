@@ -16,12 +16,17 @@ struct PhotoEdit: Codable {
     var quickIntents: [String: Double] = [:]
     /// RAW 解码参数（白平衡/色温/色调/镜头校正）。改变后需要重新解码原图。
     var loadRaw = LoadRawParams()
+    /// 手动旋转：0–3 表示顺时针 90° 的倍数；只改变几何方向，不重新解码。
+    var rotationTurns = 0
+    /// 黑白模式：移动端在显影结果之后做亮度归一，属于展示层的显影预设，不进入核心参数。
+    var monochrome = false
 
     init() {}
 
     private enum CodingKeys: String, CodingKey {
         case filmStock, printStock, camera, enlarger, filmRender, printRender
-        case scanner, io, settings, debug, quickIntents, loadRaw
+        case scanner, io, settings, debug, quickIntents, loadRaw, rotationTurns
+        case monochrome
     }
 
     /// 逐字段解码：旧索引缺少新字段时回退默认值，避免整库解码失败后读成空库。
@@ -39,6 +44,8 @@ struct PhotoEdit: Codable {
         debug = try container.decodeIfPresent(DebugParams.self, forKey: .debug) ?? DebugParams()
         quickIntents = try container.decodeIfPresent([String: Double].self, forKey: .quickIntents) ?? [:]
         loadRaw = try container.decodeIfPresent(LoadRawParams.self, forKey: .loadRaw) ?? LoadRawParams()
+        rotationTurns = try container.decodeIfPresent(Int.self, forKey: .rotationTurns) ?? 0
+        monochrome = try container.decodeIfPresent(Bool.self, forKey: .monochrome) ?? false
     }
 
     /// RAW 解码选项：白平衡/色温/色调/镜头校正。解码尺寸由调用方另行传入。
@@ -80,6 +87,8 @@ struct LibraryPhoto: Codable, Identifiable, Hashable {
     var colorLabel: String?
     var importedAt: Date = Date()
     var edit = PhotoEdit()
+    /// 导入时的初始编辑状态：重置调色时用它还原，避免把拍摄曝光等出厂值一起抹掉。
+    var initialEditData: Data? = nil
     /// 快速控制的基线（编码后的 PhotoEdit）；缺失时以当前 edit 为准。
     var quickBaselineData: Data? = nil
     /// 片边参数（移动端展示层配置，不参与核心显影，也不进交接图）。
@@ -237,7 +246,8 @@ final class LibraryStore {
             width: staged.width,
             height: staged.height,
             isRaw: true,
-            edit: edit
+            edit: edit,
+            initialEditData: try? JSONEncoder().encode(edit)
         )
         photos.append(photo)
         try save()
@@ -267,6 +277,12 @@ final class LibraryStore {
         var edit = PhotoEdit()
         edit.io.inputColorSpace = detected.space
         edit.io.inputCCTFDecoding = detected.cctfDecoding
+        // 相机内调过的曝光已写进 RAW 的感光数据；显影管线的自动曝光会把它归一化掉，
+        // 这里把拍摄时的补偿读回来重新施加，让显影台与导出和相册观感一致。
+        let bias = ImageLoader.capturedExposureBias(url: source)
+        if abs(bias) > 0.01 {
+            edit.camera.exposureCompensationEV = bias
+        }
         let photo = LibraryPhoto(
             id: id,
             filename: source.lastPathComponent,
@@ -275,7 +291,8 @@ final class LibraryStore {
             width: dimensions.width,
             height: dimensions.height,
             isRaw: true,
-            edit: edit
+            edit: edit,
+            initialEditData: try? JSONEncoder().encode(edit)
         )
         photos.append(photo)
         try save()

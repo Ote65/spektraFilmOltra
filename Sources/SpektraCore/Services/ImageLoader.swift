@@ -59,8 +59,40 @@ enum ImageLoader {
     /// - Parameter maxSize: 长边上限。预览只解码到显示需要的尺寸，避免为 12MP 原图
     ///   常驻 290MB 的双精度缓冲；导出传 nil 才是全分辨率。
     /// - Parameter rawOptions: RAW 解码参数（白平衡/色温/色调/镜头校正）；非 RAW 忽略。
+    /// - Parameter rotationTurns: 用户手动旋转，0–3 表示顺时针 90° 的倍数。
     static func load(url: URL, maxSize: Int? = nil,
-                     rawOptions: RawDecoder.Options = RawDecoder.Options()) throws -> LoadedImage {
+                     rawOptions: RawDecoder.Options = RawDecoder.Options(),
+                     rotationTurns: Int = 0) throws -> LoadedImage {
+        var loaded = try decode(url: url, maxSize: maxSize, rawOptions: rawOptions)
+        let turns = ((rotationTurns % 4) + 4) % 4
+        if turns != 0 {
+            loaded.image = loaded.image.rotatedClockwise(turns)
+        }
+        return loaded
+    }
+
+    /// 读取 EXIF 方向；缺失时按 `.up` 处理。
+    static func exifOrientation(url: URL) -> CGImagePropertyOrientation {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+              let raw = properties[kCGImagePropertyOrientation as String] as? UInt32,
+              let orientation = CGImagePropertyOrientation(rawValue: raw) else { return .up }
+        return orientation
+    }
+
+    /// 拍摄时的曝光补偿（EXIF ExposureBias）。相机内调过曝光的 DNG 靠它把拍摄意图带进显影：
+    /// 补偿已写进感光数据，但显影管线的自动曝光会把它归一化掉，必须读回来重新施加。
+    static func capturedExposureBias(url: URL) -> Double {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+              let exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any],
+              let bias = exif["ExposureBias"] as? Double,
+              bias.isFinite else { return 0 }
+        return bias
+    }
+
+    private static func decode(url: URL, maxSize: Int?,
+                               rawOptions: RawDecoder.Options) throws -> LoadedImage {
         let detected = detectColorSpace(url: url)
         let suffix = url.pathExtension.lowercased()
         if rejectedSuffixes.contains(suffix) {
@@ -114,7 +146,15 @@ enum ImageLoader {
               let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw ImageExport.ExportError.encodeFailed("image source \(url.lastPathComponent)")
         }
-        let extent = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+        // EXIF 方向必须在这里应用：显影、调色、导出、缩略图都经过这个入口。
+        let ciImage = CIImage(cgImage: cgImage)
+            .oriented(forExifOrientation: Int32(exifOrientation(url: url).rawValue))
+        let extent = ciImage.extent
+        let width = Int(extent.width.rounded())
+        let height = Int(extent.height.rounded())
+        guard width > 0, height > 0 else {
+            throw ImageExport.ExportError.encodeFailed("empty image \(url.lastPathComponent)")
+        }
         let outputSpace: CGColorSpace
         if linear {
             outputSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
@@ -125,20 +165,19 @@ enum ImageLoader {
         } else {
             outputSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         }
-        let ciImage = CIImage(cgImage: cgImage)
         let context = CIContext(options: [.workingColorSpace: outputSpace])
-        var buffer = [Float](repeating: 0, count: cgImage.width * cgImage.height * 4)
+        var buffer = [Float](repeating: 0, count: width * height * 4)
         buffer.withUnsafeMutableBytes { raw in
             context.render(
                 ciImage, toBitmap: raw.baseAddress!,
-                rowBytes: cgImage.width * 4 * MemoryLayout<Float>.size,
+                rowBytes: width * 4 * MemoryLayout<Float>.size,
                 bounds: extent, format: .RGBAf, colorSpace: outputSpace
             )
         }
-        var values = [Double](repeating: 0, count: cgImage.width * cgImage.height * 3)
-        for i in 0..<(cgImage.width * cgImage.height) {
+        var values = [Double](repeating: 0, count: width * height * 3)
+        for i in 0..<(width * height) {
             for c in 0..<3 { values[i * 3 + c] = Double(buffer[i * 4 + c]) }
         }
-        return ImageRGB(width: cgImage.width, height: cgImage.height, data: values)
+        return ImageRGB(width: width, height: height, data: values)
     }
 }

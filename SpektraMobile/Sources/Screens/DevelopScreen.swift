@@ -21,8 +21,17 @@ struct DevelopScreen: View {
     @State private var zoom: CGFloat = DebugLaunch.canvasZoom
     @State private var pan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
     @State private var lastPan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
+    /// 捏合缩放锚点：锚在双指中心，捏哪里哪里不动。
+    @State private var zoomAnchor: UnitPoint = .center
+    @State private var isPinching = false
+    @State private var pinchBaseZoom: CGFloat = 1
+    @State private var pinchBasePan: CGSize = .zero
+    @State private var pinchDragT0: CGSize = .zero
+    @State private var isDragging = false
+    @State private var dragT0: CGSize = .zero
+    @State private var dragBasePan: CGSize = .zero
+    @State private var lastDragT: CGSize = .zero
     @State private var exportOpen = DebugLaunch.exportOpen
-    @State private var tabPressStart: Date?
     @State private var stageSize: CGSize = .zero
     // 首帧就绪前先弹出一块白色画布，再显影渐变成照片
     @State private var cardRect: CGRect = .zero
@@ -31,6 +40,8 @@ struct DevelopScreen: View {
     @State private var cardStarted = false
     @State private var cardRadius: CGFloat = 2
     @State private var imageRevealed = false
+    /// 点击照片进入纯预览：顶栏、抽屉、底栏全部隐去，再点一次恢复。
+    @State private var chromeHidden = false
     @Namespace private var tabPill
 
     @Environment(\.mHousing) private var housingSetting
@@ -62,6 +73,9 @@ struct DevelopScreen: View {
                             }
                         )
                     floatingChrome
+                        .opacity(chromeHidden ? 0 : 1)
+                        .allowsHitTesting(!chromeHidden)
+                        .animation(MMotion.quick, value: chromeHidden)
                 }
                 Spacer(minLength: 0)
             }
@@ -69,12 +83,18 @@ struct DevelopScreen: View {
 
             // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
             drawer
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
                 .padding(.horizontal, MMetric.floatingPanelInset)
                 .frame(height: drawerHeight)
                 .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
                     + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
 
             tabBar
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
 
             MBackSwipe(action: onBack)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -135,7 +155,12 @@ struct DevelopScreen: View {
             }
 
             Spacer(minLength: 0)
-            previewScaleMenu
+
+            // 调色入口从底部页签移到顶栏，和调色台的导出按钮同一套黄铜胶囊。
+            MBrassPill(title: "调色", icon: "slider.horizontal.3", height: 32) {
+                openGrade()
+            }
+            .accessibilityLabel("进入调色台")
         }
         .frame(height: 34)
         .padding(.horizontal, 14)
@@ -153,6 +178,20 @@ struct DevelopScreen: View {
             MTopScrim(height: 170)
                 .offset(y: -insets.top)
         }
+    }
+
+    /// 点击调色：把当前预览与落点交给根视图做吸入动画。
+    private func openGrade() {
+        let rect = fittedPreviewRect(in: stageSize)
+        onOpenGrade(
+            session.previewImage,
+            CGRect(
+                x: rect.minX,
+                y: insets.top + rect.minY,
+                width: rect.width,
+                height: rect.height
+            )
+        )
     }
 
     /// 预览渲染比例菜单：1/8、1/4、1/2、1/1，与 Swift 主线的 previewScale 档位一致。
@@ -227,11 +266,11 @@ struct DevelopScreen: View {
                 if let image = showOriginal ? session.originalImage : session.previewImage {
                     MImage.swiftUI(image)
                         .resizable()
+                        .interpolation(.high)
                         .scaledToFit()
-                        .scaleEffect(zoom)
+                        .scaleEffect(zoom, anchor: zoomAnchor)
                         .offset(pan)
                         .animation(MMotion.state, value: showOriginal)
-                        .animation(MMotion.drawer, value: zoom)
                 } else {
                     Image(systemName: "photo")
                         .font(.system(size: 30, weight: .light))
@@ -244,35 +283,80 @@ struct DevelopScreen: View {
             .onTapGesture(count: 2) {
                 MHaptic.light()
                 withAnimation(MMotion.drawer) {
-                    if zoom > 1 {
+                    if abs(zoom - 1) > 0.001 {
                         zoom = 1
                         pan = .zero
                         lastPan = .zero
                     } else {
                         zoom = 2.2
                     }
+                    zoomAnchor = .center
                 }
             }
+            // 单击在双击之后挂载：双击优先识别，单击只在没有第二击时触发。
+            .onTapGesture {
+                MHaptic.light()
+                withAnimation(MMotion.quick) { chromeHidden.toggle() }
+            }
             .gesture(
-                MagnificationGesture()
+                MagnifyGesture()
                     .onChanged { value in
-                        zoom = min(4, max(1, value))
+                        if !isPinching {
+                            isPinching = true
+                            // 以手势开始时的状态为基线：连续两次捏合不会互相跳变。
+                            pinchBaseZoom = zoom
+                            pinchBasePan = pan
+                            zoomAnchor = value.startAnchor
+                            pinchDragT0 = lastDragT
+                            // 双指操作开始时作废在途的长按对比，避免捏合途中图片切到原片。
+                            pressToken += 1
+                        }
+                        zoom = min(4, max(0.5, pinchBaseZoom * value.magnification))
+                        if isDragging {
+                            pan = CGSize(
+                                width: pinchBasePan.width + lastDragT.width - pinchDragT0.width,
+                                height: pinchBasePan.height + lastDragT.height - pinchDragT0.height
+                            )
+                        }
                     }
-                    .onEnded { value in
-                        zoom = min(4, max(1, value))
-                        if zoom <= 1 { pan = .zero }
+                    .onEnded { _ in
+                        isPinching = false
+                        if zoom <= 1.001 {
+                            pan = .zero
+                            lastPan = .zero
+                            zoomAnchor = .center
+                        } else {
+                            lastPan = pan
+                        }
                     }
             )
             .simultaneousGesture(
                 DragGesture()
                     .onChanged { gesture in
-                        guard zoom > 1 else { return }
-                        pan = CGSize(
-                            width: lastPan.width + gesture.translation.width,
-                            height: lastPan.height + gesture.translation.height
-                        )
+                        if !isDragging {
+                            isDragging = true
+                            dragT0 = gesture.translation
+                            dragBasePan = pan
+                            pressToken += 1
+                        }
+                        lastDragT = gesture.translation
+                        if isPinching {
+                            // 双指整体移动 1:1 平移，与缩放叠加互不打架。
+                            pan = CGSize(
+                                width: pinchBasePan.width + gesture.translation.width - pinchDragT0.width,
+                                height: pinchBasePan.height + gesture.translation.height - pinchDragT0.height
+                            )
+                        } else {
+                            guard zoom > 1.001 else { return }
+                            pan = CGSize(
+                                width: dragBasePan.width + gesture.translation.width - dragT0.width,
+                                height: dragBasePan.height + gesture.translation.height - dragT0.height
+                            )
+                        }
                     }
                     .onEnded { _ in
+                        isDragging = false
+                        lastDragT = .zero
                         lastPan = pan
                     }
             )
@@ -282,6 +366,7 @@ struct DevelopScreen: View {
                     let token = pressToken
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                         guard token == pressToken else { return }
+                        guard !isPinching, !isDragging else { return }
                         MHaptic.light()
                         withAnimation(MMotion.quick) { showOriginal = true }
                     }
@@ -312,6 +397,8 @@ struct DevelopScreen: View {
                 .allowsHitTesting(false)
             }
             .allowsHitTesting(false)
+            .opacity(chromeHidden ? 0 : 1)
+            .animation(MMotion.quick, value: chromeHidden)
 
             VStack {
                 Spacer(minLength: 0)
@@ -319,6 +406,8 @@ struct DevelopScreen: View {
                     .padding(.horizontal, 14)
                     .padding(.bottom, 10)
             }
+            .opacity(chromeHidden ? 0 : 1)
+            .animation(MMotion.quick, value: chromeHidden)
         }
         .overlay(alignment: .bottom) {
             MHairline(color: MColor.hairlineFaint)
@@ -395,7 +484,7 @@ struct DevelopScreen: View {
                     .accessibilityLabel("LUT 预测帧，停手后替换为精算帧")
             }
 
-            if zoom > 1 || showOriginal {
+            if abs(zoom - 1) > 0.001 || showOriginal {
                 Text(showOriginal ? "原片" : "\(Int(zoom * 100))%")
                     .font(.mSans(8.5, .medium).monospacedDigit())
                     .foregroundStyle(showOriginal ? MColor.text2 : MColor.text4)
@@ -433,9 +522,9 @@ struct DevelopScreen: View {
             }
         }
         .allowsHitTesting(false)
-        .scaleEffect(zoom)
+        .scaleEffect(zoom, anchor: zoomAnchor)
         .offset(pan)
-        .opacity(zoom > 1 ? 0 : 1)
+        .opacity(chromeHidden || abs(zoom - 1) > 0.001 ? 0 : 1)
     }
 
     /// 与预览图 `.scaledToFit` 的落点保持一致（照片现在铺满预览区宽度），取景角只贴着照片。
@@ -541,13 +630,28 @@ struct DevelopScreen: View {
         // 阴影分两层：近处极淡、远处大半径，让边界是渐隐而不是一圈硬黑边。
         .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
         .shadow(color: .black.opacity(0.22), radius: 30, y: 12)
-        .overlay(alignment: .topTrailing) {
-            MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
-                session.undo()
+        // 旋转 / 预览比例 / 撤销浮在 sheet 外面顶部，和原本撤销按钮同一行。
+        .overlay(alignment: .top) {
+            HStack(spacing: 6) {
+                MCircleIconButton(icon: "rotate.right", size: 10, frame: 28) {
+                    MHaptic.tick()
+                    session.rotateClockwise()
+                }
+                .accessibilityLabel("顺时针旋转 90 度")
+
+                previewScaleMenu
+
+                Spacer(minLength: 0)
+
+                MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
+                    session.undo()
+                }
+                .opacity(session.canUndo ? 1 : 0.36)
+                .allowsHitTesting(session.canUndo)
+                .accessibilityLabel("撤销")
             }
-            .opacity(session.canUndo ? 1 : 0.38)
-            .allowsHitTesting(session.canUndo)
-            .offset(x: -10, y: -36)
+            .padding(.horizontal, 10)
+            .offset(y: -36)
         }
         .onPreferenceChange(MPanelHeightKey.self) { height in
             panelContentHeight = height
@@ -623,14 +727,82 @@ struct DevelopScreen: View {
     @ViewBuilder private var pageContent: some View {
         switch page {
         case 0:
-            filmPage
+            developPresetPage
         case 1:
-            tonePage
+            filmPage
         case 2:
+            tonePage
+        case 3:
             colorPage
         default:
             detailPage
         }
+    }
+
+    // MARK: - 显影预设
+
+    private var developPresetPage: some View {
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 0) {
+                MSectionHead(title: "显影预设", trailing: "\(MobileDevelopPresets.all.count) 个")
+                    .padding(.top, 10)
+
+                ForEach(MobileDevelopPresets.all) { preset in
+                    developPresetRow(preset)
+                }
+            }
+            .padding(.horizontal, MMetric.pageMargin)
+            .padding(.bottom, 16)
+            .background(MPanelHeightReporter())
+        }
+        .scrollIndicators(.never)
+    }
+
+    private func developPresetRow(_ preset: MDevelopPreset) -> some View {
+        let film = MobileCatalog.film(id: preset.filmID) ?? MobileCatalog.films[0]
+        let selected = session.matches(preset)
+        return Button {
+            MHaptic.light()
+            withAnimation(MMotion.state) {
+                session.applyDevelopPreset(preset)
+            }
+            onToast("已套用 \(preset.name)")
+        } label: {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(selected ? MColor.brassWash : MColor.surface2.opacity(0.6))
+                        .frame(width: 38, height: 38)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(selected ? MColor.brass.opacity(0.5) : MColor.hairline,
+                                              lineWidth: 1)
+                        )
+                    MFilmStockIcon(film: film, size: 28)
+                }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(preset.name)
+                        .font(.mSans(11.5, .medium))
+                        .foregroundStyle(MColor.text1)
+                    Text(preset.note)
+                        .font(.mSans(8.5, .medium))
+                        .foregroundStyle(MColor.text4)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(MColor.brass)
+                }
+            }
+            .frame(height: 50)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 胶片页
@@ -640,6 +812,14 @@ struct DevelopScreen: View {
             VStack(spacing: 14) {
                 filmRail
                 paperRail
+
+                MToggleRow(label: "黑白模式",
+                           isOn: Binding(
+                            get: { session.isMonochrome },
+                            set: { session.setMonochrome($0) }
+                           ),
+                           compact: true)
+
                 if mode == 1 {
                     proGroupsView(2)
                         .padding(.top, 4)
@@ -648,6 +828,11 @@ struct DevelopScreen: View {
             .padding(.horizontal, MMetric.pageMargin)
             .padding(.vertical, 6)
             .background(MPanelHeightReporter())
+            // 内容不足一屏时在 sheet 里垂直居中。面板顶部还有 22pt 把手（chrome），
+            // 只在把手以下视口居中会让内容整体偏下一个 chrome/2；
+            // 在底部补回等量 padding，让居中基准回到整块面板。
+            .padding(.bottom, drawerChrome)
+            .frame(minHeight: max(0, panelViewportHeight), alignment: .center)
         }
         .scrollIndicators(.never)
     }
@@ -809,7 +994,7 @@ struct DevelopScreen: View {
                             resetQuick()
                         }
 
-                        HStack(alignment: .top, spacing: 12) {
+                        HStack(alignment: .center, spacing: 12) {
                             VStack(alignment: .leading, spacing: 0) {
                                 quickSlider("grain_amount")
                                 quickSlider("grain_size")
@@ -818,6 +1003,7 @@ struct DevelopScreen: View {
                             }
                             .frame(maxWidth: .infinity)
 
+                            // 与左侧三条滑杆整块垂直居中：颗粒预览不再顶在上沿。
                             MGrainSample(intensity: grainIntensity)
                                 .frame(width: 88, height: 88)
                                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -993,48 +1179,13 @@ struct DevelopScreen: View {
     private var tabBar: some View {
         MGlassTabCapsule {
             ForEach(Array(pageItems.enumerated()), id: \.offset) { item in
-                if item.offset == 4 {
+                Button {
+                    MHaptic.tick()
+                    withAnimation(MMotion.state) { page = item.offset }
+                } label: {
                     tabLabel(item.element, index: item.offset)
-                        .contentShape(Rectangle())
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onChanged { _ in
-                                    if tabPressStart == nil { tabPressStart = Date() }
-                                }
-                                .onEnded { _ in
-                                    let duration = tabPressStart.map {
-                                        Date().timeIntervalSince($0)
-                                    } ?? 0
-                                    tabPressStart = nil
-                                    MHaptic.tick()
-                                    if duration >= 0.45 {
-                                        MHaptic.medium()
-                                        withAnimation(MMotion.pill) { exportOpen = true }
-                                    } else {
-                                        let rect = fittedPreviewRect(in: stageSize)
-                                        // 吸入用屏幕上的整张预览（含片边）：落点与画面比例必须一致，
-                                        // 交接给调色台的像素仍然是纯照片，片边不会进入调色台。
-                                        onOpenGrade(
-                                            session.previewImage,
-                                            CGRect(
-                                                x: rect.minX,
-                                                y: insets.top + rect.minY,
-                                                width: rect.width,
-                                                height: rect.height
-                                            )
-                                        )
-                                    }
-                                }
-                        )
-                } else {
-                    Button {
-                        MHaptic.tick()
-                        withAnimation(MMotion.state) { page = item.offset }
-                    } label: {
-                        tabLabel(item.element, index: item.offset)
-                    }
-                    .buttonStyle(.plain)
                 }
+                .buttonStyle(.plain)
             }
         }
         // iOS 26 悬浮玻璃胶囊：不再贴边铺一条实底，而是留出左右与底部的呼吸。
@@ -1066,7 +1217,7 @@ struct DevelopScreen: View {
         .frame(maxWidth: .infinity)
         .frame(height: 42)
         .background {
-            if page == index, index < 4 {
+            if page == index {
                 // 选中项只铺一层很薄的黄铜玻璃，不再画独立的小方块图标底。
                 Capsule()
                     .fill(MColor.brassWash)
@@ -1079,22 +1230,20 @@ struct DevelopScreen: View {
     }
 
     private func tabTone(_ index: Int) -> Color {
-        if index == 4 { return MColor.brass }
-        return page == index ? MColor.brass : (index < 4 ? MColor.text3 : MColor.text4)
+        page == index ? MColor.brass : MColor.text3
     }
 
     private func tabWeight(_ index: Int) -> Font.Weight {
-        if index == 4 { return .medium }
-        return page == index ? .semibold : .medium
+        page == index ? .semibold : .medium
     }
 
     private var pageItems: [(title: String, icon: String)] {
         [
+            ("预设", "square.stack"),
             ("胶片", "film"),
             ("光调", "sun.max"),
             ("色彩", "drop"),
             ("细节", "camera.filters"),
-            ("调色", "slider.horizontal.3"),
         ]
     }
 
@@ -1196,12 +1345,12 @@ struct MExportSheet: View {
     var onNote: (String) -> Void = { _ in }
     let onExport: (Int, Int, Double, @escaping (Result<URL, Error>) -> Void) -> Void
 
-    /// 指针指向 `formats` 的下标；默认 JPEG，和参考图一致。
-    @State private var formatIndex = 0
+    /// 指针指向 `formats` 的下标；初始值来自设置里的默认导出格式。
+    @State private var formatIndex = MobileSettings.defaultExportFormatIndex
     /// 0 最大可用尺寸、1 2048、2 4096。
-    @State private var edgeIndex = 0
+    @State private var edgeIndex = MobileSettings.defaultExportEdgeIndex
     /// 0 100%、1 95%、2 90%、3 80%。
-    @State private var qualityIndex = 1
+    @State private var qualityIndex = MobileSettings.defaultExportQualityIndex
     @State private var showMore = false
     @State private var phase: MExportPhase = .idle
     /// 完成对勾的入场动画开关。
@@ -1230,7 +1379,7 @@ struct MExportSheet: View {
     ]
     private let qualityValues = [100, 95, 90, 80]
 
-    private var format: Format { formats[min(formatIndex, formats.count - 1)] }
+    private var format: Format { formats[min(max(formatIndex, 0), formats.count - 1)] }
     private var isJPEG: Bool { format.id == 3 }
 
     /// 居中浮卡：收窄成小窗，左右留白更足。

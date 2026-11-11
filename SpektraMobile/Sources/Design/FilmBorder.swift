@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import CoreText
+import ImageIO
 import SwiftUI
 
 // MARK: - 片边选项设计
@@ -123,16 +124,36 @@ enum MFilmBorderGauge: String, CaseIterable, Identifiable {
     }
 
     /// 视觉比例下片边占长边的比例（齿孔侧 / 画幅两端）。
-    /// 135 按机械尺寸会把照片压成一条，收到 7.5% 才接近参考扫描件；
-    /// 120 与页片本来只有 2.5–3.5mm 留边，比例上略收一点即可。
+    /// 每个幅面各给一套独立的留边语言，避免多个预设看起来是同一张：
+    /// 135 标准 7.5%、半格加宽到 8.5% 并加长片间；XPan 收窄成电影感窄边；
+    /// 120 四种画幅从 3% 薄边一路拉到 7.5% 宽边；110 / 16mm / 35mm 电影各有自己的边宽。
     var visualMarginRatio: (perf: Double, end: Double) {
         switch self {
-        case .full135, .half135, .xpan: return (0.075, 0.012)
-        case .roll645, .roll66, .roll67, .roll69: return (0.045, 0.020)
+        case .full135: return (0.075, 0.012)
+        case .half135: return (0.085, 0.035)
+        case .xpan: return (0.055, 0.010)
+        case .roll645: return (0.030, 0.014)
+        case .roll66: return (0.055, 0.022)
+        case .roll67: return (0.075, 0.028)
+        case .roll69: return (0.040, 0.035)
         case .sheet45: return (0.030, 0.030)
-        case .cart110: return (0.080, 0.060)
-        case .cine16: return (0.100, 0.020)
-        case .cine35: return (0.090, 0.020)
+        case .cart110: return (0.090, 0.070)
+        case .cine16: return (0.075, 0.012)
+        case .cine35: return (0.115, 0.014)
+        }
+    }
+
+    /// 边字后缀：真实片边的品牌字后面总会跟一行规格，也是各预设最直观的区别。
+    var formatSuffix: String {
+        switch self {
+        case .full135: return ""
+        case .half135: return "HALF"
+        case .xpan: return "XPAN"
+        case .roll645, .roll66, .roll67, .roll69: return "120"
+        case .sheet45: return ""
+        case .cart110: return "110"
+        case .cine16: return "16MM"
+        case .cine35: return "35MM"
         }
     }
 }
@@ -285,6 +306,44 @@ enum MFilmBorderTextTone: String, CaseIterable, Identifiable {
     }
 }
 
+/// 日期戳的落点：模拟胶片相机日期后背在画面角落打上的日期。
+enum MFilmBorderDatePosition: String, CaseIterable, Identifiable {
+    case bottomRight
+    case bottomLeft
+    case topRight
+    case topLeft
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .bottomRight: return "右下"
+        case .bottomLeft: return "左下"
+        case .topRight: return "右上"
+        case .topLeft: return "左上"
+        }
+    }
+}
+
+/// 日期戳字体：三种胶片机常见的数码 / 打字机字型，加一种细白字。
+enum MFilmBorderDateStyle: String, CaseIterable, Identifiable {
+    case amber
+    case red
+    case typewriter
+    case thin
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .amber: return "琥珀 LED"
+        case .red: return "数码红"
+        case .typewriter: return "打字机"
+        case .thin: return "细白"
+        }
+    }
+}
+
 /// 片边宽度的两种口径：
 /// - `.visual` 按参考扫描件的观感取比例，片边纤细、画面更大；
 /// - `.real` 严格按底片机械尺寸换算，用于需要真实比例的场合。
@@ -326,6 +385,12 @@ struct MFilmBorderConfig: Codable, Hashable {
     var frameNumbers: Bool = true
     var dxCode: Bool = true
     var notch: Bool = true
+    // 日期戳：模拟日期后背在画面角落打上的拍摄日期。
+    var dateStamp: Bool = false
+    var datePosition: String = MFilmBorderDatePosition.bottomRight.rawValue
+    var dateStyle: String = MFilmBorderDateStyle.amber.rawValue
+    /// 留空时使用从原片 EXIF 读取到的拍摄日期。
+    var dateText: String = ""
     // 做旧默认全关：干净扫描件才是参考图的方向。
     var scratches: Double = 0.0
     var dust: Double = 0.0
@@ -333,12 +398,65 @@ struct MFilmBorderConfig: Codable, Hashable {
 
     static let off = MFilmBorderConfig()
 
+    init() {}
+
+    /// 逐字段解码：新增字段在旧存档里缺失时回退默认值，避免整条片边记录解码失败。
+    private enum CodingKeys: String, CodingKey {
+        case enabled, preset, gauge, widthMode, borderScale, corner, cornerScale
+        case perf, perfScale, perfPitch, perfBrightness
+        case baseTone, baseBrightness
+        case edgeText, customText, textTone, textScale, frameNumbers, dxCode, notch
+        case dateStamp, datePosition, dateStyle, dateText
+        case scratches, dust, fog
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        preset = try c.decodeIfPresent(String.self, forKey: .preset) ?? "kodak135"
+        gauge = try c.decodeIfPresent(String.self, forKey: .gauge) ?? MFilmBorderGauge.full135.rawValue
+        widthMode = try c.decodeIfPresent(String.self, forKey: .widthMode)
+        borderScale = try c.decodeIfPresent(Double.self, forKey: .borderScale) ?? 1
+        corner = try c.decodeIfPresent(String.self, forKey: .corner) ?? MFilmBorderCorner.square.rawValue
+        cornerScale = try c.decodeIfPresent(Double.self, forKey: .cornerScale) ?? 1
+        perf = try c.decodeIfPresent(String.self, forKey: .perf) ?? MFilmBorderPerf.auto.rawValue
+        perfScale = try c.decodeIfPresent(Double.self, forKey: .perfScale) ?? 1
+        perfPitch = try c.decodeIfPresent(Double.self, forKey: .perfPitch) ?? 1
+        perfBrightness = try c.decodeIfPresent(Double.self, forKey: .perfBrightness) ?? 0
+        baseTone = try c.decodeIfPresent(String.self, forKey: .baseTone) ?? MFilmBorderBase.colorNegative.rawValue
+        baseBrightness = try c.decodeIfPresent(Double.self, forKey: .baseBrightness) ?? 0
+        edgeText = try c.decodeIfPresent(Bool.self, forKey: .edgeText) ?? true
+        customText = try c.decodeIfPresent(String.self, forKey: .customText) ?? ""
+        textTone = try c.decodeIfPresent(String.self, forKey: .textTone) ?? MFilmBorderTextTone.auto.rawValue
+        textScale = try c.decodeIfPresent(Double.self, forKey: .textScale) ?? 1
+        frameNumbers = try c.decodeIfPresent(Bool.self, forKey: .frameNumbers) ?? true
+        dxCode = try c.decodeIfPresent(Bool.self, forKey: .dxCode) ?? true
+        notch = try c.decodeIfPresent(Bool.self, forKey: .notch) ?? true
+        dateStamp = try c.decodeIfPresent(Bool.self, forKey: .dateStamp) ?? false
+        datePosition = try c.decodeIfPresent(String.self, forKey: .datePosition)
+            ?? MFilmBorderDatePosition.bottomRight.rawValue
+        dateStyle = try c.decodeIfPresent(String.self, forKey: .dateStyle)
+            ?? MFilmBorderDateStyle.amber.rawValue
+        dateText = try c.decodeIfPresent(String.self, forKey: .dateText) ?? ""
+        scratches = try c.decodeIfPresent(Double.self, forKey: .scratches) ?? 0
+        dust = try c.decodeIfPresent(Double.self, forKey: .dust) ?? 0
+        fog = try c.decodeIfPresent(Double.self, forKey: .fog) ?? 0
+    }
+
     var gaugeValue: MFilmBorderGauge {
         MFilmBorderGauge(rawValue: gauge) ?? .full135
     }
 
     var widthModeValue: MFilmBorderWidthMode {
         MFilmBorderWidthMode(rawValue: widthMode ?? "") ?? .visual
+    }
+
+    var datePositionValue: MFilmBorderDatePosition {
+        MFilmBorderDatePosition(rawValue: datePosition) ?? .bottomRight
+    }
+
+    var dateStyleValue: MFilmBorderDateStyle {
+        MFilmBorderDateStyle(rawValue: dateStyle) ?? .amber
     }
 
     var perfValue: MFilmBorderPerf {
@@ -367,6 +485,9 @@ struct MFilmBorderConfig: Codable, Hashable {
         if MFilmBorderTextTone(rawValue: value.textTone) == nil {
             value.textTone = MFilmBorderTextTone.auto.rawValue
         }
+        value.datePosition = value.datePositionValue.rawValue
+        value.dateStyle = value.dateStyleValue.rawValue
+        value.dateText = String(value.dateText.prefix(24))
         value.borderScale = min(max(value.borderScale, 0.4), 2.0)
         value.cornerScale = min(max(value.cornerScale, 0.0), 3.0)
         value.perfScale = min(max(value.perfScale, 0.5), 1.8)
@@ -408,62 +529,75 @@ struct MFilmBorderPreset: Identifiable, Hashable {
         }()
     )
 
+    /// 每个预设都从幅面、留边、片基、齿孔、角型、边字五处同时拉开差异，
+    /// 保证在真实照片上换预设是「一眼看出换了」，而不是只换了一个名字。
     static let all: [MFilmBorderPreset] = [
         none,
         MFilmBorderPreset(
-            id: "kodak135", name: "135 方格", note: "KS 齿孔 · 边码",
+            id: "kodak135", name: "135 方格", note: "KS 双排孔 · 琥珀边码",
             config: presetConfig("kodak135", gauge: .full135, base: .colorNegative,
                                  corner: .square, tone: .auto, dx: true)
         ),
         MFilmBorderPreset(
-            id: "half135", name: "135 半格", note: "竖条 · 单列孔",
+            id: "half135", name: "135 半格", note: "宽边 · 密孔 · 切角",
             config: presetConfig("half135", gauge: .half135, base: .colorNegative,
-                                 corner: .square, tone: .auto, dx: true)
+                                 corner: .chamfer, tone: .white, dx: true,
+                                 cornerScale: 0.7, perfScale: 1.2, perfPitch: 0.82,
+                                 textScale: 1.05)
         ),
         MFilmBorderPreset(
-            id: "xpan", name: "XPan", note: "宽幅 · 双边码",
-            config: presetConfig("xpan", gauge: .xpan, base: .colorNegative,
-                                 corner: .square, tone: .auto, dx: true)
+            id: "xpan", name: "XPan", note: "窄边 · 冷黑 · 疏孔",
+            config: presetConfig("xpan", gauge: .xpan, base: .reversal,
+                                 corner: .square, tone: .white, dx: true,
+                                 perfScale: 0.82, perfPitch: 1.22, textScale: 0.86)
         ),
         MFilmBorderPreset(
-            id: "roll645", name: "645", note: "120 · 细边",
+            id: "roll645", name: "645", note: "120 薄边 · 圆角",
             config: presetConfig("roll645", gauge: .roll645, base: .colorNegative,
-                                 corner: .square, tone: .auto, dx: false)
+                                 corner: .rounded, tone: .auto, dx: false,
+                                 borderScale: 0.85, cornerScale: 1.4, textScale: 0.9)
         ),
         MFilmBorderPreset(
-            id: "roll66", name: "6×6", note: "120 · 方形",
-            config: presetConfig("roll66", gauge: .roll66, base: .colorNegative,
-                                 corner: .square, tone: .auto, dx: false)
+            id: "roll66", name: "6×6", note: "120 中性黑 · 细字",
+            config: presetConfig("roll66", gauge: .roll66, base: .bw,
+                                 corner: .square, tone: .white, dx: false,
+                                 textScale: 1.15)
         ),
         MFilmBorderPreset(
-            id: "roll67", name: "6×7", note: "120 · 竖幅",
-            config: presetConfig("roll67", gauge: .roll67, base: .colorNegative,
-                                 corner: .square, tone: .auto, dx: false)
+            id: "roll67", name: "6×7", note: "120 灰片基 · 切角",
+            config: presetConfig("roll67", gauge: .roll67, base: .graphite,
+                                 corner: .chamfer, tone: .auto, dx: false,
+                                 borderScale: 1.1)
         ),
         MFilmBorderPreset(
-            id: "roll69", name: "6×9", note: "120 · 宽幅",
-            config: presetConfig("roll69", gauge: .roll69, base: .colorNegative,
-                                 corner: .square, tone: .auto, dx: false)
+            id: "roll69", name: "6×9", note: "120 琥珀片基 · 宽端边",
+            config: presetConfig("roll69", gauge: .roll69, base: .clear,
+                                 corner: .square, tone: .auto, dx: false,
+                                 borderScale: 1.15, textScale: 1.05)
         ),
         MFilmBorderPreset(
-            id: "sheet45", name: "4×5", note: "页片 · 缺口",
+            id: "sheet45", name: "4×5", note: "页片 · 缺口码",
             config: presetConfig("sheet45", gauge: .sheet45, base: .bw,
                                  corner: .square, tone: .white, dx: false)
         ),
         MFilmBorderPreset(
-            id: "cine35", name: "35mm 电影", note: "BH 齿孔",
+            id: "cine35", name: "35mm 电影", note: "BH 桶孔 · 宽边 · 圆片门",
             config: presetConfig("cine35", gauge: .cine35, base: .reversal,
-                                 corner: .square, tone: .white, dx: false)
+                                 corner: .rounded, tone: .white, dx: false,
+                                 borderScale: 1.1, cornerScale: 1.8, textScale: 0.85)
         ),
         MFilmBorderPreset(
-            id: "cine16", name: "16mm 电影", note: "单排孔",
-            config: presetConfig("cine16", gauge: .cine16, base: .reversal,
-                                 corner: .square, tone: .white, dx: false)
+            id: "cine16", name: "16mm 电影", note: "单排小孔 · 窄边无编号",
+            config: presetConfig("cine16", gauge: .cine16, base: .bw,
+                                 corner: .square, tone: .white, dx: false,
+                                 borderScale: 0.8, textScale: 0.75,
+                                 frameNumbers: false)
         ),
         MFilmBorderPreset(
-            id: "cart110", name: "110", note: "暗盒 · 单排孔",
-            config: presetConfig("cart110", gauge: .cart110, base: .colorNegative,
-                                 corner: .square, tone: .auto, dx: false)
+            id: "cart110", name: "110", note: "暖白片基 · 单孔 · 圆角",
+            config: presetConfig("cart110", gauge: .cart110, base: .ivory,
+                                 corner: .rounded, tone: .black, dx: false,
+                                 borderScale: 1.05, cornerScale: 0.8, textScale: 0.9)
         ),
     ]
 
@@ -473,7 +607,13 @@ struct MFilmBorderPreset: Identifiable, Hashable {
         base: MFilmBorderBase,
         corner: MFilmBorderCorner,
         tone: MFilmBorderTextTone,
-        dx: Bool
+        dx: Bool,
+        borderScale: Double = 1,
+        cornerScale: Double = 1,
+        perfScale: Double = 1,
+        perfPitch: Double = 1,
+        textScale: Double = 1,
+        frameNumbers: Bool = true
     ) -> MFilmBorderConfig {
         var value = MFilmBorderConfig()
         value.enabled = true
@@ -488,6 +628,12 @@ struct MFilmBorderPreset: Identifiable, Hashable {
         value.edgeText = !gauge.isSheet
         value.perf = MFilmBorderPerf.auto.rawValue
         value.widthMode = MFilmBorderWidthMode.visual.rawValue
+        value.borderScale = borderScale
+        value.cornerScale = cornerScale
+        value.perfScale = perfScale
+        value.perfPitch = perfPitch
+        value.textScale = textScale
+        value.frameNumbers = frameNumbers
         return value
     }
 
@@ -526,7 +672,8 @@ enum MFilmBorderRenderer {
     // MARK: 预览
 
     static func preview(photo: CGImage, config: MFilmBorderConfig,
-                        filmID: String, photoID: String) -> CGImage? {
+                        filmID: String, photoID: String,
+                        dateLabel: String = "") -> CGImage? {
         let value = config.normalized()
         guard value.enabled else { return photo }
         let layout = layout(for: CGSize(width: photo.width, height: photo.height), config: value)
@@ -541,7 +688,8 @@ enum MFilmBorderRenderer {
               ) else { return nil }
         context.interpolationQuality = .high
         draw(in: context, layout: layout, config: value,
-             photo: photo, punch: false, filmID: filmID, photoID: photoID)
+             photo: photo, punch: false, filmID: filmID, photoID: photoID,
+             dateLabel: dateLabel)
         return context.makeImage()
     }
 
@@ -551,7 +699,8 @@ enum MFilmBorderRenderer {
     /// 再把非透明像素转到目标色彩空间后与照片混合，保证 ProPhoto / ACES 导出不串色。
     static func composite(image: ImageRGB, config: MFilmBorderConfig,
                           filmID: String, photoID: String,
-                          colorSpace: String, cctfEncoding: Bool) -> ImageRGB {
+                          colorSpace: String, cctfEncoding: Bool,
+                          dateLabel: String = "") -> ImageRGB {
         let value = config.normalized()
         guard value.enabled else { return image }
         let layout = layout(for: CGSize(width: image.width, height: image.height), config: value)
@@ -566,7 +715,8 @@ enum MFilmBorderRenderer {
               ) else { return image }
         context.interpolationQuality = .high
         draw(in: context, layout: layout, config: value,
-             photo: nil, punch: true, filmID: filmID, photoID: photoID)
+             photo: nil, punch: true, filmID: filmID, photoID: photoID,
+             dateLabel: dateLabel)
         guard let buffer = context.data else { return image }
 
         var output = ImageRGB(width: width, height: height)
@@ -680,7 +830,8 @@ enum MFilmBorderRenderer {
 
     private static func draw(in context: CGContext, layout: MFilmBorderLayout,
                              config: MFilmBorderConfig, photo: CGImage?, punch: Bool,
-                             filmID: String, photoID: String) {
+                             filmID: String, photoID: String,
+                             dateLabel: String = "") {
         let width = layout.canvas.width
         let height = layout.canvas.height
         context.saveGState()
@@ -720,6 +871,9 @@ enum MFilmBorderRenderer {
         context.setLineWidth(max(0.6, layout.pxPerMM * 0.12))
         context.strokePath()
         context.restoreGState()
+
+        // 日期戳压在画面内部，模拟日期后背；先于片边文字绘制，保证不会溢到片基上。
+        drawDateStamp(context, layout: layout, config: config, dateLabel: dateLabel)
 
         let perfColor = perfRGB(config)
         drawPerforations(context, layout: layout, config: config, color: perfColor)
@@ -1022,7 +1176,7 @@ enum MFilmBorderRenderer {
             return
         }
         let fontSize = max(5, min(220, layout.pxPerMM * 1.05 * CGFloat(config.textScale)))
-        let label = edgeLabel(filmID: filmID, custom: config.customText)
+        let label = edgeLabelText(config, filmID: filmID)
         let tracking = fontSize * 0.10
         // 110 / 16mm 只有单侧齿孔，片边很窄：边字改排到没有齿孔的那一侧。
         let oneEdge = config.perfValue.isOneEdge
@@ -1116,7 +1270,7 @@ enum MFilmBorderRenderer {
                                             config: MFilmBorderConfig, color: CGColor,
                                             filmID: String, photoID: String) {
         let margin = layout.alongX ? layout.marginY : layout.marginX
-        let label = edgeLabel(filmID: filmID, custom: config.customText)
+        let label = edgeLabelText(config, filmID: filmID)
         let number = frameLabel(photoID: photoID, gauge: layout.gauge)
         let fontName = "HelveticaNeue-CondensedBold"
         var fontSize = max(5, min(260, margin * 0.46 * CGFloat(config.textScale)))
@@ -1500,7 +1654,125 @@ enum MFilmBorderRenderer {
                                    end: CGPoint(x: width - depth, y: 0), options: [])
     }
 
+    // MARK: 日期戳
+
+    /// 从原片 EXIF 读取拍摄日期，转成胶片日期后背的字样（26 11 3）。
+    static func captureDateLabel(url: URL) -> String {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as? [String: Any] else { return "" }
+        if let exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any],
+           let text = exif[kCGImagePropertyExifDateTimeOriginal as String] as? String,
+           let label = dateLabel(fromExif: text) {
+            return label
+        }
+        if let tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any],
+           let text = tiff[kCGImagePropertyTIFFDateTime as String] as? String,
+           let label = dateLabel(fromExif: text) {
+            return label
+        }
+        // 部分相机 DNG 不带 DateTimeOriginal：退回文件创建日期，日期戳仍然可用。
+        if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate,
+           let label = dateLabel(from: created) {
+            return label
+        }
+        return ""
+    }
+
+    private static func dateLabel(from date: Date) -> String? {
+        let parts = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        guard let year = parts.year, let month = parts.month, let day = parts.day else { return nil }
+        return "\(year % 100) \(month) \(day)"
+    }
+
+    private static func dateLabel(fromExif text: String) -> String? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        guard let date = formatter.date(from: text) else { return nil }
+        let parts = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        guard let year = parts.year, let month = parts.month, let day = parts.day else { return nil }
+        return "\(year % 100) \(month) \(day)"
+    }
+
+    private static func drawDateStamp(_ context: CGContext, layout: MFilmBorderLayout,
+                                      config: MFilmBorderConfig, dateLabel: String) {
+        guard config.dateStamp else { return }
+        let custom = config.dateText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = custom.isEmpty ? dateLabel.trimmingCharacters(in: .whitespacesAndNewlines) : custom
+        guard !text.isEmpty else { return }
+        let style = config.dateStyleValue
+        let position = config.datePositionValue
+        let aperture = layout.aperture
+        let shortSide = min(aperture.width, aperture.height)
+        let fontSize = max(4, min(220, shortSide * 0.042))
+        let fontName: String
+        let color: (CGFloat, CGFloat, CGFloat)
+        switch style {
+        case .amber:
+            fontName = "HelveticaNeue-CondensedBold"
+            color = (0.98, 0.70, 0.26)
+        case .red:
+            fontName = "Menlo-Bold"
+            color = (0.96, 0.32, 0.22)
+        case .typewriter:
+            fontName = "Courier-Bold"
+            color = (0.95, 0.91, 0.82)
+        case .thin:
+            fontName = "HelveticaNeue-Light"
+            color = (0.97, 0.95, 0.89)
+        }
+        let tracking = fontSize * (style == .thin ? 0.14 : 0.10)
+        let textWidthValue = textWidth(text, fontSize: fontSize, tracking: tracking, fontName: fontName)
+        let inset = max(6, shortSide * 0.045)
+        let x: CGFloat
+        let baseline: CGFloat
+        switch position {
+        case .bottomRight:
+            x = aperture.maxX - inset - textWidthValue
+            baseline = aperture.maxY - inset
+        case .bottomLeft:
+            x = aperture.minX + inset
+            baseline = aperture.maxY - inset
+        case .topRight:
+            x = aperture.maxX - inset - textWidthValue
+            baseline = aperture.minY + inset + fontSize
+        case .topLeft:
+            x = aperture.minX + inset
+            baseline = aperture.minY + inset + fontSize
+        }
+
+        context.saveGState()
+        // 只画在画面内，不越到片基。
+        context.addPath(aperturePath(layout, config: config))
+        context.clip()
+        let textColor = CGColor(red: color.0, green: color.1, blue: color.2, alpha: 0.95)
+        if style == .amber || style == .red {
+            // 数码日期后背的发光感：同色阴影往外晕开一圈。
+            context.setShadow(offset: .zero, blur: fontSize * 0.55,
+                              color: CGColor(red: color.0, green: color.1, blue: color.2, alpha: 0.8))
+        } else {
+            context.setShadow(offset: CGSize(width: 0, height: fontSize * 0.05),
+                              blur: fontSize * 0.3, color: CGColor(gray: 0, alpha: 0.55))
+        }
+        drawText(context, text: text,
+                 origin: CGPoint(x: x, y: baseline),
+                 rotation: 0, fontSize: fontSize, color: textColor,
+                 tracking: tracking, fontName: fontName)
+        context.setShadow(offset: .zero, blur: 0, color: nil)
+        context.restoreGState()
+    }
+
     // MARK: 文字内容
+
+    /// 片边品牌字 + 幅面规格（135 / 120 / 110 / 16MM …）。
+    private static func edgeLabelText(_ config: MFilmBorderConfig, filmID: String) -> String {
+        let custom = config.customText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !custom.isEmpty { return custom.uppercased() }
+        let base = edgeLabel(filmID: filmID, custom: "")
+        let suffix = config.gaugeValue.formatSuffix
+        return suffix.isEmpty ? base : "\(base) \(suffix)"
+    }
 
     static func edgeLabel(filmID: String, custom: String) -> String {
         let trimmed = custom.trimmingCharacters(in: .whitespacesAndNewlines)

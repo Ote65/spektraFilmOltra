@@ -32,6 +32,9 @@ final class MobileGradeSession: ObservableObject {
     /// 调色台预览比例（相对 1600 交接图）：1/8、1/4、1/2、1/1。
     @Published private(set) var previewScale: Double
 
+    /// 片边日期戳的默认字样：拍摄日期（EXIF 缺失时为空，不画日期）。
+    private let captureDateLabel: String
+
     private let gradeQueue = DispatchQueue(label: "spektra.mobile.grade", qos: .userInitiated)
     private var source: ImageRGB?
     /// 最近一帧「无片边」的调色结果 / 原片显示图；改片边时只重合成这两张。
@@ -67,6 +70,8 @@ final class MobileGradeSession: ObservableObject {
         self.filename = photo.filename
         self.store = store
         self.develop = develop
+        self.captureDateLabel = MFilmBorderRenderer.captureDateLabel(
+            url: store.originalURL(for: photo))
         let saved = UserDefaults.standard.double(forKey: Self.previewScaleKey)
         self.previewScale = saved >= 0.125 && saved <= 1.0 ? saved : 1.0
         self.presets = GradePresetStore.shared.all
@@ -105,7 +110,8 @@ final class MobileGradeSession: ObservableObject {
             let baseOriginal = PreviewRenderer.cgImage(from: display)
             let framedOriginal = baseOriginal.map {
                 MFilmBorderRenderer.preview(
-                    photo: $0, config: borderConfig, filmID: filmID, photoID: self.photoID
+                    photo: $0, config: borderConfig, filmID: filmID, photoID: self.photoID,
+                    dateLabel: self.captureDateLabel
                 ) ?? $0
             }
             Task { @MainActor in
@@ -133,12 +139,30 @@ final class MobileGradeSession: ObservableObject {
         start()
     }
 
-    /// 顺时针旋转 90°：旋转属于照片本身，交给显影会话写入编辑数据后重建交接图。
+    /// 顺时针旋转 90°：只转动现有交接图与预览帧，不重跑调色或交接渲染。
     func rotateClockwise() {
-        guard !isExporting else { return }
+        guard !isExporting, let current = source else { return }
         develop.rotateClockwise()
-        sourceReady = false
-        start()
+        token += 1
+        pendingProxy?.cancel()
+        pendingSettle?.cancel()
+        proxyInFlight = false
+        isRendering = false
+        phaseLabel = ""
+        phaseProgress = 0
+        source = current.rotatedClockwise(1)
+        basePreviewCG = basePreviewCG?.quarterTurnedClockwise
+        originalBaseCG = originalBaseCG?.quarterTurnedClockwise
+        if let base = basePreviewCG {
+            previewAspect = CGFloat(base.width) / CGFloat(max(1, base.height))
+        }
+        if let previewImage, let rotated = previewImage.quarterTurnedClockwise {
+            self.previewImage = rotated
+        }
+        if let originalImage, let rotated = originalImage.quarterTurnedClockwise {
+            self.originalImage = rotated
+        }
+        applyBorderToPreview()
     }
 
     func cancel() {
@@ -148,6 +172,9 @@ final class MobileGradeSession: ObservableObject {
         pendingProxy?.cancel()
         pendingSettle?.cancel()
     }
+
+    /// LUT 卡片沿用当前胶片的图标，保持调色台与显影台同一套视觉。
+    var filmID: String { develop.filmID }
 
     /// 导出面板显示用：原图真实长边。
     var exportOriginalEdge: Int {
@@ -179,18 +206,21 @@ final class MobileGradeSession: ObservableObject {
         let config = border
         let filmID = develop.filmID
         let identifier = photoID
+        let dateLabel = captureDateLabel
         borderQueue.async { [weak self] in
             // 排到队首时已有更新的请求就直接放弃，旧帧不再合成。
             guard !flag.isCancelled else { return }
             let framed = base.map {
                 MFilmBorderRenderer.preview(
-                    photo: $0, config: config, filmID: filmID, photoID: identifier
+                    photo: $0, config: config, filmID: filmID, photoID: identifier,
+                    dateLabel: dateLabel
                 ) ?? $0
             }
             guard !flag.isCancelled else { return }
             let framedOriginal = original.map {
                 MFilmBorderRenderer.preview(
-                    photo: $0, config: config, filmID: filmID, photoID: identifier
+                    photo: $0, config: config, filmID: filmID, photoID: identifier,
+                    dateLabel: dateLabel
                 ) ?? $0
             }
             guard !flag.isCancelled else { return }
@@ -339,6 +369,7 @@ final class MobileGradeSession: ObservableObject {
         let borderConfig = border
         let filmID = develop.filmID
         let photoID = self.photoID
+        let dateLabel = captureDateLabel
         proxyInFlight = edge <= proxyEdge
         isRendering = true
         phaseLabel = edge <= proxyEdge ? "调色代理" : "调色精修"
@@ -352,7 +383,8 @@ final class MobileGradeSession: ObservableObject {
                 let cgImage = PreviewRenderer.cgImage(from: result.image)
                 let framed = cgImage.map {
                     MFilmBorderRenderer.preview(
-                        photo: $0, config: borderConfig, filmID: filmID, photoID: photoID
+                        photo: $0, config: borderConfig, filmID: filmID, photoID: photoID,
+                        dateLabel: dateLabel
                     ) ?? $0
                 }
                 Task { @MainActor [weak self] in
@@ -394,6 +426,8 @@ final class MobileGradeSession: ObservableObject {
                                store.photos.first(where: { $0.id == photoID })?.height ?? 0)
         let borderConfig = border
         let filmID = develop.filmID
+        let dateLabel = captureDateLabel
+        let watermark = MWatermarkStore.load()
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
         // 片边会把成品放大一圈：开启片边时「原始」也按内存余量钳位，避免大图导出被 jetsam。
         let edge = (longEdgeIndex == 0 && !borderConfig.enabled)
@@ -438,12 +472,21 @@ final class MobileGradeSession: ObservableObject {
                     let result = try GradeEngine.render(linear, recipe: recipe)
                     var output = Self.convertForExport(
                         result.image, colorSpace: targetSpace, cctfEncoding: targetCCTF)
+                    // 水印属于照片本身：先压进画面，再合成片边，避免盖到片基与边字上。
+                    if watermark.enabled {
+                        Task { @MainActor in self.exportLabel = "合成水印" }
+                        output = MWatermarkRenderer.composite(
+                            image: output, config: watermark,
+                            colorSpace: targetSpace, cctfEncoding: targetCCTF
+                        )
+                    }
                     if borderConfig.enabled {
                         Task { @MainActor in self.exportLabel = "合成片边" }
                         output = MFilmBorderRenderer.composite(
                             image: output, config: borderConfig,
                             filmID: filmID, photoID: exportPhotoID,
-                            colorSpace: targetSpace, cctfEncoding: targetCCTF
+                            colorSpace: targetSpace, cctfEncoding: targetCCTF,
+                            dateLabel: dateLabel
                         )
                     }
                     try FileManager.default.createDirectory(

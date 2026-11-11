@@ -1191,12 +1191,24 @@ struct MLUTCard: View {
 }
 
 // MARK: - 曲线
+//
+// 点曲线默认没有任何控制点（恒等曲线）。只有落点本身接收拖动，
+// 框内其余拖动一律交给外层 ScrollView；点击空白处新增一个点，点被选中后旁边出现删除按钮。
 
 struct MCurveEditor: View {
     @Binding var points: [CGPoint]
     var channel: String = "RGB"
 
+    @State private var selected: Int? = nil
     @State private var dragIndex: Int? = nil
+    @State private var lastTick = CGPoint(x: -1, y: -1)
+
+    /// 控制点上限：再多曲线会碎成折线，也不利于手指命中。
+    private let maxPoints = 8
+    /// 命中的距离阈值：只包住圆点本身，不扩到整块画布。
+    private let hitRadius: CGFloat = 20
+    /// 左右各留一点余量，避免控制点贴边时删除按钮无处安放。
+    private let xInset: Double = 0.02
 
     var body: some View {
         GeometryReader { geo in
@@ -1214,37 +1226,173 @@ struct MCurveEditor: View {
                         channel == "RGB" ? MColor.brass : MColor.text1,
                         style: StrokeStyle(lineWidth: 1.6, lineCap: .round)
                     )
+                    .clipShape(RoundedRectangle(cornerRadius: MRadius.control, style: .continuous))
 
                 ForEach(Array(points.enumerated()), id: \.offset) { item in
-                    Circle()
-                        .fill(dragIndex == item.offset ? MColor.brassHigh : Color(hex: 0xF1ECE3))
-                        .frame(width: dragIndex == item.offset ? 12 : 9, height: dragIndex == item.offset ? 12 : 9)
-                        .overlay(Circle().strokeBorder(Color.black.opacity(0.4), lineWidth: 1))
-                        .position(x: item.element.x * size.width, y: (1 - item.element.y) * size.height)
+                    pointHandle(index: item.offset, point: item.element, size: size)
+                }
+
+                if let selected, points.indices.contains(selected) {
+                    deleteButton(at: points[selected], size: size)
                 }
             }
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { gesture in
-                        if dragIndex == nil {
-                            dragIndex = nearest(to: gesture.location, size: size)
-                            MHaptic.light()
+                SpatialTapGesture()
+                    .onEnded { value in
+                        // 只有曲线本身可交互：点已有点 = 选中，点曲线 = 新增，
+                        // 框内其余位置不响应点击，纵向拖动照常滚动面板。
+                        if let index = nearest(to: value.location, size: size) {
+                            select(index)
+                        } else if isNearCurve(value.location, size: size) {
+                            addPointOnCurve(x: Double(value.location.x / max(1, size.width)))
                         }
-                        guard let index = dragIndex, index > 0, index < points.count - 1 else { return }
-                        let x = min(1, max(0, gesture.location.x / size.width))
-                        let y = min(1, max(0, 1 - gesture.location.y / size.height))
-                        let low = points[index - 1].x + 0.03
-                        let high = points[index + 1].x - 0.03
-                        points[index] = CGPoint(x: min(high, max(low, x)), y: y)
                     }
-                    .onEnded { _ in dragIndex = nil }
             )
             .overlay(
                 RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
                     .strokeBorder(MColor.hairline, lineWidth: 1)
             )
         }
+    }
+
+    // MARK: 点
+
+    private func pointHandle(index: Int, point: CGPoint, size: CGSize) -> some View {
+        let position = projected(point, size: size)
+        let active = selected == index || dragIndex == index
+        return ZStack {
+            if active {
+                Circle()
+                    .strokeBorder(MColor.brass.opacity(0.5), lineWidth: 1)
+                    .frame(width: 17, height: 17)
+            }
+            Circle()
+                .fill(active ? MColor.brassHigh : Color(hex: 0xF1ECE3))
+                .frame(width: active ? 11 : 9, height: active ? 11 : 9)
+                .overlay(Circle().strokeBorder(Color.black.opacity(0.42), lineWidth: 1))
+                .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+        }
+        // 可交互区只围着圆点；框内其他位置不挂手势，纵向拖动照常滚动面板。
+        .frame(width: 44, height: 44)
+        .contentShape(Circle())
+        .position(position)
+        .gesture(dragGesture(index: index, size: size))
+    }
+
+    private func dragGesture(index: Int, size: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { gesture in
+                guard points.indices.contains(index) else { return }
+                if dragIndex == nil {
+                    dragIndex = index
+                    selected = index
+                    lastTick = points[index]
+                    MHaptic.light()
+                }
+                let rawX = Double(gesture.location.x / max(1, size.width))
+                let rawY = Double(1 - gesture.location.y / max(1, size.height))
+                let low = index > 0 ? Double(points[index - 1].x) + 0.03 : xInset
+                let high = index < points.count - 1 ? Double(points[index + 1].x) - 0.03 : 1 - xInset
+                // 相邻两点过近时保持原位，绝不允许拖动把顺序拖反。
+                let x = high > low ? min(max(rawX, low), high) : Double(points[index].x)
+                let y = min(max(rawY, 0), 1)
+                points[index] = CGPoint(x: x, y: y)
+                // 每移动约 2% 给一次轻震动，既跟手又不会震成蜂鸣器。
+                if abs(x - Double(lastTick.x)) >= 0.02 || abs(y - Double(lastTick.y)) >= 0.02 {
+                    lastTick = CGPoint(x: x, y: y)
+                    MHaptic.tick()
+                }
+            }
+            .onEnded { _ in
+                dragIndex = nil
+            }
+    }
+
+    /// 在曲线上新增一个点：y 取当前曲线在该 x 的高度，之后靠拖动塑形。
+    private func addPointOnCurve(x rawX: Double) {
+        guard points.count < maxPoints else { return }
+        let x = min(max(rawX, xInset), 1 - xInset)
+        // x 方向留出最小间距，避免两个点叠在同一列导致拖动互相卡住。
+        if let crowded = points.enumerated().first(where: { abs(Double($0.element.x) - x) < 0.035 }) {
+            selected = crowded.offset
+            MHaptic.tick()
+            return
+        }
+        let y = min(max(curveValue(at: x), 0), 1)
+        points.append(CGPoint(x: x, y: y))
+        points.sort { $0.x < $1.x }
+        selected = points.firstIndex { abs($0.x - x) < 1e-9 }
+        MHaptic.tick()
+    }
+
+    /// 曲线在归一化 x 处的线性读数（用于判断点击是否落在曲线上、以及新点的初始 y）。
+    private func curveValue(at x: Double) -> Double {
+        var knots: [(x: Double, y: Double)] = [(0, 0)]
+        knots.append(contentsOf: points.sorted { $0.x < $1.x }
+            .map { (Double($0.x), Double($0.y)) })
+        knots.append((1, 1))
+        let clamped = min(max(x, 0), 1)
+        for index in 1..<knots.count {
+            let left = knots[index - 1]
+            let right = knots[index]
+            if clamped >= left.x, clamped <= right.x {
+                let dx = right.x - left.x
+                guard dx > 1e-9 else { return right.y }
+                let t = (clamped - left.x) / dx
+                return left.y + (right.y - left.y) * t
+            }
+        }
+        return clamped
+    }
+
+    private func isNearCurve(_ location: CGPoint, size: CGSize) -> Bool {
+        let x = min(max(Double(location.x / max(1, size.width)), 0), 1)
+        let curveY = (1 - curveValue(at: x)) * Double(size.height)
+        return abs(curveY - Double(location.y)) <= 18
+    }
+
+    private func select(_ index: Int) {
+        guard points.indices.contains(index) else { return }
+        guard selected != index else { return }
+        selected = index
+        MHaptic.tick()
+    }
+
+    private func removePoint(_ index: Int) {
+        guard points.indices.contains(index) else { return }
+        MHaptic.medium()
+        points.remove(at: index)
+        selected = nil
+    }
+
+    // MARK: 删除按钮
+
+    private func deleteButton(at point: CGPoint, size: CGSize) -> some View {
+        let position = projected(point, size: size)
+        let x = min(max(position.x + 20, 16), max(16, size.width - 16))
+        let y = min(max(position.y - 20, 16), max(16, size.height - 16))
+        return Button {
+            if let selected { removePoint(selected) }
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(MColor.text1)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(MColor.surface3.opacity(0.96)))
+                .overlay(Circle().strokeBorder(MColor.hairlineStrong, lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 4, y: 1)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .position(x: x, y: y)
+        .accessibilityLabel("删除曲线点")
+    }
+
+    // MARK: 绘制
+
+    private func projected(_ point: CGPoint, size: CGSize) -> CGPoint {
+        CGPoint(x: point.x * size.width, y: (1 - point.y) * size.height)
     }
 
     private func grid(size: CGSize) -> some View {
@@ -1269,10 +1417,13 @@ struct MCurveEditor: View {
         .stroke(Color.white.opacity(0.12), style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
     }
 
+    /// 曲线始终以 (0,0)、(1,1) 为端点；用户点只作为中间控制点。
     private func curvePath(size: CGSize) -> Path {
         var path = Path()
-        guard points.count > 1 else { return path }
-        let mapped = points.map { CGPoint(x: $0.x * size.width, y: (1 - $0.y) * size.height) }
+        let sorted = points.sorted { $0.x < $1.x }
+        var mapped = [CGPoint(x: 0, y: size.height)]
+        mapped.append(contentsOf: sorted.map { projected($0, size: size) })
+        mapped.append(CGPoint(x: size.width, y: 0))
         path.move(to: mapped[0])
         for i in 0..<(mapped.count - 1) {
             let p0 = mapped[max(i - 1, 0)]
@@ -1289,10 +1440,11 @@ struct MCurveEditor: View {
     private func nearest(to location: CGPoint, size: CGSize) -> Int? {
         var best: (index: Int, distance: CGFloat)? = nil
         for (index, point) in points.enumerated() {
-            let dx = point.x * size.width - location.x
-            let dy = (1 - point.y) * size.height - location.y
+            let target = projected(point, size: size)
+            let dx = target.x - location.x
+            let dy = target.y - location.y
             let distance = sqrt(dx * dx + dy * dy)
-            if distance < 34 {
+            if distance <= hitRadius {
                 if best == nil || distance < best!.distance {
                     best = (index, distance)
                 }

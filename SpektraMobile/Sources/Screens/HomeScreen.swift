@@ -7,6 +7,7 @@ struct HomeScreen: View {
     let onOpenDevelop: (MPhoto) -> Void
     let onOpenGrade: (MPhoto) -> Void
     let onOpenCamera: () -> Void
+    let onOpenSettings: () -> Void
     let onToast: (String) -> Void
 
     @State private var filter: HomeFilter = .all
@@ -16,6 +17,11 @@ struct HomeScreen: View {
     @State private var didDebugOpen = false
     @State private var searchOpen = false
     @State private var query = ""
+    /// 多选：主页右上角「…」进入，点照片勾选，底部执行收藏 / 从相册删除。
+    @State private var selecting = false
+    @State private var selectedIDs: Set<String> = []
+    /// 重置调色的二次确认目标。
+    @State private var resetTarget: MPhoto?
     @FocusState private var searchFocused: Bool
     @Environment(\.mSafeInsets) private var insets
 
@@ -38,13 +44,34 @@ struct HomeScreen: View {
                 .refreshable { await engine.refreshAssets() }
             }
 
-            bottomBar
+            if selecting {
+                selectionBar
+            } else {
+                bottomBar
+            }
 
             if let photo = actionPhoto {
                 photoActions(for: photo)
             }
         }
         .background(MColor.app)
+        .alert(
+            "重置这张照片的调色？",
+            isPresented: Binding(
+                get: { resetTarget != nil },
+                set: { if !$0 { resetTarget = nil } }
+            ),
+            presenting: resetTarget
+        ) { photo in
+            Button("取消", role: .cancel) {}
+            Button("重置", role: .destructive) {
+                engine.resetEdits(photoID: photo.id)
+                withAnimation(MMotion.drawer) { actionPhoto = nil }
+                onToast("已还原到最初状态")
+            }
+        } message: { _ in
+            Text("显影参数、胶片相纸与片边都会回到导入时的状态，且无法撤销。")
+        }
         .fileImporter(
             isPresented: $folderPickerOpen,
             allowedContentTypes: [.folder, .rawImage, .image],
@@ -74,7 +101,7 @@ struct HomeScreen: View {
                 Circle()
                     .fill(MColor.brass)
                     .frame(width: 4, height: 4)
-                Text("SPEKTRAFILM")
+                Text("SPEKTRAFILMOLTRA")
                     .font(.mSans(8, .semibold))
                     .tracking(2.0)
                     .foregroundStyle(MColor.text4)
@@ -116,6 +143,28 @@ struct HomeScreen: View {
                     .frame(maxWidth: .infinity)
                     .background(Capsule().fill(MColor.surface1))
                     .overlay(Capsule().strokeBorder(MColor.hairline, lineWidth: 1))
+                } else if selecting {
+                    Text("已选 \(selectedIDs.count) 张")
+                        .font(.pageTitle)
+                        .tracking(0.3)
+                        .foregroundStyle(MColor.text1)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 0)
+
+                    Button {
+                        MHaptic.tick()
+                        exitSelection()
+                    } label: {
+                        Text("完成")
+                            .font(.mSans(12, .semibold))
+                            .foregroundStyle(MColor.brass)
+                            .padding(.horizontal, 14)
+                            .frame(height: 34)
+                            .background(Capsule().fill(MColor.brassWash))
+                            .overlay(Capsule().strokeBorder(MColor.brass.opacity(0.25), lineWidth: 1))
+                    }
+                    .buttonStyle(MPressStyle(scale: 0.94))
                 } else {
                     Text("照片库")
                         .font(.pageTitle)
@@ -123,6 +172,15 @@ struct HomeScreen: View {
                         .foregroundStyle(MColor.text1)
 
                     Spacer(minLength: 0)
+
+                    MCircleIconButton(icon: "arrow.up.arrow.down", size: 13) {
+                        MHaptic.tick()
+                        withAnimation(MMotion.state) {
+                            sortMode = sortMode == .recent ? .filename : .recent
+                        }
+                    }
+                    .accessibilityLabel("排序方式")
+                    .accessibilityValue(sortMode.title)
 
                     MCircleIconButton(icon: "magnifyingglass", size: 15) {
                         withAnimation(MMotion.state) {
@@ -132,8 +190,16 @@ struct HomeScreen: View {
                     }
 
                     Menu {
-                        Button("最近导入") { sortMode = .recent }
-                        Button("文件名") { sortMode = .filename }
+                        Button {
+                            beginSelection()
+                        } label: {
+                            Label("选择", systemImage: "checkmark.circle")
+                        }
+                        Button {
+                            onOpenSettings()
+                        } label: {
+                            Label("设置", systemImage: "gearshape")
+                        }
                     } label: {
                         Image(systemName: "ellipsis")
                             .font(.system(size: 15, weight: .medium))
@@ -250,7 +316,11 @@ struct HomeScreen: View {
                     asset: item.element,
                     index: item.offset + 1,
                     busy: engine.importingAssetID == item.element.id,
+                    selectionMode: selecting,
+                    selected: selectedIDs.contains(item.element.id),
+                    favorite: engine.isFavorite(item.element),
                     onOpen: { open(item.element) },
+                    onToggleSelect: { toggleSelection(item.element.id) },
                     onLongPress: {
                         guard let photo = item.element.photo else { return }
                         MHaptic.medium()
@@ -281,13 +351,6 @@ struct HomeScreen: View {
                 .overlay(Capsule().strokeBorder(MColor.hairline, lineWidth: 1))
 
                 Spacer(minLength: 0)
-
-                MCircleIconButton(icon: "arrow.up.arrow.down", size: 13, frame: 42) {
-                    MHaptic.tick()
-                    withAnimation(MMotion.state) {
-                        sortMode = sortMode == .recent ? .filename : .recent
-                    }
-                }
 
                 Button {
                     MHaptic.tick()
@@ -324,6 +387,151 @@ struct HomeScreen: View {
         )
     }
 
+    // MARK: - 多选操作
+
+    private var selectionBar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(MColor.text3)
+                Text("已选 \(selectedIDs.count)")
+                    .font(.mSans(10, .medium).monospacedDigit())
+                    .foregroundStyle(MColor.text3)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 42)
+            .background(Capsule().fill(MColor.surface1.opacity(0.92)))
+            .overlay(Capsule().strokeBorder(MColor.hairline, lineWidth: 1))
+
+            Spacer(minLength: 0)
+
+            Button {
+                MHaptic.tick()
+                toggleFavoriteSelected()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: allSelectedFavorited ? "star.slash" : "star")
+                        .font(.system(size: 12, weight: .medium))
+                    Text(allSelectedFavorited ? "取消收藏" : "收藏")
+                        .font(.mSans(11, .semibold))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(canFavoriteSelected ? MColor.brass : MColor.text4)
+                .padding(.horizontal, 14)
+                .frame(height: 42)
+                .background(Capsule().fill(MColor.surface1.opacity(0.92)))
+                .overlay(Capsule().strokeBorder(
+                    canFavoriteSelected ? MColor.brass.opacity(0.28) : MColor.hairline,
+                    lineWidth: 1
+                ))
+                .contentShape(Capsule())
+            }
+            .buttonStyle(MPressStyle(scale: 0.95))
+            .disabled(!canFavoriteSelected)
+            .opacity(canFavoriteSelected ? 1 : 0.5)
+
+            Button {
+                MHaptic.medium()
+                deleteSelected()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 12, weight: .medium))
+                    Text("删除")
+                        .font(.mSans(11, .semibold))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(MColor.danger)
+                .padding(.horizontal, 14)
+                .frame(height: 42)
+                .background(Capsule().fill(MColor.surface1.opacity(0.92)))
+                .overlay(Capsule().strokeBorder(MColor.danger.opacity(0.32), lineWidth: 1))
+                .contentShape(Capsule())
+            }
+            .buttonStyle(MPressStyle(scale: 0.95))
+            .disabled(selectedIDs.isEmpty)
+            .opacity(selectedIDs.isEmpty ? 0.5 : 1)
+        }
+        .frame(height: 46)
+        .padding(.horizontal, MMetric.pageMargin)
+        .padding(.top, 10)
+        .padding(.bottom, insets.bottom)
+        .background(
+            LinearGradient(
+                colors: [MColor.app.opacity(0), MColor.app.opacity(0.94), MColor.app],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .allowsHitTesting(false)
+        )
+    }
+
+    private var selectedAssets: [MLibraryAsset] {
+        sourceAssets.filter { selectedIDs.contains($0.id) }
+    }
+
+    private var canFavoriteSelected: Bool {
+        !selectedAssets.isEmpty
+    }
+
+    private var allSelectedFavorited: Bool {
+        canFavoriteSelected && selectedAssets.allSatisfy { engine.isFavorite($0) }
+    }
+
+    private func beginSelection() {
+        MHaptic.medium()
+        withAnimation(MMotion.state) {
+            selecting = true
+            selectedIDs.removeAll()
+        }
+    }
+
+    private func exitSelection() {
+        withAnimation(MMotion.state) {
+            selecting = false
+            selectedIDs.removeAll()
+        }
+    }
+
+    private func toggleSelection(_ id: String) {
+        withAnimation(MMotion.quick) {
+            if selectedIDs.contains(id) {
+                selectedIDs.remove(id)
+            } else {
+                selectedIDs.insert(id)
+            }
+        }
+    }
+
+    private func toggleFavoriteSelected() {
+        let target = !allSelectedFavorited
+        for asset in selectedAssets {
+            if let photo = asset.photo {
+                engine.setFavorite(photoID: photo.id, value: target)
+            } else {
+                engine.setAssetFavorite(assetID: asset.id, value: target)
+            }
+        }
+        onToast(target ? "已收藏 \(selectedIDs.count) 张" : "已取消收藏")
+    }
+
+    private func deleteSelected() {
+        let assets = selectedAssets
+        guard !assets.isEmpty else { return }
+        let assetIDs = assets.map(\.id)
+        let photoIDs = assets.compactMap { $0.photo?.id }
+        Task {
+            let count = await engine.deleteAssets(assetIDs: assetIDs, photoIDs: photoIDs)
+            if count > 0 {
+                onToast("已删除 \(count) 张")
+                exitSelection()
+            } else {
+                onToast("未删除照片")
+            }
+        }
+    }
+
     /// 底部居中的圆形拍照入口：黄铜光圈按钮。
     private var cameraEntry: some View {
         Button {
@@ -350,13 +558,6 @@ struct HomeScreen: View {
             }
             .frame(width: 60, height: 60)
             .shadow(color: .black.opacity(0.46), radius: 10, y: 4)
-            .overlay(alignment: .topTrailing) {
-                Circle()
-                    .fill(MColor.filmRed)
-                    .frame(width: 7, height: 7)
-                    .overlay(Circle().strokeBorder(MColor.app.opacity(0.55), lineWidth: 1))
-                    .offset(x: -4, y: 4)
-            }
         }
         .buttonStyle(MPressStyle(scale: 0.92))
         .accessibilityLabel("拍照")
@@ -436,6 +637,11 @@ struct HomeScreen: View {
                 labelRow(photo)
 
                 MHairline().padding(.leading, 20)
+
+                actionRow(icon: "arrow.counterclockwise", title: "重置调色") {
+                    MHaptic.light()
+                    resetTarget = photo
+                }
 
                 actionRow(icon: "trash", title: "从库中移除", danger: true) {
                     withAnimation(MMotion.drawer) {
@@ -687,21 +893,23 @@ struct HomeScreen: View {
 
     // MARK: - 数据
 
-    /// 主页数据源：相册里所有 RAW；没有相册权限时退化为已入库照片。
-    private var visibleAssets: [MLibraryAsset] {
-        let source: [MLibraryAsset] = engine.assetPhase == .ready
+    /// 相册里所有 RAW；没有相册权限时退化为已入库照片。
+    private var sourceAssets: [MLibraryAsset] {
+        engine.assetPhase == .ready
             ? engine.assets
             : engine.photos.map {
                 MLibraryAsset(id: $0.id, filename: $0.filename, photo: $0, phAsset: nil)
             }
+    }
 
-        var filtered = source.filter { asset in
+    /// 主页可见数据源：在相册 RAW 上叠加筛选与搜索。
+    private var visibleAssets: [MLibraryAsset] {
+        var filtered = sourceAssets.filter { asset in
             let photo = asset.photo
             switch filter {
             case .all: return true
-            case .favorite: return photo?.favorite ?? false
+            case .favorite: return engine.isFavorite(asset)
             case .graded: return photo?.isGraded ?? false
-            case .raw: return true
             case .label(let label): return photo?.color == label
             }
         }
@@ -770,36 +978,63 @@ private struct MPhotoCard: View {
     let index: Int
     /// 正在取回原片（iCloud 下载 / 入库）。
     let busy: Bool
+    var selectionMode: Bool = false
+    var selected: Bool = false
+    var favorite: Bool = false
     let onOpen: () -> Void
+    var onToggleSelect: () -> Void = {}
     let onLongPress: () -> Void
 
-    @State private var longPressFired = false
-
     var body: some View {
-        Button {
-            if longPressFired {
-                longPressFired = false
-                return
-            }
-            MHaptic.light()
-            onOpen()
-        } label: {
-            imageStage
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .buttonStyle(MPressStyle(scale: 0.97))
-        .disabled(busy)
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.44)
-                .onEnded { _ in
-                    longPressFired = true
-                    onLongPress()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        longPressFired = false
-                    }
+        imageStage
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay {
+                if selectionMode, selected {
+                    RoundedRectangle(cornerRadius: MRadius.card, style: .continuous)
+                        .strokeBorder(MColor.brass, lineWidth: 1.6)
                 }
-        )
+            }
+            .overlay(alignment: .topTrailing) {
+                if selectionMode {
+                    selectionBadge
+                        .padding(8)
+                }
+            }
+            .contentShape(Rectangle())
+            // 长按用高优先级手势：识别后点击不再触发，松手不会误进入照片。
+            .highPriorityGesture(
+                LongPressGesture(minimumDuration: 0.45, maximumDistance: 14)
+                    .onEnded { _ in
+                        guard !selectionMode else { return }
+                        onLongPress()
+                    }
+            )
+            .onTapGesture {
+                if selectionMode {
+                    MHaptic.tick()
+                    onToggleSelect()
+                } else {
+                    MHaptic.light()
+                    onOpen()
+                }
+            }
+            .disabled(busy)
+    }
+
+    private var selectionBadge: some View {
+        ZStack {
+            Circle()
+                .fill(selected ? MColor.brass : Color.black.opacity(0.42))
+            Circle()
+                .strokeBorder(selected ? Color.clear : Color.white.opacity(0.7), lineWidth: 1.2)
+            if selected {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(MColor.brassInk)
+            }
+        }
+        .frame(width: 22, height: 22)
+        .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
     }
 
     private var imageStage: some View {
@@ -894,7 +1129,7 @@ private struct MPhotoCard: View {
 
                     Spacer()
 
-                    if asset.photo?.favorite == true {
+                    if favorite {
                         Image(systemName: "star.fill")
                             .font(.system(size: 8, weight: .medium))
                             .foregroundStyle(MColor.brass)
@@ -978,12 +1213,12 @@ private struct MAssetThumb: View {
 // MARK: - 筛选 / 排序
 
 enum HomeFilter: Identifiable, Hashable, CaseIterable {
-    case all, favorite, graded, raw, label(MColorLabel)
+    case all, favorite, graded, label(MColorLabel)
 
     var id: String { title }
 
     static var allCases: [HomeFilter] {
-        [.all, .favorite, .graded, .raw]
+        [.all, .favorite, .graded]
     }
 
     var title: String {
@@ -991,7 +1226,6 @@ enum HomeFilter: Identifiable, Hashable, CaseIterable {
         case .all: return "全部"
         case .favorite: return "收藏"
         case .graded: return "已调色"
-        case .raw: return "RAW"
         case .label(let label): return label.title
         }
     }

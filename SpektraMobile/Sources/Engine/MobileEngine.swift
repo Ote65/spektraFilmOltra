@@ -35,13 +35,17 @@ final class MobileEngine: ObservableObject {
     @Published private(set) var isImporting = false
     /// 正在按需取原片的资产 id（iCloud 下载 + 入库），用于格子上显示转圈。
     @Published private(set) var importingAssetID: String?
+    /// 未入库相册 RAW 的收藏：只记在本地偏好里，不强迫用户为了收藏先把原片复制进库。
+    @Published private(set) var assetFavorites: Set<String> = []
 
     private let thumbnailQueue = DispatchQueue(label: "spektra.mobile.thumb", qos: .utility)
+    private static let assetFavoritesKey = "mobile.asset.favorites"
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Spektrafilm/MobileLibrary", isDirectory: true)
         store = LibraryStore(root: base)
+        assetFavorites = Set(UserDefaults.standard.stringArray(forKey: Self.assetFavoritesKey) ?? [])
         refreshPhotos()
         warmThumbnails()
         importDebugFileIfNeeded()
@@ -162,6 +166,11 @@ final class MobileEngine: ObservableObject {
         defer { try? FileManager.default.removeItem(at: named) }
 
         let report = importPhotos([named])
+        // 入库前收藏过这张相册 RAW：把收藏状态接到编辑记录上，避免看起来丢了。
+        if let id = report.firstID, assetFavorites.contains(assetID) {
+            setFavorite(photoID: id, value: true)
+            setAssetFavorite(assetID: assetID, value: false)
+        }
         return report.firstID
     }
 
@@ -222,8 +231,80 @@ final class MobileEngine: ObservableObject {
         refreshPhotos()
     }
 
+    /// 从系统相册删除选中的 RAW。系统会自己弹一次删除确认；
+    /// 成功后再清掉库里的编辑记录与原图副本，避免主页残留「已入库」条目。
+    func deleteAssets(assetIDs: [String], photoIDs: [String]) async -> Int {
+        guard !assetIDs.isEmpty else { return 0 }
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: assetIDs, options: nil)
+        guard fetched.count > 0 else { return 0 }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.deleteAssets(fetched)
+            }
+        } catch {
+            NSLog("MDelete failed %@", error.localizedDescription)
+            return 0
+        }
+        for id in photoIDs {
+            remove(photoID: id)
+        }
+        for assetID in assetIDs where assetFavorites.contains(assetID) {
+            setAssetFavorite(assetID: assetID, value: false)
+        }
+        await refreshAssets()
+        return fetched.count
+    }
+
+    /// 把显影/胶片/相纸/片边全部还原到导入时的初始状态。
+    /// 只有 RAW 解码所需的输入色彩信息保留，否则原片会读不出来。
+    func resetEdits(photoID: String) {
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        var restored: PhotoEdit
+        if let data = photo.initialEditData,
+           let decoded = try? JSONDecoder().decode(PhotoEdit.self, from: data) {
+            restored = decoded
+        } else {
+            restored = PhotoEdit()
+            restored.io.inputColorSpace = photo.edit.io.inputColorSpace
+            restored.io.inputCCTFDecoding = photo.edit.io.inputCCTFDecoding
+        }
+        restored.io.outputColorSpace = photo.edit.io.outputColorSpace
+        restored.io.outputCCTFEncoding = photo.edit.io.outputCCTFEncoding
+        photo.edit = restored
+        photo.quickBaselineData = nil
+        photo.borderData = nil
+
+        // 缩略图是按旧参数显影的，清掉后按初始状态重建。
+        // 缓存键用的是缩略图绝对路径，必须按 URL 清，否则会继续显示旧图。
+        if photo.thumbnailPath != nil, let url = store.thumbnailURL(for: photo) {
+            MThumbnailCache.shared.remove(path: url.path)
+            try? FileManager.default.removeItem(at: url)
+        }
+        photo.thumbnailPath = nil
+        try? store.update(photo)
+        refreshPhotos()
+        if let refreshed = store.photos.first(where: { $0.id == photoID }) {
+            generateThumbnail(for: refreshed)
+        }
+    }
+
     func setFavorite(photoID: String, value: Bool) {
         mutate(photoID: photoID) { $0.favorite = value }
+    }
+
+    /// 未入库相册 RAW 的收藏：只落本地偏好，不在相册或库里产生任何改动。
+    func setAssetFavorite(assetID: String, value: Bool) {
+        if value {
+            assetFavorites.insert(assetID)
+        } else {
+            assetFavorites.remove(assetID)
+        }
+        UserDefaults.standard.set(Array(assetFavorites).sorted(),
+                                  forKey: Self.assetFavoritesKey)
+    }
+
+    func isFavorite(_ asset: MLibraryAsset) -> Bool {
+        asset.photo?.favorite ?? assetFavorites.contains(asset.id)
     }
 
     func setColorLabel(photoID: String, label: MColorLabel?) {
@@ -246,12 +327,15 @@ final class MobileEngine: ObservableObject {
         } else {
             exposure = String(format: "%+.1f EV", ev)
         }
+        let sideways = photo.edit.rotationTurns % 2 == 1
+        let displayWidth = sideways ? photo.height : photo.width
+        let displayHeight = sideways ? photo.width : photo.height
         return MPhoto(
             id: photo.id,
             filename: photo.filename,
             film: MobileCatalog.filmName(photo.edit.filmStock),
             paper: MobileCatalog.paperName(photo.edit.printStock),
-            dimensions: photo.width > 0 ? "\(photo.width)×\(photo.height)" : "",
+            dimensions: displayWidth > 0 ? "\(displayWidth)×\(displayHeight)" : "",
             isRaw: photo.isRaw,
             favorite: photo.favorite,
             color: photo.colorLabel.flatMap(MColorLabel.init(rawValue:)),
@@ -275,12 +359,20 @@ final class MobileEngine: ObservableObject {
         let options = edit.rawDecoderOptions()
         thumbnailQueue.async { [weak self] in
             guard let self else { return }
-            guard let loaded = try? ImageLoader.load(url: url, maxSize: 320, rawOptions: options),
+            guard let loaded = try? ImageLoader.load(url: url, maxSize: 320, rawOptions: options,
+                                                     rotationTurns: edit.rotationTurns),
                   var params = try? edit.runtimeParams() else { return }
             params.io.inputColorSpace = loaded.colorSpace
             params.io.inputCCTFDecoding = loaded.cctfDecoding
             let small = Resize.smallPreview(loaded.image, maxSize: 320)
-            let output = SimulationPipeline(params: params, keepTaps: false).process(small).rgbOut
+            var output = SimulationPipeline(params: params, keepTaps: false).process(small).rgbOut
+            if edit.monochrome {
+                // 缩略图跟随显影台的黑白模式，避免主页仍显示彩色预览。
+                output = output.map { pixel in
+                    let value = pixel.x * 0.2126 + pixel.y * 0.7152 + pixel.z * 0.0722
+                    return Vec3(value, value, value)
+                }
+            }
             Task { @MainActor in
                 try? self.store.writeThumbnail(id: id, image: output)
                 self.refreshPhotos()
@@ -304,8 +396,27 @@ final class MobileEngine: ObservableObject {
     func closeDevelop() {
         developSession?.finish()
         developSession?.cancel()
+        let photoID = developSession?.photoID
         developSession = nil
         refreshPhotos()
+        // 回主页前按最终显影参数重建缩略图，黑白预设或换片后主页不再显示旧观感。
+        if let photoID {
+            regenerateThumbnail(photoID: photoID)
+        }
+    }
+
+    private func regenerateThumbnail(photoID: String) {
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        if photo.thumbnailPath != nil, let url = store.thumbnailURL(for: photo) {
+            MThumbnailCache.shared.remove(path: url.path)
+            try? FileManager.default.removeItem(at: url)
+        }
+        photo.thumbnailPath = nil
+        try? store.update(photo)
+        refreshPhotos()
+        if let refreshed = store.photos.first(where: { $0.id == photoID }) {
+            generateThumbnail(for: refreshed)
+        }
     }
 
     // MARK: - 调色会话

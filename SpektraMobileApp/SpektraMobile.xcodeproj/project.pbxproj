@@ -35,6 +35,8 @@
 		5E4A3B27AE8A660896679EE6 /* MobileComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFEB333890C0D09618141435 /* MobileComponents.swift */; };
 		6067EE188061AFA44AE6E30E /* DevelopScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */; };
 		F1B0A0013C0DE00000000001 /* FilmBorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1B0A0013C0DE00000000002 /* FilmBorder.swift */; };
+		FA5E0000000000000000B0A1 /* SettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA5E0000000000000000B0A2 /* SettingsScreen.swift */; };
+		FA5E0000000000000000B0B1 /* Watermark.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA5E0000000000000000B0B2 /* Watermark.swift */; };
 		CA5E000000000000000000B1 /* CameraScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA5E000000000000000000A1 /* CameraScreen.swift */; };
 		CA5E000000000000000000B2 /* MCameraSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA5E000000000000000000A2 /* MCameraSession.swift */; };
 		66D070ACC8D57BA6A57610F3 /* MPlatformImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8680D530984F0FFC3DB0DB5 /* MPlatformImage.swift */; };
@@ -151,6 +153,8 @@
 		FC0E0B7CF1C19335D215739A /* ParamsDigest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParamsDigest.swift; sourceTree = "<group>"; };
 		FFEB333890C0D09618141435 /* MobileComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileComponents.swift; sourceTree = "<group>"; };
 		F1B0A0013C0DE00000000002 /* FilmBorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilmBorder.swift; sourceTree = "<group>"; };
+		FA5E0000000000000000B0A2 /* SettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsScreen.swift; sourceTree = "<group>"; };
+		FA5E0000000000000000B0B2 /* Watermark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Watermark.swift; sourceTree = "<group>"; };
 		CA5E000000000000000000A1 /* CameraScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraScreen.swift; sourceTree = "<group>"; };
 		CA5E000000000000000000A2 /* MCameraSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCameraSession.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -229,6 +233,8 @@
 				C0A755E3FD7A42CA434C6E5F /* GradeScreen.swift */,
 				2B4C8A0F0875D1B13367B022 /* HomeScreen.swift */,
 				890BCF63EE3D7458482705CC /* MobileRootView.swift */,
+				FA5E0000000000000000B0A2 /* SettingsScreen.swift */,
+				FA5E0000000000000000B0B2 /* Watermark.swift */,
 			);
 			path = Screens;
 			sourceTree = "<group>";
@@ -518,6 +524,8 @@
 				D7E0D191AA1C984B7EDC2993 /* MobileCatalog.swift in Sources */,
 				5E4A3B27AE8A660896679EE6 /* MobileComponents.swift in Sources */,
 				F1B0A0013C0DE00000000001 /* FilmBorder.swift in Sources */,
+				FA5E0000000000000000B0A1 /* SettingsScreen.swift in Sources */,
+				FA5E0000000000000000B0B1 /* Watermark.swift in Sources */,
 				FAEC0537770F0FDE1AD82B2B /* MobileDevelopSession.swift in Sources */,
 				5EEDAA0000000000000000B2 /* PhotoLibraryExport.swift in Sources */,
 				54A36A910D1B727D9BDA0A2A /* MobileEngine.swift in Sources */,

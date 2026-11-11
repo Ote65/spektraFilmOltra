@@ -1,6 +1,12 @@
 import Foundation
 import SwiftUI
 import os
+import CoreGraphics
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 
 /// 单张照片的显影会话：真实 RAW 解码 → 物理显影 → 双层预览（LUT 预测 + 精算）+ 参数映射 + 撤销。
 /// 只写 `PhotoEdit` 的既有字段，不改任何算法。
@@ -36,6 +42,8 @@ final class MobileDevelopSession: ObservableObject {
     @Published private(set) var filmID: String
     @Published private(set) var paperID: String
     @Published private(set) var canUndo = false
+    /// 黑白模式：显影结果之后的亮度归一，只属于显影预设，不写入核心参数。
+    @Published private(set) var isMonochrome = false
 
     // MARK: - 标识
 
@@ -94,16 +102,18 @@ final class MobileDevelopSession: ObservableObject {
     private var previewEdge: Int {
         let base = originalLongEdge > 0 ? originalLongEdge : loadedEdge
         guard base > 0 else { return 1280 }
-        return max(160, Int((Double(base) * previewScale).rounded()))
+        let scaled = Int((Double(base) * previewScale).rounded())
+        // 1/4 档按 12 MP 原图算只有 1008 长边，铺到 3x 屏会被放大 1.3 倍读成锯齿；
+        // 因此 1/4 及以上至少给到屏幕宽 1280，1/8 仍保留给极速预览。
+        let floorEdge = previewScale >= 0.25 ? 1280 : 160
+        return min(base, max(scaled, floorEdge))
     }
-    /// 拖动期的预测帧：与 Swift 主线一致，长边封顶 1000 px，保证跟手。
+    /// 拖动期的预测帧：长边按屏幕密度给到 1280，低于这个值在 3x 屏上放大后会读成锯齿。
     private var fastPreviewEdge: Int {
-        min(previewEdge, PreviewLUTService.maxPredictionEdge)
+        min(previewEdge, 1280)
     }
-    /// 交互预测用的低分辨率查找表：33³ 只做拖动期的过渡画面，停手后仍由全精度精算替换。
-    /// 桌面侧的 ΔE00 门禁（p99 ≤ 1.0）是在 65³ 上测的；移动端为守住拖动延迟用 33³，
-    /// 预测帧因此不是门禁口径的交付结果——界面用 `isPredicted` 标注，交付一律以精算帧为准。
-    private let fastResolution = 33
+    /// 交互预测用的查找表：65³ 与桌面门禁同档，33³ 在暗部渐变上会出现肉眼可见的色阶断层。
+    private let fastResolution = 65
     /// 停手后多久回落精算帧。精算已从 1.69 s 降到 0.91 s（1280 预览），
     /// 防抖可以从 0.5 s 收紧到 0.32 s，停手到清晰画面的总延迟从 ~2.2 s 降到 ~1.2 s。
     private let settleDelay: TimeInterval = 0.32
@@ -188,12 +198,14 @@ final class MobileDevelopSession: ObservableObject {
         phaseProgress = 0
         // 解码参数在主线程取好，后台队列只做像素工作。
         let options = rawOptions()
+        let rotation = edit.rotationTurns
         armLoadTimeout(token: token)
         loadQueue.async { [weak self] in
             do {
                 let loaded = try ImageLoader.load(
-                    url: originalURL, maxSize: maxSize, rawOptions: options)
-                let preview = Resize.smallPreview(loaded.image, maxSize: maxSize)
+                    url: originalURL, maxSize: maxSize, rawOptions: options,
+                    rotationTurns: rotation)
+                let preview = Resize.longEdge(loaded.image, maxSize: maxSize)
                 let display = Self.displayImage(preview, colorSpace: loaded.colorSpace,
                                                 cctfDecoding: loaded.cctfDecoding)
                 let original = PreviewRenderer.cgImage(from: display)
@@ -276,6 +288,29 @@ final class MobileDevelopSession: ObservableObject {
         } else {
             schedulePreview(immediate: true)
         }
+    }
+
+    /// 顺时针旋转 90°：纯几何变换，直接转动已解码缓冲与预览图，不重跑显影。
+    func rotateClockwise() {
+        guard isLoaded, let image else { return }
+        pushUndo(key: "rotate")
+        edit.rotationTurns = (edit.rotationTurns + 1) % 4
+        self.image = image.rotatedClockwise(1)
+        // 丢弃在途的旧方向渲染结果，避免稍后回写成未旋转画面。
+        fastToken += 1
+        renderToken += 1
+        renderer.invalidate()
+        isRendering = false
+        phaseLabel = ""
+        phaseProgress = 0
+        if let previewImage, let rotated = previewImage.quarterTurnedClockwise {
+            self.previewImage = rotated
+            previewAspect = rotated.size.width / max(1, rotated.size.height)
+        }
+        if let originalImage, let rotated = originalImage.quarterTurnedClockwise {
+            self.originalImage = rotated
+        }
+        persistSoon()
     }
 
     // MARK: - RAW 解码参数
@@ -456,6 +491,68 @@ final class MobileDevelopSession: ObservableObject {
         schedulePreview()
     }
 
+    /// 黑白模式只影响最终显示/导出，不改核心显影参数。
+    func setMonochrome(_ value: Bool) {
+        guard value != edit.monochrome else { return }
+        pushUndo(key: "monochrome")
+        edit.monochrome = value
+        edit.quickIntents = quickIntents
+        isMonochrome = value
+        persistSoon()
+        schedulePreview()
+    }
+
+    /// 当前参数是否与某个显影预设完全一致。
+    func matches(_ preset: MDevelopPreset) -> Bool {
+        guard filmID == preset.filmID,
+              paperID == preset.paperID,
+              edit.monochrome == preset.monochrome,
+              abs(padY) <= 0.5 else { return false }
+        let axes = MobileCatalog.quickGroups.flatMap(\.axes)
+        for axis in axes {
+            let expected = preset.quick[axis.id] ?? axis.base
+            let actual = quickIntents[axis.id] ?? axis.base
+            if abs(expected - actual) > 1e-9 { return false }
+        }
+        return true
+    }
+
+    /// 套用显影预设：只写胶片、相纸、快速显影轴与黑白模式，
+    /// 先把快速派生字段回滚到基线再按预设重算，避免参数叠加漂移。
+    func applyDevelopPreset(_ preset: MDevelopPreset) {
+        pushUndo(key: "develop.preset")
+        var next = edit
+        next.filmStock = preset.filmID
+        next.printStock = preset.paperID
+        next.monochrome = preset.monochrome
+        if let scanFilm = Self.scanFilmForSelection(preset.filmID) {
+            next.io.scanFilm = scanFilm
+        }
+
+        quickIntents = preset.quick
+        next.quickIntents = quickIntents
+        next.camera.exposureCompensationEV = baseline.camera.exposureCompensationEV
+        next.enlarger.printExposure = baseline.enlarger.printExposure
+        next.enlarger.printExposureCompensation = baseline.enlarger.printExposureCompensation
+        next.enlarger.yFilterShift = baseline.enlarger.yFilterShift
+        next.enlarger.mFilterShift = baseline.enlarger.mFilterShift
+        next.printRender.densityCurvesMorph = baseline.printRender.densityCurvesMorph
+        next.filmRender.dirCouplers = baseline.filmRender.dirCouplers
+        next.filmRender.grain = baseline.filmRender.grain
+        next.scanner = baseline.scanner
+        for (control, q) in quickIntents where abs(q) > 1e-9 {
+            applyQuickMapping(id: control, q: q, edit: &next)
+        }
+
+        edit = next
+        filmID = preset.filmID
+        paperID = preset.paperID
+        isMonochrome = preset.monochrome
+        publishFromEdit()
+        persistNow()
+        schedulePreview()
+    }
+
     func resetQuick() {
         pushUndo(key: "reset.quick")
         quickIntents = [:]
@@ -559,12 +656,17 @@ final class MobileDevelopSession: ObservableObject {
         let destination = Self.exportURL(filename: filename, ext: ext)
         let sourceURL = originalURL
         let options = rawOptions()
+        let rotation = edit.rotationTurns
+        // 水印只在最终导出合成，不进入预览链路。
+        let watermark = MWatermarkStore.load()
+        let monochrome = edit.monochrome
         isExporting = true
         exportLabel = clampedNote
         exportQueue.async { [weak self] in
             // 导出按目标长边重新解码原图：预览缓存是缩小版，不能拿它放大。
             guard let loaded = try? ImageLoader.load(
-                url: sourceURL, maxSize: requested, rawOptions: options) else {
+                url: sourceURL, maxSize: requested, rawOptions: options,
+                rotationTurns: rotation) else {
                 Task { @MainActor [weak self] in
                     self?.isExporting = false
                     self?.exportLabel = ""
@@ -582,7 +684,16 @@ final class MobileDevelopSession: ObservableObject {
                     self?.exportLabel = Self.stageLabel(label)
                 }
             })
-            let output = result.rgbOut
+            var output = result.rgbOut
+            if monochrome {
+                output = Self.monochrome(output, colorSpace: colorSpace)
+            }
+            if watermark.enabled {
+                output = MWatermarkRenderer.composite(
+                    image: output, config: watermark,
+                    colorSpace: colorSpace, cctfEncoding: cctf
+                )
+            }
             do {
                 try FileManager.default.createDirectory(
                     at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -634,11 +745,14 @@ final class MobileDevelopSession: ObservableObject {
         let previewSpace = inputColorSpace
         let previewCCTF = inputCCTF
         let options = rawOptions()
+        let rotation = edit.rotationTurns
+        let monochrome = edit.monochrome
         loadQueue.async {
             var params = baseParams
             var source = previewImage
             if maxEdge > previewEdge,
-               let loaded = try? ImageLoader.load(url: url, maxSize: maxEdge, rawOptions: options) {
+               let loaded = try? ImageLoader.load(url: url, maxSize: maxEdge, rawOptions: options,
+                                                  rotationTurns: rotation) {
                 source = loaded.image
                 params.io.inputColorSpace = loaded.colorSpace
                 params.io.inputCCTFDecoding = loaded.cctfDecoding
@@ -649,7 +763,10 @@ final class MobileDevelopSession: ObservableObject {
             params.io.outputColorSpace = "ProPhoto RGB"
             params.io.outputCCTFEncoding = false
             renderer.render(params: params, image: source, maxSize: maxEdge) { outcome in
-                completion(outcome.image)
+                let result = monochrome
+                    ? Self.monochrome(outcome.image, colorSpace: "ProPhoto RGB")
+                    : outcome.image
+                completion(result)
             }
         }
     }
@@ -672,6 +789,7 @@ final class MobileDevelopSession: ObservableObject {
 
     /// 换片后在后台预烘预测表，首次拖滑杆不必等冷启动烘焙。
     private func prewarmLUT() {
+        guard MobileSettings.predictivePreviewEnabled else { return }
         guard var params = try? edit.runtimeParams(), !params.io.scanFilm else { return }
         params.io.inputColorSpace = inputColorSpace
         params.io.inputCCTFDecoding = inputCCTF
@@ -696,6 +814,21 @@ final class MobileDevelopSession: ObservableObject {
         if immediate {
             fastDirty = false
             renderAccurate()
+            return
+        }
+        // 关闭「双层预览预测」后不再出 LUT 预测帧：拖动期间保持上一帧，
+        // 停手后直接走真实物理精算。代价是拖动时没有即时反馈，换来决定性。
+        if !MobileSettings.predictivePreviewEnabled {
+            fastDirty = false
+            isRendering = true
+            phaseLabel = "显影中"
+            phaseProgress = 0
+            let settle = DispatchWorkItem { [weak self] in
+                self?.pendingSettle = nil
+                self?.renderAccurate()
+            }
+            pendingSettle = settle
+            DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay, execute: settle)
             return
         }
         isRendering = true
@@ -732,6 +865,8 @@ final class MobileDevelopSession: ObservableObject {
         isRendering = true
         phaseLabel = "显影中"
         phaseProgress = 0
+        let monochrome = edit.monochrome
+        let outputColorSpace = params.io.outputColorSpace
         renderer.render(
             params: params,
             image: image,
@@ -744,7 +879,10 @@ final class MobileDevelopSession: ObservableObject {
                 }
             }
         ) { [weak self] outcome in
-            let display = PreviewRenderer.cgImage(from: outcome.image)
+            let rgb = monochrome
+                ? Self.monochrome(outcome.image, colorSpace: outputColorSpace)
+                : outcome.image
+            let display = PreviewRenderer.cgImage(from: rgb)
             Task { @MainActor [weak self] in
                 guard let self, self.renderToken == token else { return }
                 if let display, !outcome.cancelled {
@@ -777,6 +915,7 @@ final class MobileDevelopSession: ObservableObject {
     }
 
     private func startFast() {
+        guard MobileSettings.predictivePreviewEnabled else { return }
         guard let image, var params = try? edit.runtimeParams(), !params.io.scanFilm else { return }
         params.io.inputColorSpace = inputColorSpace
         params.io.inputCCTFDecoding = inputCCTF
@@ -788,6 +927,7 @@ final class MobileDevelopSession: ObservableObject {
         let resolution = fastResolution
         // 交互近似参数在主线程取好，后台只做像素运算。
         let adjustments = previewAdjustments()
+        let monochrome = edit.monochrome
         fastInFlight = true
         fastDirty = false
         lutQueue.async { [weak self] in
@@ -814,7 +954,10 @@ final class MobileDevelopSession: ObservableObject {
             let adjusted = PreviewAdjustments.applyLinear(linear, params: adjustments)
             let encoded = PreviewLUTService.displayImage(fromLinear: adjusted)
             let display = PreviewAdjustments.applyDisplay(encoded, params: adjustments)
-            let cgImage = PreviewRenderer.cgImage(from: display)
+            let finalDisplay = monochrome
+                ? Self.monochrome(display, colorSpace: "sRGB")
+                : display
+            let cgImage = PreviewRenderer.cgImage(from: finalDisplay)
             Task { @MainActor [weak self] in
                 self?.finishFast(token: token, cgImage: cgImage)
             }
@@ -1153,6 +1296,7 @@ final class MobileDevelopSession: ObservableObject {
         proChoices = choices
         filmID = edit.filmStock
         paperID = edit.printStock
+        isMonochrome = edit.monochrome
     }
 
     private func pushUndo(key: String) {
@@ -1195,6 +1339,27 @@ final class MobileDevelopSession: ObservableObject {
 
     private func clamp(_ value: Double, _ low: Double, _ high: Double) -> Double {
         min(max(value, low), high)
+    }
+
+    /// 黑白模式：按目标色彩空间的亮度权重把 RGB 归一成灰。
+    /// 只发生在显影结果之后，不改变任何核心显影参数。
+    private nonisolated static func monochrome(_ image: ImageRGB, colorSpace: String) -> ImageRGB {
+        let weights = luminanceWeights(for: colorSpace)
+        return image.map { pixel in
+            let value = pixel.x * weights.0 + pixel.y * weights.1 + pixel.z * weights.2
+            return Vec3(value, value, value)
+        }
+    }
+
+    private nonisolated static func luminanceWeights(for colorSpace: String) -> (Double, Double, Double) {
+        switch colorSpace {
+        case "ProPhoto RGB":
+            return (0.2880402, 0.7118741, 0.0000857)
+        case "ACES2065-1":
+            return (0.2722287, 0.6740818, 0.0536895)
+        default:
+            return (0.2126, 0.7152, 0.0722)
+        }
     }
 
     private static func stageLabel(_ label: String) -> String {

@@ -102,6 +102,10 @@ final class MCameraSession: NSObject, ObservableObject {
     @Published private(set) var exposureBias: Double = 0
     /// nil 表示自动白平衡。
     @Published private(set) var temperature: Int?
+    /// 长按取景框后 AE/AF 进入锁定；此时上下拖动改 ISO。
+    @Published private(set) var isExposureLocked = false
+    /// 当前 ISO：未锁定时是设备的自动读数，锁定时是手动值。
+    @Published private(set) var isoValue: Float = 0
 
     /// 只有就绪且支持 RAW 时才允许按快门。
     var canCapture: Bool {
@@ -275,10 +279,11 @@ final class MCameraSession: NSObject, ObservableObject {
             photoOutput.isAppleProRAWEnabled = true
         }
 
-        // 优先 Bayer RAW（体积小、是真 RAW）；没有时才退回 Apple ProRAW。
+        // 优先 Apple ProRAW：它已经是去过马赛克的线性 DNG，显影时不用现场去马赛克，读取快好几倍；
+        // Bayer RAW 虽然更"原始"，但 12MP 去马赛克在 CIRAWFilter 里要几秒，用户会以为卡死。
         let formats = photoOutput.availableRawPhotoPixelFormatTypes
-        let bayer = formats.first { !AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
-        let picked = bayer ?? formats.first
+        let proRAW = formats.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
+        let picked = proRAW ?? formats.first
 
         self.device = device
         return picked
@@ -295,16 +300,58 @@ final class MCameraSession: NSObject, ObservableObject {
 
         // 只拍 RAW：qualityPrioritization 只对 processed 图有意义，设了反而会被系统拒绝，所以不设。
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: nil)
-        if hasFlash, photoOutput.supportedFlashModes.contains(flash.avMode) {
-            settings.flashMode = flash.avMode
+        // 闪光灯必须显式写到拍摄设置上才會触发；RAW 拍摄同样靠闪光灯照亮。
+        if hasFlash {
+            let mode = flash.avMode
+            if photoOutput.supportedFlashModes.contains(mode) {
+                if flash == .auto, !photoOutput.isFlashScene {
+                    // 自动档在亮场景不触发是系统行为；明示出来，免得以为开关坏了。
+                    message = "自动闪光：场景亮度足够，本次未触发闪光"
+                } else {
+                    settings.flashMode = mode
+                }
+            } else if flash == .on {
+                message = "当前设备或模式不支持强制闪光"
+            }
         }
 
         let delegate = MCaptureDelegate { [weak self] result in
             DispatchQueue.main.async { self?.finish(result) }
         }
         captureDelegate = delegate
-        photoOutput.capturePhoto(with: settings, delegate: delegate)
+
+        // 拍摄瞬间的重力方向决定出片朝向：横屏拍的 DNG 在快门那一刻就按重力转正，
+        // 显影台拿到的是正图，不需要再手动旋转。
+        let angle = Self.captureRotationAngle(for: UIDevice.current.orientation)
+        sessionQueue.async { [photoOutput] in
+            if let connection = photoOutput.connection(with: .video) {
+                if #available(iOS 17.0, *) {
+                    if connection.isVideoRotationAngleSupported(angle) {
+                        connection.videoRotationAngle = angle
+                    }
+                } else {
+                    let orientation: AVCaptureVideoOrientation =
+                        angle == 0 ? .landscapeRight :
+                        angle == 90 ? .portrait :
+                        angle == 180 ? .landscapeLeft : .portraitUpsideDown
+                    if connection.isVideoOrientationSupported {
+                        connection.videoOrientation = orientation
+                    }
+                }
+            }
+            photoOutput.capturePhoto(with: settings, delegate: delegate)
+        }
         #endif
+    }
+
+    /// UIDevice 重力方向 → 输出缓冲顺时针转角（AVCam 映射：设备 landscapeLeft 对应缓冲 0°）。
+    static func captureRotationAngle(for orientation: UIDeviceOrientation) -> CGFloat {
+        switch orientation {
+        case .landscapeLeft: return 0
+        case .landscapeRight: return 180
+        case .portraitUpsideDown: return 270
+        default: return 90
+        }
     }
 
     #if os(iOS)
@@ -395,8 +442,8 @@ final class MCameraSession: NSObject, ObservableObject {
             self.session.commitConfiguration()
 
             let formats = attached ? self.photoOutput.availableRawPhotoPixelFormatTypes : []
-            let bayer = formats.first { !AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
-            let picked = bayer ?? formats.first
+            let proRAW = formats.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
+            let picked = proRAW ?? formats.first
 
             // Spektra 只拍 RAW：前置没有 RAW 就把后置装回去。
             guard picked != nil else {
@@ -435,27 +482,37 @@ final class MCameraSession: NSObject, ObservableObject {
                 self.lens = .wide
                 self.exposureBias = 0
                 self.temperature = nil
+                self.isExposureLocked = false
                 self.flash = next.hasFlash ? self.flash : .off
             }
         }
         #endif
     }
 
-    /// 曝光补偿按 -1 → -0.5 → 0 → +0.5 → +1 循环。
+    /// 曝光补偿按 -1 → -0.5 → 0 → +0.5 → +1 循环（快捷按钮用）。
     func cycleExposure() {
-        #if os(iOS)
-        guard let device else { return }
         let steps: [Double] = [-1, -0.5, 0, 0.5, 1]
         let index = steps.firstIndex { abs($0 - exposureBias) < 0.01 } ?? 2
-        let next = steps[(index + 1) % steps.count]
+        setExposureBias(steps[(index + 1) % steps.count])
+    }
+
+    func setExposureBias(_ value: Double) {
+        #if os(iOS)
+        guard let device else { return }
+        let clamped = min(max(value, -3), 3)
         do {
             try device.lockForConfiguration()
-            device.setExposureTargetBias(Float(next))
+            if device.exposureMode == .locked,
+               device.isExposureModeSupported(.continuousAutoExposure) {
+                // AE 锁定后仍要能调曝光：恢复自动测光，对焦继续保持锁定。
+                device.exposureMode = .continuousAutoExposure
+            }
+            device.setExposureTargetBias(Float(clamped))
             device.unlockForConfiguration()
         } catch {
             return
         }
-        exposureBias = next
+        exposureBias = clamped
         #endif
     }
 
@@ -463,10 +520,11 @@ final class MCameraSession: NSObject, ObservableObject {
     func cycleTemperature() {
         let steps: [Int?] = [nil, 3200, 4300, 5600, 7000]
         let index = steps.firstIndex { $0 == temperature } ?? 0
-        apply(temperature: steps[(index + 1) % steps.count])
+        setTemperature(steps[(index + 1) % steps.count])
     }
 
-    private func apply(temperature kelvin: Int?) {
+    /// nil 表示回到自动白平衡；否则按开尔文锁定白平衡。
+    func setTemperature(_ kelvin: Int?) {
         #if os(iOS)
         guard let device else { return }
         do {
@@ -500,16 +558,98 @@ final class MCameraSession: NSObject, ObservableObject {
             try device.lockForConfiguration()
             if device.isFocusPointOfInterestSupported {
                 device.focusPointOfInterest = point
-                device.focusMode = .autoFocus
+                if device.isFocusModeSupported(.autoFocus) { device.focusMode = .autoFocus }
             }
             if device.isExposurePointOfInterestSupported {
                 device.exposurePointOfInterest = point
-                device.exposureMode = .autoExpose
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
             }
             device.unlockForConfiguration()
         } catch {
             return
         }
+        isExposureLocked = false
+        isoValue = device.iso
+        #endif
+    }
+
+    /// 长按取景框：锁定当前对焦与曝光，作为上下拖动改 ISO 的起点。
+    func lockFocusAndExposure(at point: CGPoint) {
+        #if os(iOS)
+        guard let device else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusPointOfInterestSupported {
+                device.focusPointOfInterest = point
+                if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+            }
+            if device.isExposurePointOfInterestSupported {
+                device.exposurePointOfInterest = point
+                if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
+            }
+            device.unlockForConfiguration()
+        } catch {
+            return
+        }
+        isExposureLocked = true
+        isoValue = device.iso
+        #endif
+    }
+
+    /// 未锁定时直接滑动：只锁曝光以便调 ISO，对焦保持当前模式。
+    func lockExposure() {
+        #if os(iOS)
+        guard let device else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
+            device.unlockForConfiguration()
+        } catch {
+            return
+        }
+        isExposureLocked = true
+        isoValue = device.iso
+        #endif
+    }
+
+    /// 锁定后上下拖动：保持当前快门，只改 ISO（夹在格式的感光度范围内）。
+    func setISO(_ value: Float) {
+        #if os(iOS)
+        guard let device, isExposureLocked, device.isExposureModeSupported(.custom) else { return }
+        let upper = min(device.activeFormat.maxISO, 6400)
+        let clamped = min(max(value, device.activeFormat.minISO), upper)
+        let duration = device.exposureDuration
+        do {
+            try device.lockForConfiguration()
+            device.setExposureModeCustom(duration: duration, iso: clamped, completionHandler: nil)
+            device.unlockForConfiguration()
+        } catch {
+            return
+        }
+        isoValue = clamped
+        #endif
+    }
+
+    /// 点按取景框时解除 AE/AF 锁定，回到连续自动。
+    func releaseLock() {
+        #if os(iOS)
+        guard let device else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            device.unlockForConfiguration()
+        } catch {
+            return
+        }
+        isExposureLocked = false
+        isoValue = device.iso
         #endif
     }
 }

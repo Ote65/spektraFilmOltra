@@ -26,7 +26,7 @@ struct MobileRootView: View {
 
     init() {
         let args = ProcessInfo.processInfo.arguments
-        var start: MScreen = .home
+        var start: MScreen = MobileSettings.launchScreen == .camera ? .camera : .home
         if let index = args.firstIndex(of: "--screen"), args.indices.contains(index + 1) {
             switch args[index + 1] {
             case "camera": start = .camera
@@ -60,16 +60,27 @@ struct MobileRootView: View {
                     openGrade(photo.id, entry: .direct, returningTo: .home)
                 },
                 onOpenCamera: openCamera,
+                onOpenSettings: openSettings,
                 onToast: showToast
             )
             .offset(x: screen == .home || screen == .camera ? 0 : -72)
             .allowsHitTesting(screen == .home)
 
             if screen == .camera {
-                // 相机只负责拍 RAW 并写进系统相册，入库交给主页的相册扫描。
-                CameraScreen(onClose: closeCamera)
+                // 拍完直接入库并进入这张照片的显影台；相册写入在相机页后台继续。
+                CameraScreen(onClose: closeCamera, onCaptured: openCaptured)
                     .transition(.opacity)
                     .zIndex(3)
+            }
+
+            if screen == .settings {
+                SettingsScreen(
+                    onBack: closeSettings,
+                    onToast: showToast,
+                    previewURL: engine.photos.first?.thumbnailURL
+                )
+                .transition(.move(edge: .trailing))
+                .zIndex(3)
             }
 
             if let develop {
@@ -154,7 +165,7 @@ struct MobileRootView: View {
                 develop = engine.openDevelop(photoID: first.id)
             case .grade:
                 grade = engine.openGrade(photoID: first.id, entry: .direct)
-            case .home, .camera:
+            case .home, .camera, .settings:
                 break
             }
             applyDebugQuickIfNeeded(to: develop)
@@ -180,10 +191,29 @@ struct MobileRootView: View {
         withAnimation(MMotion.push) { screen = .camera }
     }
 
+    private func openSettings() {
+        withAnimation(MMotion.push) { screen = .settings }
+    }
+
+    private func closeSettings() {
+        withAnimation(MMotion.push) { screen = .home }
+    }
+
     private func closeCamera() {
         withAnimation(MMotion.push) { screen = .home }
         // 相册里可能刚多了一张 RAW：回主页时重扫一遍。
         Task { await engine.refreshAssets() }
+    }
+
+    /// 拍完 → 入库 → 直接进入这张照片的显影台；导入失败才退回主页。
+    private func openCaptured(_ url: URL) {
+        let report = engine.importPhotos([url])
+        guard let photoID = report.firstID else {
+            closeCamera()
+            showToast(report.reason.isEmpty ? "拍摄的照片没能入库" : report.reason)
+            return
+        }
+        openDevelop(photoID)
     }
 
     private func openDevelop(_ photoID: String) {

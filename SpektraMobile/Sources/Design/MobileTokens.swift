@@ -261,9 +261,10 @@ enum DebugLaunch {
     static var developPage: Int {
         guard let index = args.firstIndex(of: "--page"), args.indices.contains(index + 1) else { return 0 }
         switch args[index + 1] {
-        case "tone": return 1
-        case "color": return 2
-        case "detail": return 3
+        case "film": return 1
+        case "tone": return 2
+        case "color": return 3
+        case "detail": return 4
         default: return 0
         }
     }
