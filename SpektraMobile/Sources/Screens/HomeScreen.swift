@@ -1240,15 +1240,6 @@ private struct MPhotoCard: View {
     }
 }
 
-/// 相册缩略图内存缓存：滚动回来或重进主页时不重复向 PhotoKit 取图。
-private enum MAssetThumbCache {
-    static let shared: NSCache<NSString, UIImage> = {
-        let cache = NSCache<NSString, UIImage>()
-        cache.countLimit = 400
-        return cache
-    }()
-}
-
 /// 相册缩略图（未入库的 RAW）。
 private struct MAssetThumb: View {
     let asset: PHAsset
@@ -1271,11 +1262,6 @@ private struct MAssetThumb: View {
     private func request() {
         guard !requested else { return }
         requested = true
-        let key = asset.localIdentifier as NSString
-        if let hit = MAssetThumbCache.shared.object(forKey: key) {
-            image = hit
-            return
-        }
         let options = PHImageRequestOptions()
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .fast
@@ -1287,10 +1273,7 @@ private struct MAssetThumb: View {
             options: options
         ) { result, _ in
             guard let result else { return }
-            DispatchQueue.main.async {
-                MAssetThumbCache.shared.setObject(result, forKey: key)
-                image = result
-            }
+            DispatchQueue.main.async { image = result }
         }
     }
 }
