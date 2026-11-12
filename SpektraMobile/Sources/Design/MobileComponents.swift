@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - iOS 26 玻璃材质
 //
@@ -1995,6 +1996,195 @@ struct MTickRuler: View {
                 try? await Task.sleep(nanoseconds: 16_000_000)
             }
             inertia = nil
+        }
+    }
+}
+
+// MARK: - 画布手势层
+
+/// 用 UIKit 识别器接管预览画布：
+/// - 单指拖动 = 平移（任意倍率下都生效）；
+/// - 双指 = 捏合缩放 + 双指拖动平移，两个信号分开接，缩放锚在双指中心；
+/// - 双击 = 放大 / 回默认；单击 = 显示 / 隐藏 UI；长按 = 看原片。
+/// SwiftUI 的 DragGesture 只跟一根手指，双指时会被单指带偏，所以下沉到 UIKit。
+struct MCanvasGestureLayer: UIViewRepresentable {
+    var onTap: () -> Void
+    var onDoubleTap: (CGPoint) -> Void
+    var onMultiTouchBegin: (CGPoint) -> Void
+    var onMultiTouchChange: (CGFloat, CGSize) -> Void
+    var onMultiTouchEnd: () -> Void
+    var onPanBegin: () -> Void
+    var onPanChange: (CGSize) -> Void
+    var onPanEnd: () -> Void
+    var onLongPress: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        view.isMultipleTouchEnabled = true
+        let coordinator = context.coordinator
+
+        // 缩放与双指平移是两个独立手势：捏合的 location 只给锚点，
+        // 平移必须由双指 UIPanGestureRecognizer 的 translation 提供。
+        let pinch = UIPinchGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handlePinch(_:)))
+        let twoFingerPan = UIPanGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handleTwoFingerPan(_:)))
+        twoFingerPan.minimumNumberOfTouches = 2
+        twoFingerPan.maximumNumberOfTouches = 2
+        pinch.delegate = coordinator
+        twoFingerPan.delegate = coordinator
+
+        let pan = UIPanGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handlePan(_:)))
+        pan.maximumNumberOfTouches = 1
+
+        let doubleTap = UITapGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        let tap = UITapGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handleTap(_:)))
+        tap.require(toFail: doubleTap)
+
+        let longPress = UILongPressGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.28
+        longPress.allowableMovement = 14
+        tap.require(toFail: longPress)
+        // 捏合 / 拖动过的这一组触摸不能再被识别成单击，
+        // 否则双指松开时可能误触「隐藏 UI」并顺带把画布重置回默认位置。
+        tap.require(toFail: pinch)
+        tap.require(toFail: twoFingerPan)
+        tap.require(toFail: pan)
+        doubleTap.require(toFail: pinch)
+        doubleTap.require(toFail: twoFingerPan)
+        doubleTap.require(toFail: pan)
+
+        for recognizer in [pinch, twoFingerPan, pan, doubleTap, tap, longPress] {
+            view.addGestureRecognizer(recognizer)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.parent = self
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var parent: MCanvasGestureLayer
+        /// 双指序列（捏合 + 双指平移）的合并状态：只回调一次 begin / end。
+        private var multiTouchActive = false
+        private var pinchActive = false
+        private var twoFingerPanActive = false
+        private var pinchScale: CGFloat = 1
+        private var twoFingerTranslation: CGSize = .zero
+
+        init(_ parent: MCanvasGestureLayer) { self.parent = parent }
+
+        @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            switch recognizer.state {
+            case .began:
+                pinchActive = true
+                pinchScale = 1
+                beginMultiTouchIfNeeded(at: recognizer.location(in: view))
+            case .changed:
+                pinchScale = recognizer.scale
+                emitMultiTouch()
+            case .ended, .cancelled, .failed:
+                // 保留最后的 scale：双指平移可能还活着，清掉会导致倍率回跳。
+                pinchActive = false
+                endMultiTouchIfNeeded()
+            default:
+                break
+            }
+        }
+
+        @objc func handleTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            switch recognizer.state {
+            case .began:
+                twoFingerPanActive = true
+                twoFingerTranslation = .zero
+                beginMultiTouchIfNeeded(at: recognizer.location(in: view))
+            case .changed:
+                let translation = recognizer.translation(in: view)
+                twoFingerTranslation = CGSize(width: translation.x, height: translation.y)
+                emitMultiTouch()
+            case .ended, .cancelled, .failed:
+                // 同理保留位移，等捏合也结束再统一收尾。
+                twoFingerPanActive = false
+                endMultiTouchIfNeeded()
+            default:
+                break
+            }
+        }
+
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard recognizer.numberOfTouches <= 1, let view = recognizer.view else { return }
+            switch recognizer.state {
+            case .began:
+                parent.onPanBegin()
+            case .changed:
+                let translation = recognizer.translation(in: view)
+                parent.onPanChange(CGSize(width: translation.x, height: translation.y))
+            case .ended, .cancelled, .failed:
+                parent.onPanEnd()
+            default:
+                break
+            }
+        }
+
+        @objc func handleTap(_ recognizer: UITapGestureRecognizer) {
+            parent.onTap()
+        }
+
+        @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            parent.onDoubleTap(recognizer.location(in: view))
+        }
+
+        @objc func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            switch recognizer.state {
+            case .began:
+                parent.onLongPress(true)
+            case .ended, .cancelled, .failed:
+                parent.onLongPress(false)
+            default:
+                break
+            }
+        }
+
+        /// 捏合和双指拖动同时识别，才能做到「边放大边拖」。
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool {
+            let pair = [gestureRecognizer, other]
+            let hasPinch = pair.contains { $0 is UIPinchGestureRecognizer }
+            let hasPan = pair.contains { $0 is UIPanGestureRecognizer }
+            return hasPinch && hasPan
+        }
+
+        private func beginMultiTouchIfNeeded(at point: CGPoint) {
+            guard !multiTouchActive else { return }
+            multiTouchActive = true
+            pinchScale = 1
+            twoFingerTranslation = .zero
+            parent.onMultiTouchBegin(point)
+        }
+
+        private func emitMultiTouch() {
+            guard multiTouchActive else { return }
+            parent.onMultiTouchChange(pinchScale, twoFingerTranslation)
+        }
+
+        private func endMultiTouchIfNeeded() {
+            guard multiTouchActive, !pinchActive, !twoFingerPanActive else { return }
+            multiTouchActive = false
+            parent.onMultiTouchEnd()
         }
     }
 }

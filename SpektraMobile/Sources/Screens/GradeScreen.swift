@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct GradeScreen: View {
@@ -39,22 +40,20 @@ struct GradeScreen: View {
     @State private var imageRevealed = false
 
     @State private var showOriginal = false
-    @State private var pressToken = 0
     @State private var zoom: CGFloat = DebugLaunch.canvasZoom
-    /// 点击照片进入纯预览：顶栏、抽屉、底栏全部隐去，再点一次恢复。
+    /// 点击照片进入纯预览：顶栏、抽屉、底栏全部隐去，照片移到整屏中心。
     @State private var chromeHidden = false
+    /// 自由画布：平移不再受倍率限制。
     @State private var pan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
-    @State private var lastPan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
-    /// 捏合缩放锚点：锚在双指中心，捏哪里哪里不动。
-    @State private var zoomAnchor: UnitPoint = .center
-    @State private var isPinching = false
+    /// 进入纯预览前的画布状态；回来时恢复（纯预览里动过画布就不恢复）。
+    @State private var savedZoom: CGFloat = 1
+    @State private var savedPan: CGSize = .zero
+    @State private var canvasTouchedWhileHidden = false
+    /// 捏合缩放：锚在双指中心，双指的整体位移同时转成平移。
     @State private var pinchBaseZoom: CGFloat = 1
     @State private var pinchBasePan: CGSize = .zero
-    @State private var pinchDragT0: CGSize = .zero
-    @State private var isDragging = false
-    @State private var dragT0: CGSize = .zero
+    @State private var pinchAnchorOffset: CGSize = .zero
     @State private var dragBasePan: CGSize = .zero
-    @State private var lastDragT: CGSize = .zero
 
     /// 曲线默认没有任何控制点，恒等曲线；用户点击曲线才新增点。
     @State private var curvePoints: [CGPoint] = []
@@ -476,6 +475,107 @@ struct GradeScreen: View {
         }
     }
 
+    // MARK: - 画布交互
+
+    private var stageCenter: CGPoint {
+        CGPoint(x: stageSize.width / 2, y: stageSize.height / 2)
+    }
+
+    /// 纯预览时照片要从「偏上的默认位置」挪到整屏中心；显示 UI 时回到默认位置。
+    /// 取景区顶边 = 顶部安全区 + 顶栏，两种布局（单列 / 分栏）都一样，
+    /// 所以直接用布局常量算，不依赖全局坐标抓取。
+    private var hiddenCenterOffsetY: CGFloat {
+        guard chromeHidden else { return 0 }
+        let stageCenterY = insets.top + MMetric.navHeight + stageSize.height / 2
+        return insets.size.height / 2 - stageCenterY
+    }
+
+    /// 纯预览里动过画布：回到带 UI 时不恢复进入前的缩放 / 位移。
+    private func markCanvasInteraction() {
+        guard chromeHidden else { return }
+        canvasTouchedWhileHidden = true
+    }
+
+    /// 单击切换纯预览：隐去 UI 时照片回到居中整幅，再点回来恢复原状态。
+    private func toggleChrome() {
+        if chromeHidden {
+            withAnimation(MMotion.canvas) {
+                chromeHidden = false
+                if !canvasTouchedWhileHidden {
+                    zoom = savedZoom
+                    pan = savedPan
+                }
+            }
+        } else {
+            savedZoom = zoom
+            savedPan = pan
+            canvasTouchedWhileHidden = false
+            withAnimation(MMotion.canvas) {
+                chromeHidden = true
+                zoom = 1
+                pan = .zero
+            }
+        }
+    }
+
+    /// 双击切换：默认倍率下以点击点为锚放大，已放大则回到默认状态。
+    private func doubleTapped(at point: CGPoint) {
+        MHaptic.light()
+        markCanvasInteraction()
+        if zoom > 1.001 {
+            withAnimation(MMotion.canvas) {
+                zoom = 1
+                pan = .zero
+            }
+            return
+        }
+        let target: CGFloat = 2.2
+        let anchor = CGPoint(x: point.x - stageCenter.x,
+                             y: point.y - stageCenter.y - hiddenCenterOffsetY)
+        let scale = target / max(zoom, 0.001)
+        withAnimation(MMotion.canvas) {
+            zoom = target
+            pan = CGSize(
+                width: pan.width * scale + anchor.x * (1 - scale),
+                height: pan.height * scale + anchor.y * (1 - scale))
+        }
+    }
+
+    /// 双指按下：记录基线，之后缩放与整体位移一起生效。
+    private func pinchBegan(at point: CGPoint) {
+        pinchBaseZoom = zoom
+        pinchBasePan = pan
+        pinchAnchorOffset = CGSize(
+            width: point.x - stageCenter.x,
+            height: point.y - stageCenter.y - hiddenCenterOffsetY)
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
+    /// 双指更新：缩放倍率和双指整体位移是两个独立信号，必须分别接。
+    /// 之前从捏合手势的 location 推平移，手指整体移动时 location 不动，
+    /// 结果就是只能缩放、不能平移。
+    private func pinchChanged(scale: CGFloat, translation: CGSize) {
+        let next = min(4, max(0.5, pinchBaseZoom * scale))
+        let ratio = pinchBaseZoom > 0 ? next / pinchBaseZoom : 1
+        zoom = next
+        pan = CGSize(
+            width: pinchBasePan.width + pinchAnchorOffset.width * (1 - ratio)
+                + translation.width,
+            height: pinchBasePan.height + pinchAnchorOffset.height * (1 - ratio)
+                + translation.height)
+    }
+
+    private func pinchEnded() {
+        // 松手不再改动画布：位置和倍率由用户决定，双击才回默认。
+    }
+
+    private func panBegan() {
+        dragBasePan = pan
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
     // MARK: - 顶栏
 
     private var navigationBar: some View {
@@ -541,8 +641,8 @@ struct GradeScreen: View {
                         .resizable()
                         .scaledToFit()
                         .padding(.horizontal, 14)
-                        .scaleEffect(zoom, anchor: zoomAnchor)
-                        .offset(pan)
+                        .scaleEffect(zoom)
+                        .offset(x: pan.width, y: pan.height + hiddenCenterOffsetY)
                         .animation(MMotion.state, value: showOriginal)
                 } else {
                     Image(systemName: "photo")
@@ -552,102 +652,35 @@ struct GradeScreen: View {
             }
             // 画布是整个页面：放大后的照片可以延伸到顶栏与抽屉下面，只由屏幕边界裁切。
             .opacity(imageRevealed ? 1 : 0)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                MHaptic.light()
-                withAnimation(MMotion.drawer) {
-                    if abs(zoom - 1) > 0.001 {
-                        zoom = 1
-                        pan = .zero
-                        lastPan = .zero
-                    } else {
-                        zoom = 2.2
-                    }
-                    zoomAnchor = .center
+            .allowsHitTesting(false)
+
+            // 手势层：只有 UIKit 识别器能准确区分单指拖动与双指缩放。
+            // 双指同时缩放 + 平移（与系统相册一致），单指拖动，双击放大 / 缩小。
+            MCanvasGestureLayer(
+                onTap: {
+                    MHaptic.light()
+                    toggleChrome()
+                },
+                onDoubleTap: { point in doubleTapped(at: point) },
+                onMultiTouchBegin: { point in pinchBegan(at: point) },
+                onMultiTouchChange: { scale, translation in
+                    pinchChanged(scale: scale, translation: translation)
+                },
+                onMultiTouchEnd: { pinchEnded() },
+                onPanBegin: { panBegan() },
+                onPanChange: { translation in
+                    pan = CGSize(
+                        width: dragBasePan.width + translation.width,
+                        height: dragBasePan.height + translation.height)
+                },
+                onPanEnd: {},
+                onLongPress: { pressed in
+                    if pressed { MHaptic.light() }
+                    withAnimation(MMotion.quick) { showOriginal = pressed }
                 }
-            }
-            // 单击在双击之后挂载：双击优先识别，单击只在没有第二击时触发。
-            .onTapGesture {
-                MHaptic.light()
-                withAnimation(MMotion.quick) { chromeHidden.toggle() }
-            }
-            .gesture(
-                MagnifyGesture()
-                    .onChanged { value in
-                        if !isPinching {
-                            isPinching = true
-                            // 以手势开始时的状态为基线：连续两次捏合不会互相跳变。
-                            pinchBaseZoom = zoom
-                            pinchBasePan = pan
-                            zoomAnchor = value.startAnchor
-                            pinchDragT0 = lastDragT
-                            // 双指操作开始时作废在途的长按对比，避免捏合途中图片切到原片。
-                            pressToken += 1
-                        }
-                        zoom = min(4, max(0.5, pinchBaseZoom * value.magnification))
-                        if isDragging {
-                            pan = CGSize(
-                                width: pinchBasePan.width + lastDragT.width - pinchDragT0.width,
-                                height: pinchBasePan.height + lastDragT.height - pinchDragT0.height
-                            )
-                        }
-                    }
-                    .onEnded { _ in
-                        isPinching = false
-                        if zoom <= 1.001 {
-                            pan = .zero
-                            lastPan = .zero
-                            zoomAnchor = .center
-                        } else {
-                            lastPan = pan
-                        }
-                    }
             )
-            .simultaneousGesture(
-                DragGesture()
-                    .onChanged { gesture in
-                        if !isDragging {
-                            isDragging = true
-                            dragT0 = gesture.translation
-                            dragBasePan = pan
-                            pressToken += 1
-                        }
-                        lastDragT = gesture.translation
-                        if isPinching {
-                            // 双指整体移动 1:1 平移，与缩放叠加互不打架。
-                            pan = CGSize(
-                                width: pinchBasePan.width + gesture.translation.width - pinchDragT0.width,
-                                height: pinchBasePan.height + gesture.translation.height - pinchDragT0.height
-                            )
-                        } else {
-                            guard zoom > 1.001 else { return }
-                            pan = CGSize(
-                                width: dragBasePan.width + gesture.translation.width - dragT0.width,
-                                height: dragBasePan.height + gesture.translation.height - dragT0.height
-                            )
-                        }
-                    }
-                    .onEnded { _ in
-                        isDragging = false
-                        lastDragT = .zero
-                        lastPan = pan
-                    }
-            )
-            .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 18, pressing: { pressing in
-                if pressing {
-                    pressToken += 1
-                    let token = pressToken
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        guard token == pressToken else { return }
-                        guard !isPinching, !isDragging else { return }
-                        MHaptic.light()
-                        withAnimation(MMotion.quick) { showOriginal = true }
-                    }
-                } else {
-                    pressToken += 1
-                    withAnimation(MMotion.quick) { showOriginal = false }
-                }
-            }, perform: {})
+            .opacity(imageRevealed ? 1 : 0)
+            .allowsHitTesting(imageRevealed)
 
             if let failure = session.sourceFailure, !session.sourceReady {
                 sourceFailureCard(failure)
@@ -677,11 +710,11 @@ struct GradeScreen: View {
 
                     Button {
                         MHaptic.tick()
-                        withAnimation(MMotion.drawer) {
+                        markCanvasInteraction()
+                        withAnimation(MMotion.canvas) {
                             if abs(zoom - 1) > 0.001 {
                                 zoom = 1
                                 pan = .zero
-                                lastPan = .zero
                             } else {
                                 zoom = 2.2
                             }
@@ -842,8 +875,8 @@ struct GradeScreen: View {
             }
         }
         .allowsHitTesting(false)
-        .scaleEffect(zoom, anchor: zoomAnchor)
-        .offset(pan)
+        .scaleEffect(zoom)
+        .offset(x: pan.width, y: pan.height + hiddenCenterOffsetY)
     }
 
     private func fittedPreviewRect(in size: CGSize) -> CGRect {

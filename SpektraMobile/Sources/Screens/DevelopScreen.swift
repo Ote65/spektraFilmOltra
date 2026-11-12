@@ -17,20 +17,19 @@ struct DevelopScreen: View {
     @State private var drawerChrome: CGFloat = 0
 
     @State private var showOriginal = false
-    @State private var pressToken = 0
     @State private var zoom: CGFloat = DebugLaunch.canvasZoom
     @State private var pan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
-    @State private var lastPan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
-    /// 捏合缩放锚点：锚在双指中心，捏哪里哪里不动。
-    @State private var zoomAnchor: UnitPoint = .center
-    @State private var isPinching = false
+    /// 点击照片进入纯预览：控件全部隐去，照片移到整屏中心。
+    @State private var chromeHidden = false
+    /// 进入纯预览前的画布状态；回来时恢复（纯预览里动过画布就不恢复）。
+    @State private var savedZoom: CGFloat = 1
+    @State private var savedPan: CGSize = .zero
+    @State private var canvasTouchedWhileHidden = false
+    /// 捏合缩放：锚在双指中心，双指整体位移同时转成平移。
     @State private var pinchBaseZoom: CGFloat = 1
     @State private var pinchBasePan: CGSize = .zero
-    @State private var pinchDragT0: CGSize = .zero
-    @State private var isDragging = false
-    @State private var dragT0: CGSize = .zero
+    @State private var pinchAnchorOffset: CGSize = .zero
     @State private var dragBasePan: CGSize = .zero
-    @State private var lastDragT: CGSize = .zero
     @State private var exportOpen = DebugLaunch.exportOpen
     @State private var stageSize: CGSize = .zero
     // 分栏右栏的直方图：随预览图刷新，后台采样不阻塞显影渲染。
@@ -44,8 +43,6 @@ struct DevelopScreen: View {
     @State private var cardStarted = false
     @State private var cardRadius: CGFloat = 2
     @State private var imageRevealed = false
-    /// 点击照片进入纯预览：顶栏、抽屉、底栏全部隐去，再点一次恢复。
-    @State private var chromeHidden = false
     @Namespace private var tabPill
 
     @Environment(\.mHousing) private var housingSetting
@@ -578,6 +575,98 @@ struct DevelopScreen: View {
         }
     }
 
+    // MARK: - 画布交互
+
+    private var stageCenter: CGPoint {
+        CGPoint(x: stageSize.width / 2, y: stageSize.height / 2)
+    }
+
+    /// 纯预览时照片从默认位置（画布居中偏上）挪到整屏中心；显示控件时归零。
+    private var hiddenCenterOffsetY: CGFloat {
+        guard chromeHidden else { return 0 }
+        let stageTop = isSplit ? 0 : insets.top
+        return insets.size.height / 2 - (stageTop + stageSize.height / 2)
+    }
+
+    /// 纯预览里动过画布：回到带控件时不恢复进入前的缩放 / 位移。
+    private func markCanvasInteraction() {
+        guard chromeHidden else { return }
+        canvasTouchedWhileHidden = true
+    }
+
+    /// 单击切换纯预览：隐去控件时照片居中整幅，再点回来恢复原状态。
+    private func toggleChrome() {
+        if chromeHidden {
+            withAnimation(MMotion.canvas) {
+                chromeHidden = false
+                if !canvasTouchedWhileHidden {
+                    zoom = savedZoom
+                    pan = savedPan
+                }
+            }
+        } else {
+            savedZoom = zoom
+            savedPan = pan
+            canvasTouchedWhileHidden = false
+            withAnimation(MMotion.canvas) {
+                chromeHidden = true
+                zoom = 1
+                pan = .zero
+            }
+        }
+    }
+
+    /// 双击切换：默认倍率下以点击点为锚放大，已放大则回到默认状态。
+    private func doubleTapped(at point: CGPoint) {
+        MHaptic.light()
+        markCanvasInteraction()
+        if zoom > 1.001 {
+            withAnimation(MMotion.canvas) {
+                zoom = 1
+                pan = .zero
+            }
+            return
+        }
+        let target: CGFloat = 2.2
+        let anchor = CGPoint(x: point.x - stageCenter.x,
+                             y: point.y - stageCenter.y - hiddenCenterOffsetY)
+        let scale = target / max(zoom, 0.001)
+        withAnimation(MMotion.canvas) {
+            zoom = target
+            pan = CGSize(
+                width: pan.width * scale + anchor.x * (1 - scale),
+                height: pan.height * scale + anchor.y * (1 - scale))
+        }
+    }
+
+    /// 双指按下：记录基线，之后缩放与双指整体位移一起生效。
+    private func pinchBegan(at point: CGPoint) {
+        pinchBaseZoom = zoom
+        pinchBasePan = pan
+        pinchAnchorOffset = CGSize(
+            width: point.x - stageCenter.x,
+            height: point.y - stageCenter.y - hiddenCenterOffsetY)
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
+    private func pinchChanged(scale: CGFloat, translation: CGSize) {
+        let next = min(4, max(0.5, pinchBaseZoom * scale))
+        let ratio = pinchBaseZoom > 0 ? next / pinchBaseZoom : 1
+        zoom = next
+        pan = CGSize(
+            width: pinchBasePan.width + pinchAnchorOffset.width * (1 - ratio)
+                + translation.width,
+            height: pinchBasePan.height + pinchAnchorOffset.height * (1 - ratio)
+                + translation.height)
+    }
+
+    private func panBegan() {
+        dragBasePan = pan
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
     // MARK: - 预览
 
     private var previewStage: some View {
@@ -590,8 +679,8 @@ struct DevelopScreen: View {
                         .resizable()
                         .interpolation(.high)
                         .scaledToFit()
-                        .scaleEffect(zoom, anchor: zoomAnchor)
-                        .offset(pan)
+                        .scaleEffect(zoom)
+                        .offset(x: pan.width, y: pan.height + hiddenCenterOffsetY)
                         .animation(MMotion.state, value: showOriginal)
                 } else {
                     Image(systemName: "photo")
@@ -601,102 +690,34 @@ struct DevelopScreen: View {
             }
             // 不再按预览槽裁切：画布是整个页面，放大后照片可以延伸到顶部控件与抽屉下面。
             .opacity(imageRevealed && !previewHidden ? 1 : 0)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                MHaptic.light()
-                withAnimation(MMotion.drawer) {
-                    if abs(zoom - 1) > 0.001 {
-                        zoom = 1
-                        pan = .zero
-                        lastPan = .zero
-                    } else {
-                        zoom = 2.2
-                    }
-                    zoomAnchor = .center
+            .allowsHitTesting(false)
+
+            // 与调色台共用同一套画布手势：单指平移、双指同时缩放 + 平移、双击放大 / 回默认。
+            MCanvasGestureLayer(
+                onTap: {
+                    MHaptic.light()
+                    toggleChrome()
+                },
+                onDoubleTap: { point in doubleTapped(at: point) },
+                onMultiTouchBegin: { point in pinchBegan(at: point) },
+                onMultiTouchChange: { scale, translation in
+                    pinchChanged(scale: scale, translation: translation)
+                },
+                onMultiTouchEnd: {},
+                onPanBegin: { panBegan() },
+                onPanChange: { translation in
+                    pan = CGSize(
+                        width: dragBasePan.width + translation.width,
+                        height: dragBasePan.height + translation.height)
+                },
+                onPanEnd: {},
+                onLongPress: { pressed in
+                    if pressed { MHaptic.light() }
+                    withAnimation(MMotion.quick) { showOriginal = pressed }
                 }
-            }
-            // 单击在双击之后挂载：双击优先识别，单击只在没有第二击时触发。
-            .onTapGesture {
-                MHaptic.light()
-                withAnimation(MMotion.quick) { chromeHidden.toggle() }
-            }
-            .gesture(
-                MagnifyGesture()
-                    .onChanged { value in
-                        if !isPinching {
-                            isPinching = true
-                            // 以手势开始时的状态为基线：连续两次捏合不会互相跳变。
-                            pinchBaseZoom = zoom
-                            pinchBasePan = pan
-                            zoomAnchor = value.startAnchor
-                            pinchDragT0 = lastDragT
-                            // 双指操作开始时作废在途的长按对比，避免捏合途中图片切到原片。
-                            pressToken += 1
-                        }
-                        zoom = min(4, max(0.5, pinchBaseZoom * value.magnification))
-                        if isDragging {
-                            pan = CGSize(
-                                width: pinchBasePan.width + lastDragT.width - pinchDragT0.width,
-                                height: pinchBasePan.height + lastDragT.height - pinchDragT0.height
-                            )
-                        }
-                    }
-                    .onEnded { _ in
-                        isPinching = false
-                        if zoom <= 1.001 {
-                            pan = .zero
-                            lastPan = .zero
-                            zoomAnchor = .center
-                        } else {
-                            lastPan = pan
-                        }
-                    }
             )
-            .simultaneousGesture(
-                DragGesture()
-                    .onChanged { gesture in
-                        if !isDragging {
-                            isDragging = true
-                            dragT0 = gesture.translation
-                            dragBasePan = pan
-                            pressToken += 1
-                        }
-                        lastDragT = gesture.translation
-                        if isPinching {
-                            // 双指整体移动 1:1 平移，与缩放叠加互不打架。
-                            pan = CGSize(
-                                width: pinchBasePan.width + gesture.translation.width - pinchDragT0.width,
-                                height: pinchBasePan.height + gesture.translation.height - pinchDragT0.height
-                            )
-                        } else {
-                            guard zoom > 1.001 else { return }
-                            pan = CGSize(
-                                width: dragBasePan.width + gesture.translation.width - dragT0.width,
-                                height: dragBasePan.height + gesture.translation.height - dragT0.height
-                            )
-                        }
-                    }
-                    .onEnded { _ in
-                        isDragging = false
-                        lastDragT = .zero
-                        lastPan = pan
-                    }
-            )
-            .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 18, pressing: { pressing in
-                if pressing {
-                    pressToken += 1
-                    let token = pressToken
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        guard token == pressToken else { return }
-                        guard !isPinching, !isDragging else { return }
-                        MHaptic.light()
-                        withAnimation(MMotion.quick) { showOriginal = true }
-                    }
-                } else {
-                    pressToken += 1
-                    withAnimation(MMotion.quick) { showOriginal = false }
-                }
-            }, perform: {})
+            .opacity(imageRevealed && !previewHidden ? 1 : 0)
+            .allowsHitTesting(imageRevealed && !previewHidden)
 
             if let failure = session.loadFailure, !session.isLoaded {
                 loadFailureCard(failure)
@@ -844,8 +865,8 @@ struct DevelopScreen: View {
             }
         }
         .allowsHitTesting(false)
-        .scaleEffect(zoom, anchor: zoomAnchor)
-        .offset(pan)
+        .scaleEffect(zoom)
+        .offset(x: pan.width, y: pan.height + hiddenCenterOffsetY)
         .opacity(chromeHidden || abs(zoom - 1) > 0.001 ? 0 : 1)
     }
 

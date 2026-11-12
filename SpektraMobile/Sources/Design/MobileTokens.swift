@@ -256,6 +256,8 @@ enum MMotion {
     static let state = Animation.easeOut(duration: 0.2)
     static let quick = Animation.easeOut(duration: 0.14)
     static let press = Animation.easeOut(duration: 0.16)
+    /// 预览画布的缩放 / 归位：系统相册同款弹簧，收尾带一点回弹。
+    static let canvas = Animation.spring(response: 0.4, dampingFraction: 0.86)
 }
 
 // MARK: - 预览调试参数

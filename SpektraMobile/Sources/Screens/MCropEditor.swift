@@ -100,7 +100,6 @@ struct MCropEditor: View {
                         .position(x: photo.midX, y: photo.midY)
                     MCropFrame(
                         imageRect: frame,
-                        photoRect: photo,
                         crop: Binding(get: { draft.crop }, set: { draft.crop = $0 }),
                         pixelRatio: lockedRatio,
                         orientedAspect: orientedAspect
@@ -173,7 +172,7 @@ struct MCropEditor: View {
 
             MParamSlider(label: "角度", value: $draft.straighten, base: 0,
                          range: -45...45, step: 1, decimals: 0, suffix: "°",
-                         compact: true)
+                         compact: true, snapTarget: 0, snapDistance: 2)
                 .padding(.horizontal, 20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -188,11 +187,11 @@ struct MCropEditor: View {
 
             MParamSlider(label: "垂直", value: $draft.perspectiveV, base: 0,
                          range: -100...100, step: 1, decimals: 0, suffix: "",
-                         compact: true)
+                         compact: true, snapTarget: 0, snapDistance: 4)
                 .padding(.horizontal, 20)
             MParamSlider(label: "水平", value: $draft.perspectiveH, base: 0,
                          range: -100...100, step: 1, decimals: 0, suffix: "",
-                         compact: true)
+                         compact: true, snapTarget: 0, snapDistance: 4)
                 .padding(.horizontal, 20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -402,15 +401,16 @@ private enum MRatio: String, CaseIterable, Identifiable {
 
 /// 归一化裁切框 + 手势。坐标全部相对“已校正画面”，与像素渲染同一套映射。
 private struct MCropFrame: View {
-    /// 原画幅（取景框坐标系）。
+    /// 原画幅（取景框坐标系）。校正后溢出的照片不参与压暗，
+    /// 保证透视/旋转时外扩的画面能看到完整亮度。
     let imageRect: CGRect
-    /// 校正后照片的实际显示区域，可能溢出原画幅。
-    let photoRect: CGRect
     @Binding var crop: MPhotoGeometry.Crop
     let pixelRatio: CGFloat?
     let orientedAspect: CGFloat
 
     @State private var dragOrigin: MPhotoGeometry.Crop?
+    /// 当前是否吸附在居中 / 铺满的参考位上，用来只发一次吸附触感。
+    @State private var snapActive = true
 
     private var cropRect: CGRect {
         CGRect(
@@ -448,7 +448,7 @@ private struct MCropFrame: View {
 
     private var dimming: some View {
         Path { path in
-            path.addRect(photoRect)
+            path.addRect(imageRect)
             path.addRect(cropRect)
         }
         .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
@@ -515,35 +515,45 @@ private struct MCropFrame: View {
     private func gesture(_ kind: MCropHandle) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
-                if dragOrigin == nil { dragOrigin = crop }
+                if dragOrigin == nil {
+                    dragOrigin = crop
+                    // 首帧不响：只有「拖进 / 拖出」吸附位时才给触感。
+                    snapActive = true
+                }
                 guard let origin = dragOrigin else { return }
-                crop = Self.adjust(
+                let result = adjust(
                     origin, handle: kind,
                     dx: value.translation.width / max(1, imageRect.width),
-                    dy: value.translation.height / max(1, imageRect.height),
-                    pixelRatio: pixelRatio,
-                    orientedAspect: orientedAspect
+                    dy: value.translation.height / max(1, imageRect.height)
                 )
+                crop = result.crop
+                if result.snapped != snapActive {
+                    snapActive = result.snapped
+                    if result.snapped { MHaptic.light() }
+                }
             }
-            .onEnded { _ in dragOrigin = nil }
+            .onEnded { _ in
+                dragOrigin = nil
+                snapActive = true
+            }
     }
 
     /// 拖拽解算：固定比例时先锁比例再按锚点收进画面，避免取景框被拖出画布。
-    private static func adjust(
+    private func adjust(
         _ origin: MPhotoGeometry.Crop, handle: MCropHandle,
-        dx: Double, dy: Double, pixelRatio: CGFloat?, orientedAspect: CGFloat
-    ) -> MPhotoGeometry.Crop {
+        dx: Double, dy: Double
+    ) -> (crop: MPhotoGeometry.Crop, snapped: Bool) {
         let minSize = 0.06
         let ratio = pixelRatio.map(Double.init)
         let aspect = Double(orientedAspect)
+        let candidate: MPhotoGeometry.Crop
 
         if handle == .move {
             let x = min(max(origin.x + dx, 0), 1 - origin.width)
             let y = min(max(origin.y + dy, 0), 1 - origin.height)
-            return MPhotoGeometry.Crop(x: x, y: y, width: origin.width, height: origin.height)
-        }
-
-        if let ratio {
+            candidate = MPhotoGeometry.Crop(x: x, y: y,
+                                            width: origin.width, height: origin.height)
+        } else if let ratio {
             let left = handle.touchesLeft
             let right = handle.touchesRight
             let top = handle.touchesTop
@@ -571,7 +581,8 @@ private struct MCropFrame: View {
                 let x = left ? anchorX - width : anchorX
                 let y = top ? origin.y + origin.height - height
                     : bottom ? origin.y : centerY - height / 2
-                return MPhotoGeometry.Crop(x: x, y: y, width: width, height: height).clamped
+                candidate = MPhotoGeometry.Crop(
+                    x: x, y: y, width: width, height: height).clamped
             } else {
                 let anchorY = top ? origin.y + origin.height : origin.y
                 let available = top ? anchorY : 1 - anchorY
@@ -585,24 +596,59 @@ private struct MCropFrame: View {
                 }
                 let x = centerX - width / 2
                 let y = top ? anchorY - height : anchorY
-                return MPhotoGeometry.Crop(x: x, y: y, width: width, height: height).clamped
+                candidate = MPhotoGeometry.Crop(
+                    x: x, y: y, width: width, height: height).clamped
             }
+        } else {
+            var x = origin.x
+            var y = origin.y
+            var width = origin.width
+            var height = origin.height
+            if handle.touchesLeft { x += dx; width -= dx }
+            if handle.touchesRight { width += dx }
+            if handle.touchesTop { y += dy; height -= dy }
+            if handle.touchesBottom { height += dy }
+
+            width = max(width, minSize)
+            height = max(height, minSize)
+            x = min(max(x, 0), max(0, 1 - width))
+            y = min(max(y, 0), max(0, 1 - height))
+            candidate = MPhotoGeometry.Crop(
+                x: x, y: y, width: width, height: height).clamped
+        }
+        return snapped(candidate)
+    }
+
+    /// 吸附：框中心回到画幅中心、或重新铺满整幅（默认状态）。
+    /// 半径按屏幕点换算，阈值在任何尺寸下都是同样的手感。
+    private func snapped(_ candidate: MPhotoGeometry.Crop)
+        -> (crop: MPhotoGeometry.Crop, snapped: Bool) {
+        let unitX = 7 / max(1, imageRect.width)
+        let unitY = 7 / max(1, imageRect.height)
+        var value = candidate
+        var isSnapped = false
+
+        // 默认状态：重新铺满整幅。固定比例与原画幅不一致时不能套用。
+        let matchesOriginal = pixelRatio == nil
+            || abs((pixelRatio ?? 0) - orientedAspect) < 0.01
+        if matchesOriginal, !value.isFull,
+           value.x <= unitX, value.y <= unitY,
+           abs(value.width - 1) <= unitX, abs(value.height - 1) <= unitY {
+            return (.full, true)
         }
 
-        var x = origin.x
-        var y = origin.y
-        var width = origin.width
-        var height = origin.height
-        if handle.touchesLeft { x += dx; width -= dx }
-        if handle.touchesRight { width += dx }
-        if handle.touchesTop { y += dy; height -= dy }
-        if handle.touchesBottom { height += dy }
-
-        width = max(width, minSize)
-        height = max(height, minSize)
-        x = min(max(x, 0), max(0, 1 - width))
-        y = min(max(y, 0), max(0, 1 - height))
-        return MPhotoGeometry.Crop(x: x, y: y, width: width, height: height).clamped
+        // 居中吸附：只挪位置、不改尺寸，固定比例也不会被破坏。
+        let centerX = value.x + value.width / 2
+        if abs(centerX - 0.5) <= unitX {
+            value.x = min(max(0.5 - value.width / 2, 0), 1 - value.width)
+            isSnapped = true
+        }
+        let centerY = value.y + value.height / 2
+        if abs(centerY - 0.5) <= unitY {
+            value.y = min(max(0.5 - value.height / 2, 0), 1 - value.height)
+            isSnapped = true
+        }
+        return (value, isSnapped)
     }
 }
 

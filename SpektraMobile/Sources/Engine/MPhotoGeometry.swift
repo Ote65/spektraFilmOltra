@@ -393,7 +393,8 @@ struct MPhotoGeometry: Codable, Equatable {
         filter.setValue(CIVector(cgPoint: targets[2]), forKey: "inputBottomRight")
         filter.setValue(CIVector(cgPoint: targets[3]), forKey: "inputBottomLeft")
         guard let warped = filter.outputImage else { return image.cropped(to: canvas) }
-        // perspScale 保证四边形覆盖整个画布，`cropped` 后 extent 恰好等于画布。
+        // 画布就是外接框：四边形四角落在画布边缘，边缘之外由 CI 留透明，
+        // 交给取景页按背景色显示（照片的四个角会像系统相册那样露出来）。
         return warped.cropped(to: canvas)
     }
 
