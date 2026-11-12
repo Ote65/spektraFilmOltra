@@ -151,7 +151,7 @@ final class MobileEngine: ObservableObject {
         hasRawAlbum = Self.smartAlbum(.smartAlbumRAW) != nil
     }
 
-    static func smartAlbum(_ subtype: PHAssetCollectionSubtype) -> PHAssetCollection? {
+    nonisolated static func smartAlbum(_ subtype: PHAssetCollectionSubtype) -> PHAssetCollection? {
         PHAssetCollection.fetchAssetCollections(
             with: .smartAlbum, subtype: subtype, options: nil
         ).firstObject
@@ -241,7 +241,8 @@ final class MobileEngine: ObservableObject {
     }
 
     /// 按当前筛选直接取相册内容；同一个资产只收一次。
-    private static func fetchAssets(scope: MAssetScope, allowNonRaw: Bool)
+    /// nonisolated：真正的取图与筛选在后台队列执行，不继承 @MainActor 隔离。
+    nonisolated private static func fetchAssets(scope: MAssetScope, allowNonRaw: Bool)
         async -> [(asset: PHAsset, filename: String)] {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -285,7 +286,7 @@ final class MobileEngine: ObservableObject {
 
     /// 主页可见的本体：RAW 一律收；非 RAW 只收 JPEG（PNG / HEIC 都被筛掉）。
     /// 关闭「支持 JPEG」时非 RAW 全部不收。
-    private static func displayResource(for asset: PHAsset, allowNonRaw: Bool) -> PHAssetResource? {
+    private nonisolated static func displayResource(for asset: PHAsset, allowNonRaw: Bool) -> PHAssetResource? {
         let resources = PHAssetResource.assetResources(for: asset)
         if let raw = resources.first(where: {
             UTType($0.uniformTypeIdentifier)?.conforms(to: .rawImage) == true
