@@ -33,9 +33,12 @@ struct HomeScreen: View {
             VStack(spacing: 0) {
                 header
 
+                // 筛选栏固定在顶部，不跟随下面的照片网格一起滚走。
+                filterRow
+                    .padding(.bottom, 12)
+
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 0) {
-                        filterRow
                         sectionHead
                         photoGrid
                         emptyHint
@@ -245,6 +248,7 @@ struct HomeScreen: View {
     private var filterRow: some View {
         HStack(spacing: 7) {
             // 左侧类型按钮：对应系统相簿，可横向滚动。
+            // 右缘用渐变淡出，滚到颜色标签前不会出现一条生硬的截断线。
             ScrollView(.horizontal) {
                 HStack(spacing: 7) {
                     ForEach(scopeChips) { chip in
@@ -261,9 +265,20 @@ struct HomeScreen: View {
                     }
                 }
                 .padding(.leading, MMetric.pageMargin)
-                .padding(.trailing, 4)
+                .padding(.trailing, 18)
             }
             .scrollIndicators(.never)
+            .mask {
+                HStack(spacing: 0) {
+                    Rectangle().fill(.black)
+                    LinearGradient(
+                        colors: [.black, .clear],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: 16)
+                }
+            }
 
             // 右侧四个颜色标签固定不滚动。
             HStack(spacing: 2) {
@@ -887,10 +902,10 @@ struct HomeScreen: View {
 
     // MARK: - 从文件夹导入
 
-    /// 可导入的扩展名：关闭「支持 JPEG」时仅 RAW，打开后只额外放行 JPEG。
+    /// 可导入的扩展名：关闭「支持 JPEG」时仅 RAW，打开后放行所有可显影的编码图。
     private var importableSuffixes: Set<String> {
         MobileSettings.allowNonRaw
-            ? ImageLoader.rawSuffixes.union(["jpg", "jpeg"])
+            ? ImageLoader.rawSuffixes.union(ImageLoader.encodedSuffixes)
             : ImageLoader.rawSuffixes
     }
 

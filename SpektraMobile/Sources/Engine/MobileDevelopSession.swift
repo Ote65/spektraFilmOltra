@@ -781,6 +781,44 @@ final class MobileDevelopSession: ObservableObject {
         }
     }
 
+    /// 直接调色入口：只解码原片并转换到线性 ProPhoto，不跑胶片显影。
+    /// 与 `prepareHandoff` 不同，这里不依赖显影预览，也不写回任何显影参数。
+    func prepareOriginalHandoff(maxEdge: Int = 1600,
+                                completion: @escaping (ImageRGB?) -> Void) {
+        guard let photo = store.photos.first(where: { $0.id == photoID }) else {
+            completion(nil)
+            return
+        }
+        let url = store.originalURL(for: photo)
+        let options = rawOptions()
+        let rotation = edit.rotationTurns
+        loadQueue.async {
+            guard let loaded = try? ImageLoader.load(
+                url: url, maxSize: maxEdge, rawOptions: options,
+                rotationTurns: rotation, allowEncoded: true) else {
+                completion(nil)
+                return
+            }
+            // RAW 解码结果已经是线性 ProPhoto；JPEG / HEIC 等编码图要按 ICC 与 CCTF 转过去。
+            var output = loaded.image
+            if loaded.colorSpace != "ProPhoto RGB" || loaded.cctfDecoding {
+                let kind = ColorMath.cctfKind(for: loaded.colorSpace)
+                output = loaded.image.map { rgb in
+                    var linear = rgb
+                    if loaded.cctfDecoding {
+                        linear = Vec3(
+                            ColorMath.cctfDecode(rgb.x, kind: kind),
+                            ColorMath.cctfDecode(rgb.y, kind: kind),
+                            ColorMath.cctfDecode(rgb.z, kind: kind)
+                        )
+                    }
+                    return ColorMath.rgbToRGB(linear, from: loaded.colorSpace, to: "ProPhoto RGB")
+                }
+            }
+            completion(output)
+        }
+    }
+
     private func flushHandoffs() {
         guard let image else {
             let items = pendingHandoffs

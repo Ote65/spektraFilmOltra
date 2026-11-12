@@ -414,6 +414,8 @@ struct MWatermarkEditor: View {
     @State private var tab: Int
     @State private var showImporter = false
     @State private var dragStart: CGSize?
+    /// 当前吸附到的九宫格位置（"x,y"）；只在进入新吸附点时给一次触感。
+    @State private var snapKey = ""
     @State private var background: MPlatformImage?
     @Environment(\.mSafeInsets) private var insets
 
@@ -529,17 +531,55 @@ struct MWatermarkEditor: View {
                     .onChanged { value in
                         if dragStart == nil {
                             dragStart = CGSize(width: config.offsetX, height: config.offsetY)
+                            snapKey = ""
                         }
                         let base = dragStart ?? .zero
                         let dx = Double(value.translation.width / max(1, size.width)) * 100
                         let dy = Double(value.translation.height / max(1, size.height)) * 100
-                        config.offsetX = min(50, max(-50, base.width + dx))
-                        config.offsetY = min(50, max(-50, base.height + dy))
+                        let raw = CGSize(
+                            width: min(50, max(-50, base.width + dx)),
+                            height: min(50, max(-50, base.height + dy))
+                        )
+                        let snapped = Self.snappedOffset(raw, size: size)
+                        config.offsetX = snapped.offset.width
+                        config.offsetY = snapped.offset.height
+                        if snapped.key != snapKey {
+                            snapKey = snapped.key
+                            if !snapped.key.isEmpty { MHaptic.light() }
+                        }
                     }
-                    .onEnded { _ in dragStart = nil }
+                    .onEnded { _ in
+                        dragStart = nil
+                        snapKey = ""
+                    }
             )
         }
         .frame(height: 300)
+    }
+
+    /// 九宫格吸附：水平 / 垂直各三档，对应左中右与上中下；进入吸附位时给轻触感。
+    private static let snapOffsets: [Double] = [-100.0 / 3, 0, 100.0 / 3]
+
+    static func snappedOffset(_ raw: CGSize, size: CGSize)
+        -> (offset: CGSize, key: String) {
+        let thresholdX = 10 / max(1, size.width) * 100
+        let thresholdY = 10 / max(1, size.height) * 100
+        var x = raw.width
+        var y = raw.height
+        var ix = -1
+        var iy = -1
+        for (index, target) in snapOffsets.enumerated()
+        where abs(raw.width - target) <= thresholdX {
+            x = target
+            ix = index
+        }
+        for (index, target) in snapOffsets.enumerated()
+        where abs(raw.height - target) <= thresholdY {
+            y = target
+            iy = index
+        }
+        let key = (ix >= 0 && iy >= 0) ? "\(ix),\(iy)" : ""
+        return (CGSize(width: x, height: y), key)
     }
 
     private func loadBackground() {
@@ -577,7 +617,8 @@ struct MWatermarkEditor: View {
                 .padding(.top, 10)
 
             MParamSlider(label: "旋转", value: $config.rotation, base: 0,
-                         range: -180...180, step: 1, decimals: 0, suffix: "°", compact: true)
+                         range: -180...180, step: 1, decimals: 0, suffix: "°",
+                         compact: true, snapTarget: 0, snapDistance: 1.5)
                 .padding(.top, 4)
 
             MToggleRow(label: "使用投影", isOn: $config.shadow, compact: true)
@@ -692,7 +733,8 @@ struct MWatermarkEditor: View {
             .padding(.top, 14)
 
             MParamSlider(label: "旋转", value: $config.rotation, base: 0,
-                         range: -180...180, step: 1, decimals: 0, suffix: "°", compact: true)
+                         range: -180...180, step: 1, decimals: 0, suffix: "°",
+                         compact: true, snapTarget: 0, snapDistance: 1.5)
                 .padding(.top, 6)
 
             commonSliders
@@ -706,9 +748,11 @@ struct MWatermarkEditor: View {
             MParamSlider(label: "不透明度", value: $config.opacity, base: 80,
                          range: 0...100, step: 1, decimals: 0, suffix: "%", compact: true)
             MParamSlider(label: "水平偏移", value: $config.offsetX, base: 0,
-                         range: -50...50, step: 1, decimals: 0, suffix: "%", compact: true)
+                         range: -50...50, step: 1, decimals: 0, suffix: "%",
+                         compact: true, snapTarget: 0, snapDistance: 2)
             MParamSlider(label: "垂直偏移", value: $config.offsetY, base: 0,
-                         range: -50...50, step: 1, decimals: 0, suffix: "%", compact: true)
+                         range: -50...50, step: 1, decimals: 0, suffix: "%",
+                         compact: true, snapTarget: 0, snapDistance: 2)
         }
     }
 

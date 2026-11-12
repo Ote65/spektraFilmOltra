@@ -1896,8 +1896,12 @@ enum MImageFit {
 /// 相机曝光/色温与调色台裁切页共用，保证两处手感完全一致。
 struct MTickRuler: View {
     let range: ClosedRange<Double>
+    /// 一个刻度代表的值：决定刻度密度与拖动灵敏度。
     let step: Double
     @Binding var value: Double
+    /// 读数量化步长；不填时跟随 `step`。
+    /// 例如刻度仍是 1°、读数细到 0.1°：视觉节奏不变，手感更细腻。
+    var fineStep: Double? = nil
     var spacing: CGFloat = 13
     var rulerHeight: CGFloat = 26
     var haptics = false
@@ -1963,10 +1967,15 @@ struct MTickRuler: View {
     }
 
     private func commit(_ raw: Double) {
-        let quantized = min(max((raw / step).rounded() * step,
+        let quantum = max(abs(fineStep ?? step), 1e-9)
+        let quantized = min(max((raw / quantum).rounded() * quantum,
                                 range.lowerBound), range.upperBound)
-        if abs(quantized - value) > 1e-6 {
-            if haptics { MHaptic.tick() }
+        if abs(quantized - value) > 1e-9 {
+            // 触感只落在整刻度上：0.1° 的细读数不该连续震。
+            let major = max(abs(step), 1e-9)
+            let oldTick = Int((value / major).rounded())
+            let newTick = Int((quantized / major).rounded())
+            if haptics, oldTick != newTick { MHaptic.tick() }
             value = quantized
         }
     }

@@ -57,7 +57,8 @@ struct DevelopScreen: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            MColor.app
+            // 沉浸式预览时整屏统一成画布底色，顶部状态栏区域不会出现一条浅色差。
+            (chromeHidden ? MColor.canvas : MColor.app)
 
             if isSplit {
                 splitLayout
@@ -65,7 +66,8 @@ struct DevelopScreen: View {
                 stackedLayout
             }
         }
-        .background(MColor.app)
+        .background(chromeHidden ? MColor.canvas : MColor.app)
+        .animation(MMotion.quick, value: chromeHidden)
         .overlay {
             if exportOpen {
                 MExportSheet(
@@ -753,8 +755,11 @@ struct DevelopScreen: View {
             .opacity(chromeHidden ? 0 : 1)
             .animation(MMotion.quick, value: chromeHidden)
         }
+        // 沉浸式预览不画画布底边线，避免屏幕底部出现一条横线。
         .overlay(alignment: .bottom) {
-            MHairline(color: MColor.hairlineFaint)
+            if !chromeHidden {
+                MHairline(color: MColor.hairlineFaint)
+            }
         }
     }
 
@@ -1725,6 +1730,8 @@ struct MExportSheet: View {
     @State private var qualityIndex = MobileSettings.defaultExportQualityIndex
     /// 本次导出是否合成水印；初始值跟随设置里的水印开关。
     @State private var addWatermark = MWatermarkStore.load().enabled
+    /// 设置里关闭「导出时添加水印」后，导出面板不再给出这个勾选。
+    @State private var watermarkAvailable = MWatermarkStore.load().enabled
     @State private var showMore = false
     @State private var phase: MExportPhase = .idle
     /// 完成对勾的入场动画开关。
@@ -1919,7 +1926,9 @@ struct MExportSheet: View {
             field("文件类型") { formatField }
             field("尺寸") { edgeField }
             field("图像品质") { qualityField }
-            watermarkOption
+            if watermarkAvailable {
+                watermarkOption
+            }
 
             hairline
 
@@ -2200,7 +2209,7 @@ struct MExportSheet: View {
         donePop = false
         withAnimation(MMotion.state) { phase = .exporting }
         let quality = isJPEG ? Double(qualityValues[min(qualityIndex, qualityValues.count - 1)]) / 100 : 0.95
-        onExport(format.id, edgeIndex, quality, addWatermark) { result in
+        onExport(format.id, edgeIndex, quality, addWatermark && watermarkAvailable) { result in
             switch result {
             case .success(let url):
                 // 默认保存到相册：成功不打扰，失败/被拒时必须告诉用户文件还在 App 内。

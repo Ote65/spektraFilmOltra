@@ -207,12 +207,13 @@ final class LibraryStore {
         let cctfDecoding: Bool
     }
 
-    /// 允许入库的扩展名：默认仅 RAW；打开「支持 JPEG」后只额外放行 JPEG。
-    /// PNG / HEIC 等编码图不进库，避免网络保存图和截屏混入。
+    /// 允许入库的扩展名：默认仅 RAW；打开「支持 JPEG」后放行所有可显影的编码图
+    /// （JPEG / HEIC / PNG / TIFF…）。这样主页「全部 / 收藏」才能完整映射系统相册，
+    /// 不会在 JPEG 模式下看起来只剩 RAW。
     static func accepts(_ source: URL, allowingEncoded: Bool) -> Bool {
         let ext = source.pathExtension.lowercased()
         if ImageLoader.rawSuffixes.contains(ext) { return true }
-        return allowingEncoded && (ext == "jpg" || ext == "jpeg")
+        return allowingEncoded && ImageLoader.encodedSuffixes.contains(ext)
     }
 
     /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。

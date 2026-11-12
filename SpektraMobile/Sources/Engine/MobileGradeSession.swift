@@ -1,6 +1,14 @@
 import Foundation
 import SwiftUI
 
+/// 调色台的源像素来源。
+enum MGradeSource {
+    /// 显影台交接过来的显影结果（正常链路）。
+    case developed
+    /// 直接调色：原片解码后直接进入调色台，不跑胶片显影。
+    case original
+}
+
 /// 调色会话：只接收显影会话产出的线性 ProPhoto 交接像素，
 /// 不在调色台里读取 RAW，也不反向修改显影参数。
 @MainActor
@@ -9,6 +17,7 @@ final class MobileGradeSession: ObservableObject {
     let filename: String
     private let store: LibraryStore
     private let develop: MobileDevelopSession
+    private let sourceMode: MGradeSource
 
     @Published private(set) var previewImage: MPlatformImage?
     @Published private(set) var originalImage: MPlatformImage?
@@ -88,11 +97,13 @@ final class MobileGradeSession: ObservableObject {
     }
     private static let previewScaleKey = "mobile.grade.previewScale"
 
-    init(photo: LibraryPhoto, store: LibraryStore, develop: MobileDevelopSession) {
+    init(photo: LibraryPhoto, store: LibraryStore, develop: MobileDevelopSession,
+         source: MGradeSource = .developed) {
         self.photoID = photo.id
         self.filename = photo.filename
         self.store = store
         self.develop = develop
+        self.sourceMode = source
         let stamp = MFilmBorderRenderer.captureStamp(url: store.originalURL(for: photo))
         self.captureDateLabel = stamp.date
         self.captureTimeLabel = stamp.time
@@ -121,7 +132,7 @@ final class MobileGradeSession: ObservableObject {
         let filmID = develop.filmID
         let borderConfig = border
         let geometry = geometry
-        develop.prepareHandoff(maxEdge: sourceEdge) { [weak self] image in
+        handoff(maxEdge: sourceEdge) { [weak self] image in
             guard let self else { return }
             guard let image else {
                 Task { @MainActor in
@@ -169,6 +180,16 @@ final class MobileGradeSession: ObservableObject {
                 }
                 self.schedule(immediate: true)
             }
+        }
+    }
+
+    /// 交接像素：正常链路走显影结果，直接调色入口走原片。
+    private func handoff(maxEdge: Int, completion: @escaping (ImageRGB?) -> Void) {
+        switch sourceMode {
+        case .developed:
+            develop.prepareHandoff(maxEdge: maxEdge, completion: completion)
+        case .original:
+            develop.prepareOriginalHandoff(maxEdge: maxEdge, completion: completion)
         }
     }
 
@@ -611,7 +632,7 @@ final class MobileGradeSession: ObservableObject {
         phaseLabel = "导出调色"
         exportLabel = "导出调色"
         phaseProgress = 0
-        develop.prepareHandoff(maxEdge: edge) { [weak self] image in
+        handoff(maxEdge: edge) { [weak self] image in
             guard let self else { return }
             guard let image else {
                 Task { @MainActor in

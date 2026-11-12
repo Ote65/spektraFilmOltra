@@ -284,9 +284,11 @@ final class MobileEngine: ObservableObject {
         }
     }
 
-    /// 主页可见的本体：RAW 一律收；非 RAW 只收 JPEG（PNG / HEIC 都被筛掉）。
-    /// 关闭「支持 JPEG」时非 RAW 全部不收。
-    private nonisolated static func displayResource(for asset: PHAsset, allowNonRaw: Bool) -> PHAssetResource? {
+    /// 主页可见的本体：RAW 一律收；打开「支持 JPEG」后收所有可显影编码图
+    /// （JPEG / HEIC / PNG / TIFF…），「全部 / 收藏」才能和系统相册一致；
+    /// 关闭时非 RAW 全部不收。
+    private nonisolated static func displayResource(for asset: PHAsset,
+                                                    allowNonRaw: Bool) -> PHAssetResource? {
         let resources = PHAssetResource.assetResources(for: asset)
         if let raw = resources.first(where: {
             UTType($0.uniformTypeIdentifier)?.conforms(to: .rawImage) == true
@@ -294,9 +296,12 @@ final class MobileEngine: ObservableObject {
             return raw
         }
         guard allowNonRaw else { return nil }
-        return resources.first {
-            UTType($0.uniformTypeIdentifier)?.conforms(to: .jpeg) == true
+        let encoded = resources.filter {
+            UTType($0.uniformTypeIdentifier)?.conforms(to: .image) == true
         }
+        // 优先 JPEG；没有 JPEG 时用 HEIC / PNG / TIFF 等可解码编码图。
+        return encoded.first { UTType($0.uniformTypeIdentifier)?.conforms(to: .jpeg) == true }
+            ?? encoded.first
     }
 
     @discardableResult
@@ -546,6 +551,7 @@ final class MobileEngine: ObservableObject {
     // MARK: - 调色会话
 
     /// 从主页直接进调色台时，临时建一个不显示的显影会话，只为产出交接像素。
+    /// `.direct` 入口不跑显影：交接图由原片直接解码，照片原样进入调色台。
     func openGrade(photoID: String, entry: MGradeEntry) -> MobileGradeSession? {
         guard let photo = store.photos.first(where: { $0.id == photoID }) else { return nil }
         let develop: MobileDevelopSession
@@ -554,9 +560,13 @@ final class MobileEngine: ObservableObject {
             current.finish()
         } else {
             develop = MobileDevelopSession(photo: photo, store: store)
-            develop.start()
+            if entry != .direct {
+                develop.start()
+            }
         }
-        let grade = MobileGradeSession(photo: photo, store: store, develop: develop)
+        let grade = MobileGradeSession(
+            photo: photo, store: store, develop: develop,
+            source: entry == .direct ? .original : .developed)
         gradeSession = grade
         if let id = DebugLaunch.gradeBorder,
            let preset = MFilmBorderPreset.preset(id: id) {

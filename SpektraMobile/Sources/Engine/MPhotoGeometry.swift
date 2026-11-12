@@ -162,17 +162,24 @@ struct MPhotoGeometry: Codable, Equatable {
     }
 
     /// 单位方框 → 校正后的四边形。
-    /// 透视把对应一侧**向外扩张**：源图该侧在输出中占得更宽，输出看到的就是该侧被放大，
-    /// 也就是把"上窄下宽"这类透视拉直。外扩保证输出画布始终落在四边形内部，
-    /// 不会出现黑边或边缘拖影；超出画布的部分自然被裁掉（与 Lightroom 一致）。
-    /// 旋转需要单独放大保证四角被覆盖，透视本身不做整体缩放。
+    /// 按 Lightroom 的透视逻辑：以画面中心为轴做梯形变换，一侧向外扩张、对侧向内收；
+    /// 然后把整块梯形放大到「最窄的一侧刚好铺满画幅」。这样扩张的一侧会伸出原画幅，
+    /// 取景框内又不会出现黑边 —— 观感是照片被向外拉伸，而不是压回原来的比例。
+    /// 旋转需要单独放大保证四角被覆盖，透视本身只做上面的贴边补偿。
     private func warpQuad(width: Double, height: Double) -> [CGPoint] {
         let pv = perspectiveV / 100
         let ph = perspectiveH / 100
-        let top = 1 + max(pv, 0) * 0.45
-        let bottom = 1 + max(-pv, 0) * 0.45
-        let right = 1 + max(ph, 0) * 0.45
-        let left = 1 + max(-ph, 0) * 0.45
+        let strength = 0.35
+        let topScale = 1 + pv * strength
+        let bottomScale = 1 - pv * strength
+        let rightScale = 1 + ph * strength
+        let leftScale = 1 - ph * strength
+        // 贴边补偿：最窄的一边放大回 1.0，保证原画幅始终落在四边形内部。
+        let fit = 1 / max(0.2, min(topScale, bottomScale, leftScale, rightScale))
+        let top = topScale * fit
+        let bottom = bottomScale * fit
+        let right = rightScale * fit
+        let left = leftScale * fit
 
         var points = [
             CGPoint(x: 0.5 - top / 2, y: 0.5 - left / 2),

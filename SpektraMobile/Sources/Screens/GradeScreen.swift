@@ -69,7 +69,8 @@ struct GradeScreen: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            MColor.app
+            // 沉浸式预览时整屏统一成画布底色：顶栏 / 抽屉留下的空档不会和画布出现色差。
+            (chromeHidden ? MColor.canvas : MColor.app)
 
             if isSplit {
                 splitLayout
@@ -77,7 +78,8 @@ struct GradeScreen: View {
                 stackedLayout
             }
         }
-        .background(MColor.app)
+        .background(chromeHidden ? MColor.canvas : MColor.app)
+        .animation(MMotion.quick, value: chromeHidden)
         .overlay {
             if exportOpen {
                 MExportSheet(
@@ -733,6 +735,8 @@ struct GradeScreen: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
 
                 Spacer()
 
@@ -772,8 +776,14 @@ struct GradeScreen: View {
                 .animation(MMotion.quick, value: chromeHidden)
                 .animation(MMotion.quick, value: drawerHeight)
             }
+            .allowsHitTesting(!chromeHidden)
         }
-        .overlay(alignment: .bottom) { MHairline(color: MColor.hairlineFaint) }
+        // 沉浸式预览不画画布底边线，避免屏幕底部出现一条横线。
+        .overlay(alignment: .bottom) {
+            if !chromeHidden {
+                MHairline(color: MColor.hairlineFaint)
+            }
+        }
     }
 
     /// 交接图失败时替代空白画布的失败卡：说明原因并给出重试入口。
@@ -832,7 +842,7 @@ struct GradeScreen: View {
             }
             .foregroundStyle(MColor.text3)
             .padding(.horizontal, 8)
-            .frame(height: 24)
+            .frame(height: 28)
             .mGlassSurface(Capsule(), fallbackFill: Color.black.opacity(0.5))
             .overlay(Capsule().strokeBorder(MColor.hairline, lineWidth: 1))
         }

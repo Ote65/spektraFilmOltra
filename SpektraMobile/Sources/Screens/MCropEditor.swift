@@ -79,17 +79,20 @@ struct MCropEditor: View {
 
     private var canvas: some View {
         GeometryReader { proxy in
-            // 取景框锚定在原画幅上，尺寸固定；校正后的照片按外接框绘制，
-            // 超出原画幅的部分自然溢出画布（与系统相册、Lightroom 一致），
-            // 所以拖动透视/旋转时照片不会缩进画框里。
-            let frame = MImageFit.rect(aspect: orientedAspect, in: proxy.size,
-                                       horizontalPadding: 18)
+            // 校正后的照片按外接框整体适配画布：透视把一侧向外拉伸时，整张照片会被缩小展示，
+            // 扩张出来的部分真正可见（而不是被屏幕边缘裁掉）；取景框再按原画幅缩小叠在照片上。
             let bounds = photoBounds
-            let photo = CGRect(
-                x: frame.minX + bounds.minX * frame.width,
-                y: frame.minY + bounds.minY * frame.height,
-                width: bounds.width * frame.width,
-                height: bounds.height * frame.height
+            let warpedAspect = CGFloat(bounds.width) * orientedAspect
+                / CGFloat(max(1e-6, bounds.height))
+            let photo = MImageFit.rect(aspect: warpedAspect, in: proxy.size,
+                                       horizontalPadding: 18)
+            let unitWidth = photo.width / CGFloat(max(1e-6, bounds.width))
+            let unitHeight = photo.height / CGFloat(max(1e-6, bounds.height))
+            let frame = CGRect(
+                x: photo.minX - CGFloat(bounds.minX) * unitWidth,
+                y: photo.minY - CGFloat(bounds.minY) * unitHeight,
+                width: unitWidth,
+                height: unitHeight
             )
             ZStack {
                 if let image = preview.image {
@@ -163,38 +166,84 @@ struct MCropEditor: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// 水平纠正：一条整轨滑杆，整条轨道 = 90°，拖满一屏就到 ±45°。
+    /// 水平纠正：iOS 原相机同款刻度尺，读数细分到 0.1°，拖动仍然按 1° 一格滚动。
     private var straightenPanel: some View {
-        VStack(spacing: 2) {
-            panelHeader(title: "水平") {
-                draft.straighten = 0
-            }
-
-            MParamSlider(label: "角度", value: $draft.straighten, base: 0,
-                         range: -45...45, step: 1, decimals: 0, suffix: "°",
-                         compact: true, snapTarget: 0, snapDistance: 2)
-                .padding(.horizontal, 20)
+        rulerPanel(title: "水平", value: $draft.straighten,
+                   range: -45...45, step: 1, fineStep: 0.1,
+                   decimals: 1, suffix: "°") {
+            draft.straighten = 0
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     private var perspectivePanel: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 4) {
             panelHeader(title: "透视纠正") {
                 draft.perspectiveV = 0
                 draft.perspectiveH = 0
             }
 
-            MParamSlider(label: "垂直", value: $draft.perspectiveV, base: 0,
-                         range: -100...100, step: 1, decimals: 0, suffix: "",
-                         compact: true, snapTarget: 0, snapDistance: 4)
-                .padding(.horizontal, 20)
-            MParamSlider(label: "水平", value: $draft.perspectiveH, base: 0,
-                         range: -100...100, step: 1, decimals: 0, suffix: "",
-                         compact: true, snapTarget: 0, snapDistance: 4)
+            perspectiveRow(title: "垂直", value: $draft.perspectiveV)
+            perspectiveRow(title: "水平", value: $draft.perspectiveH)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+
+    private func rulerPanel(
+        title: String, value: Binding<Double>,
+        range: ClosedRange<Double>, step: Double, fineStep: Double,
+        decimals: Int, suffix: String,
+        reset: @escaping () -> Void
+    ) -> some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.mSans(11, .medium))
+                    .foregroundStyle(MColor.text3)
+                Text(rulerText(value.wrappedValue, decimals: decimals, suffix: suffix))
+                    .font(.mSans(13, .medium).monospacedDigit())
+                    .foregroundStyle(MColor.text1)
+                Spacer()
+                Button("复位") {
+                    withAnimation(MMotion.state) { reset() }
+                }
+                .font(.mSans(11, .medium))
+                .foregroundStyle(MColor.text3)
+            }
+            .padding(.horizontal, 20)
+
+            MTickRuler(range: range, step: step, value: value,
+                       fineStep: fineStep, haptics: true)
                 .padding(.horizontal, 20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+
+    private func perspectiveRow(title: String, value: Binding<Double>) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.mSans(10, .medium))
+                .foregroundStyle(MColor.text3)
+                .frame(width: 26, alignment: .leading)
+            Text(rulerText(value.wrappedValue, decimals: 0, suffix: "", signed: true))
+                .font(.mSans(10, .medium).monospacedDigit())
+                .foregroundStyle(MColor.text2)
+                .frame(width: 34, alignment: .trailing)
+            MTickRuler(range: -100...100, step: 1, value: value, haptics: true)
+        }
+        .padding(.horizontal, 20)
+    }
+
+    private func rulerText(_ value: Double, decimals: Int,
+                           suffix: String, signed: Bool = true) -> String {
+        let cutoff = pow(10, Double(-decimals)) * 0.5
+        let normalized = abs(value) < cutoff ? 0 : value
+        var text = String(format: "%.\(decimals)f", normalized)
+        if decimals > 0, text.contains(".") {
+            while text.hasSuffix("0") { text.removeLast() }
+            if text.hasSuffix(".") { text.removeLast() }
+        }
+        if signed, normalized > 0 { text = "+" + text }
+        return text + suffix
     }
 
     private func panelHeader(title: String, reset: @escaping () -> Void) -> some View {
