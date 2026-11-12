@@ -567,8 +567,9 @@ final class MobileGradeSession: ObservableObject {
 
     // MARK: - 导出
 
-    /// `jpegQuality` 仅在 JPEG 档生效，取值 0…1。
+    /// `jpegQuality` 仅在 JPEG 档生效，取值 0…1；`includeWatermark` 是导出面板的单次水印开关。
     func export(format: Int, longEdgeIndex: Int, jpegQuality: Double = 0.95,
+                includeWatermark: Bool = true,
                 completion: @escaping (Result<URL, Error>) -> Void) {
         guard !isExporting, sourceReady else {
             completion(.failure(MobileExportError.busy))
@@ -580,6 +581,7 @@ final class MobileGradeSession: ObservableObject {
         let filmID = develop.filmID
         let dateLabel = captureDateLabel
         let timeLabel = captureTimeLabel
+        let watermarkEnabled = includeWatermark
         let watermark = MWatermarkStore.load()
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
         // 片边会把成品放大一圈：开启片边时「原始」也按内存余量钳位，避免大图导出被 jetsam。
@@ -629,10 +631,13 @@ final class MobileGradeSession: ObservableObject {
                     var output = Self.convertForExport(
                         result.image, colorSpace: targetSpace, cctfEncoding: targetCCTF)
                     // 水印属于照片本身：先压进画面，再合成片边，避免盖到片基与边字上。
-                    if watermark.enabled {
+                    if watermarkEnabled {
                         Task { @MainActor in self.exportLabel = "合成水印" }
+                        var config = watermark
+                        // 导出面板的勾选是这次导出的最终决定，覆盖设置里的启用位。
+                        config.enabled = true
                         output = MWatermarkRenderer.composite(
-                            image: output, config: watermark,
+                            image: output, config: config,
                             colorSpace: targetSpace, cctfEncoding: targetCCTF
                         )
                     }

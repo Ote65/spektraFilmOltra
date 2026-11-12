@@ -92,9 +92,10 @@ struct GradeScreen: View {
                         onGoHome()
                     },
                     onNote: onToast,
-                    onExport: { format, edge, quality, done in
+                    onExport: { format, edge, quality, watermark, done in
                         session.export(format: format, longEdgeIndex: edge,
-                                       jpegQuality: quality) { result in
+                                       jpegQuality: quality,
+                                       includeWatermark: watermark) { result in
                             if case .failure(let error) = result {
                                 onToast((error as? LUTParseError)?.errorDescription ?? "导出失败")
                             }

@@ -80,9 +80,10 @@ struct DevelopScreen: View {
                         onBack()
                     },
                     onNote: onToast,
-                    onExport: { format, edge, quality, done in
+                    onExport: { format, edge, quality, watermark, done in
                         session.export(format: format, longEdgeIndex: edge,
-                                       jpegQuality: quality) { result in
+                                       jpegQuality: quality,
+                                       includeWatermark: watermark) { result in
                             if case .failure = result { onToast("导出失败") }
                             done(result)
                         }
@@ -1714,7 +1715,7 @@ struct MExportSheet: View {
     let onReturnHome: () -> Void
     /// 相册写入是后台静默的，失败时用调用方的 toast 说明「文件已在 App 内」。
     var onNote: (String) -> Void = { _ in }
-    let onExport: (Int, Int, Double, @escaping (Result<URL, Error>) -> Void) -> Void
+    let onExport: (Int, Int, Double, Bool, @escaping (Result<URL, Error>) -> Void) -> Void
 
     /// 指针指向 `formats` 的下标；初始值来自设置里的默认导出格式。
     @State private var formatIndex = MobileSettings.defaultExportFormatIndex
@@ -1722,6 +1723,8 @@ struct MExportSheet: View {
     @State private var edgeIndex = MobileSettings.defaultExportEdgeIndex
     /// 0 100%、1 95%、2 90%、3 80%。
     @State private var qualityIndex = MobileSettings.defaultExportQualityIndex
+    /// 本次导出是否合成水印；初始值跟随设置里的水印开关。
+    @State private var addWatermark = MWatermarkStore.load().enabled
     @State private var showMore = false
     @State private var phase: MExportPhase = .idle
     /// 完成对勾的入场动画开关。
@@ -1916,6 +1919,7 @@ struct MExportSheet: View {
             field("文件类型") { formatField }
             field("尺寸") { edgeField }
             field("图像品质") { qualityField }
+            watermarkOption
 
             hairline
 
@@ -2027,6 +2031,29 @@ struct MExportSheet: View {
             .accessibilityLabel("图像品质")
             .accessibilityValue("无损")
         }
+    }
+
+    /// 单次导出的水印开关：取消勾选就不合成水印，其余参数仍走设置里的水印配置。
+    private var watermarkOption: some View {
+        Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) { addWatermark.toggle() }
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: addWatermark ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(addWatermark ? MColor.brass : MColor.text3)
+                Text("添加水印")
+                    .font(.mSans(12.5, .medium))
+                    .foregroundStyle(MColor.text1)
+                Spacer(minLength: 0)
+            }
+            .frame(height: 30)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("添加水印")
+        .accessibilityValue(addWatermark ? "开启" : "关闭")
     }
 
     private var moreOptions: some View {
@@ -2173,7 +2200,7 @@ struct MExportSheet: View {
         donePop = false
         withAnimation(MMotion.state) { phase = .exporting }
         let quality = isJPEG ? Double(qualityValues[min(qualityIndex, qualityValues.count - 1)]) / 100 : 0.95
-        onExport(format.id, edgeIndex, quality) { result in
+        onExport(format.id, edgeIndex, quality, addWatermark) { result in
             switch result {
             case .success(let url):
                 // 默认保存到相册：成功不打扰，失败/被拒时必须告诉用户文件还在 App 内。

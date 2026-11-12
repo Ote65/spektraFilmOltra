@@ -614,8 +614,9 @@ final class MobileDevelopSession: ObservableObject {
     // MARK: - 导出
 
     /// 导出请求：`format` 0 sRGB TIFF16、1 ProPhoto 线性 TIFF16、2 ACES 线性 EXR、3 JPEG。
-    /// `jpegQuality` 仅在 JPEG 档生效，取值 0…1。
+    /// `jpegQuality` 仅在 JPEG 档生效，取值 0…1；`includeWatermark` 是导出面板的单次水印开关。
     func export(format: Int, longEdgeIndex: Int, jpegQuality: Double = 0.95,
+                includeWatermark: Bool = true,
                 completion: @escaping (Result<URL, Error>) -> Void) {
         guard !isExporting, let image else {
             completion(.failure(MobileExportError.busy))
@@ -662,7 +663,8 @@ final class MobileDevelopSession: ObservableObject {
         let sourceURL = originalURL
         let options = rawOptions()
         let rotation = edit.rotationTurns
-        // 水印只在最终导出合成，不进入预览链路。
+        // 水印只在最终导出合成，不进入预览链路；导出面板的勾选可单次关闭。
+        let watermarkEnabled = includeWatermark
         let watermark = MWatermarkStore.load()
         let monochrome = edit.monochrome
         isExporting = true
@@ -693,9 +695,12 @@ final class MobileDevelopSession: ObservableObject {
             if monochrome {
                 output = Self.monochrome(output, colorSpace: colorSpace)
             }
-            if watermark.enabled {
+            if watermarkEnabled {
+                var config = watermark
+                // 导出面板的勾选是这次导出的最终决定，覆盖设置里的启用位。
+                config.enabled = true
                 output = MWatermarkRenderer.composite(
-                    image: output, config: watermark,
+                    image: output, config: config,
                     colorSpace: colorSpace, cctfEncoding: cctf
                 )
             }
