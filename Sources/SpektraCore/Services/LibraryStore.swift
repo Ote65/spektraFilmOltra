@@ -107,11 +107,14 @@ final class LibraryStore {
     private(set) var photos: [LibraryPhoto] = []
     let root: URL
     private let ioQueue = DispatchQueue(label: "spektrafilm.library.io", qos: .utility)
+    /// 移动端打开「支持 JPEG」后需要保留编码图记录，桌面端仍只保留 RAW。
+    private let keepsEncodedRecords: Bool
     private var indexURL: URL { root.appendingPathComponent("index.json") }
     private var originalsURL: URL { root.appendingPathComponent("Originals", isDirectory: true) }
     private var thumbnailsURL: URL { root.appendingPathComponent("Thumbnails", isDirectory: true) }
 
-    init(root: URL? = nil) {
+    init(root: URL? = nil, keepsEncodedRecords: Bool = false) {
+        self.keepsEncodedRecords = keepsEncodedRecords
         let base = root ?? FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         )[0].appendingPathComponent("Spektrafilm/Library", isDirectory: true)
@@ -128,9 +131,13 @@ final class LibraryStore {
             photos = []
             return
         }
-        // 索引里的记录一律保留：关掉「支持 JPEG」时由展示层隐藏，
-        // 重新打开后编辑记录还在，不能在这里按扩展名把记录丢掉。
-        photos = decoded
+        // 移动端要保留编码图记录（关掉「支持 JPEG」时只在主页隐藏）；
+        // 桌面端维持只收 RAW，避免历史索引里的编码图重新出现在库中。
+        photos = keepsEncodedRecords ? decoded : decoded.filter {
+            ImageLoader.rawSuffixes.contains(
+                URL(fileURLWithPath: $0.originalPath).pathExtension.lowercased()
+            )
+        }
     }
 
     func save() throws {
@@ -200,11 +207,12 @@ final class LibraryStore {
         let cctfDecoding: Bool
     }
 
-    /// 允许入库的扩展名：默认仅 RAW；打开「支持 JPEG」后再加常见编码图。
+    /// 允许入库的扩展名：默认仅 RAW；打开「支持 JPEG」后只额外放行 JPEG。
+    /// PNG / HEIC 等编码图不进库，避免网络保存图和截屏混入。
     static func accepts(_ source: URL, allowingEncoded: Bool) -> Bool {
         let ext = source.pathExtension.lowercased()
         if ImageLoader.rawSuffixes.contains(ext) { return true }
-        return allowingEncoded && ImageLoader.encodedSuffixes.contains(ext)
+        return allowingEncoded && (ext == "jpg" || ext == "jpeg")
     }
 
     /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。

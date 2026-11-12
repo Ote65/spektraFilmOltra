@@ -51,8 +51,6 @@ struct MLibraryAsset: Identifiable, Hashable {
     let photo: MPhoto?
     /// 相册资产本体：未入库时靠它取相册缩略图，入库时取原片。
     let phAsset: PHAsset?
-    /// 是否为拍摄图：RAW 或带相机 EXIF 的编码图；网络保存的图片为 false。
-    var isCaptured: Bool = true
 
     var isImported: Bool { photo != nil }
     var isGraded: Bool { photo?.isGraded ?? false }
@@ -79,6 +77,31 @@ struct MLibraryAsset: Identifiable, Hashable {
         lhs.id == rhs.id && lhs.photo?.id == rhs.photo?.id
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+/// 主页顶部的类型筛选：全部 / 收藏 / RAW / 已调色 / 某个系统相簿。
+enum MAssetScope: Hashable {
+    case all
+    case favorites
+    case raw
+    case graded
+    case album(String)
+
+    var title: String {
+        switch self {
+        case .all: return "全部"
+        case .favorites: return "收藏"
+        case .raw: return "RAW"
+        case .graded: return "已调色"
+        case .album: return "相簿"
+        }
+    }
+}
+
+/// 系统相册里的用户相簿。
+struct MAlbum: Identifiable, Hashable {
+    let id: String
+    let title: String
 }
 
 struct MFilm: Identifiable, Hashable {

@@ -10,7 +10,8 @@ struct HomeScreen: View {
     let onOpenSettings: () -> Void
     let onToast: (String) -> Void
 
-    @State private var filter: HomeFilter = .all
+    /// 颜色标签是跨相簿的附加筛选，固定在筛选行右侧。
+    @State private var colorFilter: MColorLabel?
     @State private var sortMode: HomeSort = .recent
     @State private var actionPhoto: MPhoto?
     @State private var folderPickerOpen = false
@@ -81,14 +82,11 @@ struct HomeScreen: View {
             handleFolderImport(result)
         }
         .task {
-            // 主页默认就是「相册」，不再需要先点导入。
-            // 打开「支持 JPEG」时默认只显示拍摄图，避免网络保存的图片混进网格。
-            if allowNonRaw { filter = .capture }
+            // 主页直接映射系统相册，不需要先「导入」。
             await engine.refreshAssets()
         }
-        .onChange(of: allowNonRaw) { _, isOn in
-            // 设置里切换「支持 JPEG」后立刻按新范围重扫相册，并同步库里照片的可见性。
-            filter = isOn ? .capture : .all
+        .onChange(of: allowNonRaw) { _, _ in
+            // 设置里切换「支持 JPEG」后按新范围重新映射，当前选中的相簿保持不变。
             engine.refreshPhotos()
             Task { await engine.refreshAssets() }
         }
@@ -224,7 +222,7 @@ struct HomeScreen: View {
             }
 
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\(visibleAssets.count) 张\(allowNonRaw ? "照片" : "RAW") · \(gradedCount) 张已调色")
+                Text("\(visibleAssets.count) 张\(countUnit) · \(gradedCount) 张已调色")
                     .mMeta(10, color: MColor.text3)
 
                 Spacer(minLength: 0)
@@ -239,45 +237,74 @@ struct HomeScreen: View {
     // MARK: - 筛选
 
     private var filterRow: some View {
-        ScrollView(.horizontal) {
-            HStack(spacing: 7) {
-                ForEach(HomeFilter.chips(allowNonRaw: allowNonRaw)) { item in
-                    MFilterChip(
-                        title: item.title,
-                        tone: item.tone,
-                        selected: filter == item
-                    ) {
-                        withAnimation(MMotion.state) { filter = item }
+        HStack(spacing: 7) {
+            // 左侧类型按钮：对应系统相簿，可横向滚动。
+            ScrollView(.horizontal) {
+                HStack(spacing: 7) {
+                    ForEach(scopeChips) { chip in
+                        MFilterChip(
+                            title: chip.title,
+                            tone: nil,
+                            selected: engine.scope == chip.scope
+                        ) {
+                            MHaptic.tick()
+                            withAnimation(MMotion.state) {
+                                engine.selectScope(chip.scope)
+                            }
+                        }
                     }
                 }
+                .padding(.leading, MMetric.pageMargin)
+                .padding(.trailing, 4)
+            }
+            .scrollIndicators(.never)
 
-                MVerticalHairline(height: 16)
-                    .padding(.horizontal, 3)
-
+            // 右侧四个颜色标签固定不滚动。
+            HStack(spacing: 2) {
                 ForEach(MColorLabel.allCases) { label in
                     MColorDotFilter(
                         label: label,
-                        selected: filter == .label(label)
+                        selected: colorFilter == label
                     ) {
-                        toggleLabel(label)
+                        MHaptic.tick()
+                        withAnimation(MMotion.state) {
+                            colorFilter = colorFilter == label ? nil : label
+                        }
                     }
                 }
             }
-            .padding(.horizontal, MMetric.pageMargin)
+            .padding(.trailing, MMetric.pageMargin)
         }
-        .scrollIndicators(.never)
     }
 
-    private func toggleLabel(_ label: MColorLabel) {
-        MHaptic.tick()
-        withAnimation(MMotion.state) {
-            filter = filter == .label(label) ? .all : .label(label)
+    /// 类型按钮：全部 / 收藏 / RAW（系统有 RAW 相簿时）/ 已调色 / 系统相簿。
+    private var scopeChips: [ScopeChip] {
+        var chips = [
+            ScopeChip(id: "all", title: "全部", scope: .all),
+            ScopeChip(id: "favorites", title: "收藏", scope: .favorites),
+        ]
+        if engine.hasRawAlbum {
+            chips.append(ScopeChip(id: "raw", title: "RAW", scope: .raw))
         }
+        chips.append(ScopeChip(id: "graded", title: "已调色", scope: .graded))
+        chips += engine.albums.map {
+            ScopeChip(id: $0.id, title: $0.title, scope: .album($0.id))
+        }
+        return chips
+    }
+
+    private var currentScopeTitle: String {
+        ScopeChip.title(for: engine.scope, albums: engine.albums)
+    }
+
+    private var countUnit: String {
+        if case .raw = engine.scope { return "RAW" }
+        return allowNonRaw ? "照片" : "RAW"
     }
 
     private var sectionHead: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(filter.title)
+            Text(currentScopeTitle)
                 .font(.mSans(11, .semibold))
                 .foregroundStyle(MColor.text2)
 
@@ -854,10 +881,10 @@ struct HomeScreen: View {
 
     // MARK: - 从文件夹导入
 
-    /// 可导入的扩展名：关闭「支持 JPEG」时仅 RAW，打开后再加上常见编码图。
+    /// 可导入的扩展名：关闭「支持 JPEG」时仅 RAW，打开后只额外放行 JPEG。
     private var importableSuffixes: Set<String> {
         MobileSettings.allowNonRaw
-            ? ImageLoader.rawSuffixes.union(ImageLoader.encodedSuffixes)
+            ? ImageLoader.rawSuffixes.union(["jpg", "jpeg"])
             : ImageLoader.rawSuffixes
     }
 
@@ -920,23 +947,15 @@ struct HomeScreen: View {
         engine.assetPhase == .ready
             ? engine.assets
             : engine.photos.map {
-                MLibraryAsset(id: $0.id, filename: $0.filename, photo: $0, phAsset: nil,
-                              isCaptured: $0.isRaw)
+                MLibraryAsset(id: $0.id, filename: $0.filename, photo: $0, phAsset: nil)
             }
     }
 
-    /// 主页可见数据源：在相册资产上叠加筛选与搜索。
+    /// 主页可见数据源：类型由 engine.scope 决定，这里只叠加颜色标签、搜索与排序。
     private var visibleAssets: [MLibraryAsset] {
-        var filtered = sourceAssets.filter { asset in
-            let photo = asset.photo
-            switch filter {
-            case .all: return true
-            case .capture: return asset.isCaptured
-            case .raw: return asset.isRawFormat
-            case .favorite: return engine.isFavorite(asset)
-            case .graded: return photo?.isGraded ?? false
-            case .label(let label): return photo?.color == label
-            }
+        var filtered = sourceAssets
+        if let colorFilter {
+            filtered = filtered.filter { $0.photo?.color == colorFilter }
         }
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !keyword.isEmpty {
@@ -1239,31 +1258,17 @@ private struct MAssetThumb: View {
 
 // MARK: - 筛选 / 排序
 
-enum HomeFilter: Identifiable, Hashable {
-    case all, capture, favorite, graded, raw, label(MColorLabel)
+/// 顶部类型按钮：相簿筛选 + 软件自己的「已调色」。
+private struct ScopeChip: Identifiable {
+    let id: String
+    let title: String
+    let scope: MAssetScope
 
-    var id: String { title }
-
-    /// 「拍摄 / RAW」只在打开「支持 JPEG」后出现，关闭时仍是原来的三项。
-    static func chips(allowNonRaw: Bool) -> [HomeFilter] {
-        allowNonRaw ? [.all, .capture, .favorite, .graded, .raw]
-                    : [.all, .favorite, .graded]
-    }
-
-    var title: String {
-        switch self {
-        case .all: return "全部"
-        case .capture: return "拍摄"
-        case .favorite: return "收藏"
-        case .graded: return "已调色"
-        case .raw: return "RAW"
-        case .label(let label): return label.title
+    static func title(for scope: MAssetScope, albums: [MAlbum]) -> String {
+        if case .album(let id) = scope {
+            return albums.first(where: { $0.id == id })?.title ?? "相簿"
         }
-    }
-
-    var tone: MColorLabel? {
-        if case .label(let label) = self { return label }
-        return nil
+        return scope.title
     }
 }
 
