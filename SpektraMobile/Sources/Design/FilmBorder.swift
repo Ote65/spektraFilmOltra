@@ -306,6 +306,23 @@ enum MFilmBorderTextTone: String, CaseIterable, Identifiable {
     }
 }
 
+/// 边字内容：跟随所用胶片、固定品牌字，或完全自定义。
+enum MFilmBorderTextContent: String, CaseIterable, Identifiable {
+    case followFilm
+    case oltrafilm
+    case custom
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .followFilm: return "随胶片"
+        case .oltrafilm: return "OLTRAFILM"
+        case .custom: return "自定义内容"
+        }
+    }
+}
+
 /// 日期戳的落点：模拟胶片相机日期后背在画面角落打上的日期。
 enum MFilmBorderDatePosition: String, CaseIterable, Identifiable {
     case bottomRight
@@ -409,6 +426,21 @@ enum MFilmBorderDateFont: String, CaseIterable, Identifiable {
     var isDSEG7: Bool { self == .dseg7 }
 }
 
+/// 日期戳方向：横排或旋转 90° 竖排。
+enum MFilmBorderDateOrientation: String, CaseIterable, Identifiable {
+    case horizontal
+    case vertical
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .horizontal: return "横排"
+        case .vertical: return "竖排"
+        }
+    }
+}
+
 /// 片边宽度的两种口径：
 /// - `.visual` 按参考扫描件的观感取比例，片边纤细、画面更大；
 /// - `.real` 严格按底片机械尺寸换算，用于需要真实比例的场合。
@@ -444,6 +476,8 @@ struct MFilmBorderConfig: Codable, Hashable {
     var baseTone: String = MFilmBorderBase.colorNegative.rawValue
     var baseBrightness: Double = 0.0
     var edgeText: Bool = true
+    /// 边字内容来源：随胶片 / OLTRAFILM / 自定义内容。
+    var edgeTextMode: String = MFilmBorderTextContent.followFilm.rawValue
     var customText: String = ""
     var textTone: String = MFilmBorderTextTone.auto.rawValue
     var textScale: Double = 1.0
@@ -456,6 +490,9 @@ struct MFilmBorderConfig: Codable, Hashable {
     var dateStyle: String = MFilmBorderDateStyle.amber.rawValue
     var dateMode: String = MFilmBorderDateMode.date.rawValue
     var dateFont: String = MFilmBorderDateFont.system.rawValue
+    /// 日期字号倍率与方向，让日期戳能按画面比例横排或竖排。
+    var dateScale: Double = 1.0
+    var dateOrientation: String = MFilmBorderDateOrientation.horizontal.rawValue
     /// 留空时使用从原片 EXIF 读取到的拍摄日期。
     var dateText: String = ""
     // 做旧默认全关：干净扫描件才是参考图的方向。
@@ -472,8 +509,8 @@ struct MFilmBorderConfig: Codable, Hashable {
         case enabled, preset, gauge, widthMode, borderScale, corner, cornerScale
         case perf, perfScale, perfPitch, perfBrightness
         case baseTone, baseBrightness
-        case edgeText, customText, textTone, textScale, frameNumbers, dxCode, notch
-        case dateStamp, datePosition, dateStyle, dateMode, dateFont, dateText
+        case edgeText, edgeTextMode, customText, textTone, textScale, frameNumbers, dxCode, notch
+        case dateStamp, datePosition, dateStyle, dateMode, dateFont, dateScale, dateOrientation, dateText
         case scratches, dust, fog
     }
 
@@ -493,7 +530,13 @@ struct MFilmBorderConfig: Codable, Hashable {
         baseTone = try c.decodeIfPresent(String.self, forKey: .baseTone) ?? MFilmBorderBase.colorNegative.rawValue
         baseBrightness = try c.decodeIfPresent(Double.self, forKey: .baseBrightness) ?? 0
         edgeText = try c.decodeIfPresent(Bool.self, forKey: .edgeText) ?? true
-        customText = try c.decodeIfPresent(String.self, forKey: .customText) ?? ""
+        let custom = try c.decodeIfPresent(String.self, forKey: .customText) ?? ""
+        customText = custom
+        // 旧存档只有自定义文本，没有内容来源：文本非空即视为自定义。
+        edgeTextMode = try c.decodeIfPresent(String.self, forKey: .edgeTextMode)
+            ?? (custom.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? MFilmBorderTextContent.followFilm.rawValue
+                : MFilmBorderTextContent.custom.rawValue)
         textTone = try c.decodeIfPresent(String.self, forKey: .textTone) ?? MFilmBorderTextTone.auto.rawValue
         textScale = try c.decodeIfPresent(Double.self, forKey: .textScale) ?? 1
         frameNumbers = try c.decodeIfPresent(Bool.self, forKey: .frameNumbers) ?? true
@@ -508,6 +551,9 @@ struct MFilmBorderConfig: Codable, Hashable {
             ?? MFilmBorderDateMode.date.rawValue
         dateFont = try c.decodeIfPresent(String.self, forKey: .dateFont)
             ?? MFilmBorderDateFont.system.rawValue
+        dateScale = try c.decodeIfPresent(Double.self, forKey: .dateScale) ?? 1
+        dateOrientation = try c.decodeIfPresent(String.self, forKey: .dateOrientation)
+            ?? MFilmBorderDateOrientation.horizontal.rawValue
         dateText = try c.decodeIfPresent(String.self, forKey: .dateText) ?? ""
         scratches = try c.decodeIfPresent(Double.self, forKey: .scratches) ?? 0
         dust = try c.decodeIfPresent(Double.self, forKey: .dust) ?? 0
@@ -536,6 +582,14 @@ struct MFilmBorderConfig: Codable, Hashable {
 
     var dateFontValue: MFilmBorderDateFont {
         MFilmBorderDateFont(rawValue: dateFont) ?? .system
+    }
+
+    var dateOrientationValue: MFilmBorderDateOrientation {
+        MFilmBorderDateOrientation(rawValue: dateOrientation) ?? .horizontal
+    }
+
+    var edgeTextModeValue: MFilmBorderTextContent {
+        MFilmBorderTextContent(rawValue: edgeTextMode) ?? .followFilm
     }
 
     var perfValue: MFilmBorderPerf {
@@ -568,6 +622,8 @@ struct MFilmBorderConfig: Codable, Hashable {
         value.dateStyle = value.dateStyleValue.rawValue
         value.dateMode = value.dateModeValue.rawValue
         value.dateFont = value.dateFontValue.rawValue
+        value.edgeTextMode = value.edgeTextModeValue.rawValue
+        value.dateOrientation = value.dateOrientationValue.rawValue
         value.dateText = String(value.dateText.prefix(24))
         value.borderScale = min(max(value.borderScale, 0.4), 2.0)
         value.cornerScale = min(max(value.cornerScale, 0.0), 3.0)
@@ -576,6 +632,7 @@ struct MFilmBorderConfig: Codable, Hashable {
         value.perfBrightness = min(max(value.perfBrightness, -1.0), 1.0)
         value.baseBrightness = min(max(value.baseBrightness, -1.0), 1.0)
         value.textScale = min(max(value.textScale, 0.5), 2.5)
+        value.dateScale = min(max(value.dateScale, 0.4), 2.5)
         value.scratches = min(max(value.scratches, 0.0), 1.0)
         value.dust = min(max(value.dust, 0.0), 1.0)
         value.fog = min(max(value.fog, 0.0), 1.0)
@@ -589,6 +646,36 @@ struct MFilmBorderConfig: Codable, Hashable {
         lhs.preset = ""
         rhs.preset = ""
         return lhs == rhs
+    }
+}
+
+// MARK: - 片边记忆
+
+/// 片边参数的跨照片 / 跨启动记忆：
+/// 只记样式参数；片边开关启动时一律关闭，做旧效果也不参与记忆。
+enum MFilmBorderMemory {
+    private static let key = "mobile.border.memory"
+
+    /// 记忆快照：强制关闭片边与做旧，其余参数原样保留。
+    static func remembered(_ config: MFilmBorderConfig) -> MFilmBorderConfig {
+        var value = config.normalized()
+        value.enabled = false
+        value.scratches = 0
+        value.dust = 0
+        value.fog = 0
+        return value
+    }
+
+    static func load() -> MFilmBorderConfig? {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data)
+        else { return nil }
+        return remembered(decoded)
+    }
+
+    static func save(_ config: MFilmBorderConfig) {
+        guard let data = try? JSONEncoder().encode(remembered(config)) else { return }
+        UserDefaults.standard.set(data, forKey: key)
     }
 }
 
@@ -795,10 +882,12 @@ enum MFilmBorderRenderer {
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else { return image }
         context.interpolationQuality = .high
+        // 先画片边本体，做旧留到照片像素写入之后再叠，才能同时作用在画面上。
         draw(in: context, layout: layout, config: value,
              photo: nil, punch: true, filmID: filmID, photoID: photoID,
-             dateLabel: dateLabel, timeLabel: timeLabel)
-        guard let buffer = context.data else { return image }
+             dateLabel: dateLabel, timeLabel: timeLabel, includeAging: false)
+        guard let rawBuffer = context.data else { return image }
+        let pixels = rawBuffer.bindMemory(to: UInt8.self, capacity: width * height * 4)
 
         var output = ImageRGB(width: width, height: height)
         let offsetX = Int(layout.aperture.minX.rounded())
@@ -818,7 +907,45 @@ enum MFilmBorderRenderer {
             }
         }
 
-        let pixels = buffer.bindMemory(to: UInt8.self, capacity: width * height * 4)
+        blendOverlay(pixels, bytesPerRow: width * 4, width: width, height: height,
+                     colorSpace: colorSpace, cctfEncoding: cctfEncoding, into: &output)
+
+        // 做旧层盖在整张成品上：片基与画面同时出现同一批划痕、灰尘与雾。
+        if value.scratches > 0.001 || value.dust > 0.001 || value.fog > 0.001,
+           let overlay = agingOverlay(layout: layout, config: value, photoID: photoID),
+           let data = overlay.dataProvider?.data,
+           let pixels = CFDataGetBytePtr(data) {
+            blendOverlay(pixels, bytesPerRow: overlay.bytesPerRow,
+                         width: width, height: height,
+                         colorSpace: colorSpace, cctfEncoding: cctfEncoding, into: &output)
+        }
+        return output
+    }
+
+    /// 做旧单独一层透明底图：导出时在照片像素写入后叠加，预览时直接画在同一上下文里。
+    private static func agingOverlay(layout: MFilmBorderLayout, config: MFilmBorderConfig,
+                                     photoID: String) -> CGImage? {
+        let width = max(1, Int(layout.canvas.width.rounded()))
+        let height = max(1, Int(layout.canvas.height.rounded()))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        context.interpolationQuality = .high
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+        drawAging(context, layout: layout, config: config, photoID: photoID)
+        return context.makeImage()
+    }
+
+    /// 把 sRGB、预乘 alpha 的 8 位 RGBA 图层混合进目标色彩空间的输出像素。
+    private static func blendOverlay(_ pixels: UnsafePointer<UInt8>, bytesPerRow: Int,
+                                     width: Int, height: Int,
+                                     colorSpace: String, cctfEncoding: Bool,
+                                     into output: inout ImageRGB) {
         let needsConversion = !(colorSpace == "sRGB" && cctfEncoding)
         var cache: [UInt32: Vec3] = [:]
         let sRGBKind = ColorMath.cctfKind(for: "sRGB")
@@ -826,50 +953,52 @@ enum MFilmBorderRenderer {
 
         output.data.withUnsafeMutableBufferPointer { destination in
             guard let dst = destination.baseAddress else { return }
-            for index in 0..<(width * height) {
-                let alpha = Double(pixels[index * 4 + 3]) / 255.0
-                guard alpha > 0 else { continue }
-                let invAlpha = 1.0 / alpha
-                let channels = (
-                    UInt8(min(255, max(0, Double(pixels[index * 4]) * invAlpha))),
-                    UInt8(min(255, max(0, Double(pixels[index * 4 + 1]) * invAlpha))),
-                    UInt8(min(255, max(0, Double(pixels[index * 4 + 2]) * invAlpha)))
-                )
-                let converted: Vec3
-                if needsConversion {
-                    let key = (UInt32(channels.0) << 16) | (UInt32(channels.1) << 8) | UInt32(channels.2)
-                    if let cached = cache[key] {
-                        converted = cached
-                    } else {
-                        let linear = Vec3(
-                            ColorMath.cctfDecode(Double(channels.0) / 255.0, kind: sRGBKind),
-                            ColorMath.cctfDecode(Double(channels.1) / 255.0, kind: sRGBKind),
-                            ColorMath.cctfDecode(Double(channels.2) / 255.0, kind: sRGBKind)
-                        )
-                        var target = ColorMath.rgbToRGB(linear, from: "sRGB", to: colorSpace)
-                        if cctfEncoding {
-                            target = Vec3(
-                                ColorMath.cctfEncode(target.x, kind: outKind),
-                                ColorMath.cctfEncode(target.y, kind: outKind),
-                                ColorMath.cctfEncode(target.z, kind: outKind)
+            for row in 0..<height {
+                let rowStart = pixels.advanced(by: row * bytesPerRow)
+                for column in 0..<width {
+                    let alpha = Double(rowStart[column * 4 + 3]) / 255.0
+                    guard alpha > 0 else { continue }
+                    let invAlpha = 1.0 / alpha
+                    let channels = (
+                        UInt8(min(255, max(0, Double(rowStart[column * 4]) * invAlpha))),
+                        UInt8(min(255, max(0, Double(rowStart[column * 4 + 1]) * invAlpha))),
+                        UInt8(min(255, max(0, Double(rowStart[column * 4 + 2]) * invAlpha)))
+                    )
+                    let converted: Vec3
+                    if needsConversion {
+                        let key = (UInt32(channels.0) << 16) | (UInt32(channels.1) << 8) | UInt32(channels.2)
+                        if let cached = cache[key] {
+                            converted = cached
+                        } else {
+                            let linear = Vec3(
+                                ColorMath.cctfDecode(Double(channels.0) / 255.0, kind: sRGBKind),
+                                ColorMath.cctfDecode(Double(channels.1) / 255.0, kind: sRGBKind),
+                                ColorMath.cctfDecode(Double(channels.2) / 255.0, kind: sRGBKind)
                             )
+                            var target = ColorMath.rgbToRGB(linear, from: "sRGB", to: colorSpace)
+                            if cctfEncoding {
+                                target = Vec3(
+                                    ColorMath.cctfEncode(target.x, kind: outKind),
+                                    ColorMath.cctfEncode(target.y, kind: outKind),
+                                    ColorMath.cctfEncode(target.z, kind: outKind)
+                                )
+                            }
+                            converted = target
+                            if cache.count < 131_072 { cache[key] = target }
                         }
-                        converted = target
-                        if cache.count < 131_072 { cache[key] = target }
+                    } else {
+                        converted = Vec3(Double(channels.0) / 255.0,
+                                         Double(channels.1) / 255.0,
+                                         Double(channels.2) / 255.0)
                     }
-                } else {
-                    converted = Vec3(Double(channels.0) / 255.0,
-                                     Double(channels.1) / 255.0,
-                                     Double(channels.2) / 255.0)
+                    let target = (row * width + column) * 3
+                    let keep = 1.0 - alpha
+                    dst[target] = Float(converted.x * alpha + Double(dst[target]) * keep)
+                    dst[target + 1] = Float(converted.y * alpha + Double(dst[target + 1]) * keep)
+                    dst[target + 2] = Float(converted.z * alpha + Double(dst[target + 2]) * keep)
                 }
-                let target = index * 3
-                let keep = 1.0 - alpha
-                dst[target] = Float(converted.x * alpha + Double(dst[target]) * keep)
-                dst[target + 1] = Float(converted.y * alpha + Double(dst[target + 1]) * keep)
-                dst[target + 2] = Float(converted.z * alpha + Double(dst[target + 2]) * keep)
             }
         }
-        return output
     }
 
     // MARK: 参数换算
@@ -912,7 +1041,8 @@ enum MFilmBorderRenderer {
     private static func draw(in context: CGContext, layout: MFilmBorderLayout,
                              config: MFilmBorderConfig, photo: CGImage?, punch: Bool,
                              filmID: String, photoID: String,
-                             dateLabel: String = "", timeLabel: String = "") {
+                             dateLabel: String = "", timeLabel: String = "",
+                             includeAging: Bool = true) {
         let width = layout.canvas.width
         let height = layout.canvas.height
         context.saveGState()
@@ -971,8 +1101,10 @@ enum MFilmBorderRenderer {
         if config.gaugeValue.isSheet, config.notch {
             drawNotchCode(context, layout: layout, config: config)
         }
-        drawWear(context, layout: layout, config: config, photoID: photoID)
-        drawEdgeFog(context, layout: layout, config: config)
+        // 做旧压在所有内容之上：划痕、灰尘、雾化也落在画面里，而不只是片基。
+        if includeAging {
+            drawAging(context, layout: layout, config: config, photoID: photoID)
+        }
 
         context.restoreGState()
     }
@@ -1649,91 +1781,351 @@ enum MFilmBorderRenderer {
                                        width: unit * 0.9, height: unit * 0.9))
     }
 
-    // MARK: 磨损
+    // MARK: 做旧
 
-    private static func drawWear(_ context: CGContext, layout: MFilmBorderLayout,
-                                 config: MFilmBorderConfig, photoID: String) {
-        var random = MFilmBorderRandom(seed: "wear-\(photoID)-\(config.gauge)")
+    /// 划痕、灰尘、雾化统一画在整张成品上（片基 + 画面）。
+    /// 位置由 photoID 决定：预览、缩略图与导出拿到的是同一批纹理。
+    private static func drawAging(_ context: CGContext, layout: MFilmBorderLayout,
+                                  config: MFilmBorderConfig, photoID: String) {
+        let width = layout.canvas.width
+        let height = layout.canvas.height
+        guard width > 8, height > 8 else { return }
+        // 高分辨率导出按面积补足粒子数，避免做旧在大图上变得稀稀拉拉。
+        let areaScale = min(3.0, max(0.6, width * height / (1500 * 1000)))
+        drawScratches(context, layout: layout, config: config,
+                      photoID: photoID, areaScale: areaScale)
+        drawDust(context, layout: layout, config: config,
+                 photoID: photoID, areaScale: areaScale)
+        drawFog(context, layout: layout, config: config, photoID: photoID)
+    }
 
-        // 划痕：只落在片边上，不动画面。
-        let scratchCount = Int((config.scratches * 5).rounded())
-        for _ in 0..<scratchCount {
-            let light = random.unit() > 0.35
-            let alpha = random.range(0.10, 0.34)
-            context.setStrokeColor(red: light ? 1 : 0, green: light ? 0.98 : 0,
-                                   blue: light ? 0.92 : 0, alpha: alpha)
-            context.setLineWidth(max(0.5, layout.pxPerMM * random.range(0.02, 0.07)))
-            let path = CGMutablePath()
-            if layout.alongX {
-                let y = random.unit() > 0.5
-                    ? random.range(0, layout.marginY * 0.92)
-                    : random.range(layout.canvas.height - layout.marginY * 0.92, layout.canvas.height)
-                path.move(to: CGPoint(x: random.range(0, layout.canvas.width * 0.25), y: y))
-                path.addLine(to: CGPoint(x: random.range(layout.canvas.width * 0.55, layout.canvas.width), y: y))
-            } else {
-                let x = random.unit() > 0.5
-                    ? random.range(0, layout.marginX * 0.92)
-                    : random.range(layout.canvas.width - layout.marginX * 0.92, layout.canvas.width)
-                path.move(to: CGPoint(x: x, y: random.range(0, layout.canvas.height * 0.25)))
-                path.addLine(to: CGPoint(x: x, y: random.range(layout.canvas.height * 0.55, layout.canvas.height)))
+    /// 划痕：沿片长方向的长丝，带轻微弯曲、两端渐隐，亮痕有一圈很淡的光晕。
+    private static func drawScratches(_ context: CGContext, layout: MFilmBorderLayout,
+                                      config: MFilmBorderConfig, photoID: String,
+                                      areaScale: CGFloat) {
+        guard config.scratches > 0.001 else { return }
+        let width = layout.canvas.width
+        let height = layout.canvas.height
+        let length = layout.alongX ? width : height
+        let cross = layout.alongX ? height : width
+        var random = MFilmBorderRandom(seed: "aging-scratch-\(photoID)-\(config.gauge)")
+        let count = max(1, Int((config.scratches * 12 * areaScale).rounded()))
+        let strength = 0.35 + config.scratches * 0.65
+        context.saveGState()
+        context.setLineCap(.round)
+
+        for _ in 0..<count {
+            let bright = random.unit() > 0.30
+            let long = random.unit() > 0.35
+            let span = length * (long ? random.range(0.55, 1.0) : random.range(0.16, 0.42))
+            let start = random.range(-0.08 * length, length * 0.96 - span)
+            let fixed = random.range(cross * 0.04, cross * 0.96)
+            let slope = random.range(-0.012, 0.012)
+            // 弯曲幅度跟随分辨率缩放，预览与导出看起来是同一条划痕。
+            let scale = max(0.8, layout.pxPerMM / 45)
+            let amplitude = (random.unit() > 0.6
+                ? random.range(0.4, 1.6)
+                : random.range(0.08, 0.45)) * scale
+            let frequency = random.range(0.6, 2.2)
+            let phase = random.range(0, .pi * 2)
+            let coreWidth = max(0.45, layout.pxPerMM * random.range(0.012, 0.05))
+            let alpha = random.range(0.12, 0.34) * strength
+            let dark = !bright && random.unit() > 0.55
+            let segments = 28
+
+            func point(_ t: CGFloat) -> CGPoint {
+                let along = start + span * t
+                let wobble = sin(t * .pi * frequency * 2 + phase) * sin(t * .pi) * amplitude
+                let drift = fixed + (t - 0.5) * span * slope
+                return layout.alongX
+                    ? CGPoint(x: along, y: drift + wobble)
+                    : CGPoint(x: drift + wobble, y: along)
             }
-            context.addPath(path)
-            context.strokePath()
-        }
 
-        // 灰尘：细小白点，和划痕分开生成，避免每次改参数整片纹理重排。
-        let dustCount = Int((config.dust * 140).rounded())
-        for _ in 0..<dustCount {
-            let firstEdge = random.unit() > 0.5
+            var previous = point(0)
+            let tone: (CGFloat, CGFloat, CGFloat)
+            if bright {
+                tone = (1.0, 0.985, 0.94)
+            } else if dark {
+                tone = (0.03, 0.028, 0.022)
+            } else {
+                tone = (0.72, 0.68, 0.60)
+            }
+            for step in 1...segments {
+                let t = CGFloat(step) / CGFloat(segments)
+                let current = point(t)
+                let taper = sin(t * .pi)
+                let segmentAlpha = alpha * (0.20 + 0.80 * taper)
+                let segmentWidth = coreWidth * (0.30 + 0.70 * taper)
+                // 亮划痕：先铺一圈极淡的晕，再压细芯；暗划痕只留细线。
+                if bright {
+                    context.setStrokeColor(red: 1.0, green: 0.98, blue: 0.92,
+                                           alpha: segmentAlpha * 0.26)
+                    context.setLineWidth(segmentWidth * 3.0)
+                    context.move(to: previous)
+                    context.addLine(to: current)
+                    context.strokePath()
+                    // 药膜划痕的彩色边缘：极淡的冷色偏移线。
+                    let fringe = coreWidth * 1.15
+                    context.setStrokeColor(red: 0.55, green: 0.80, blue: 1.0,
+                                           alpha: segmentAlpha * 0.14)
+                    context.setLineWidth(max(0.35, segmentWidth * 0.5))
+                    if layout.alongX {
+                        context.move(to: CGPoint(x: previous.x, y: previous.y + fringe))
+                        context.addLine(to: CGPoint(x: current.x, y: current.y + fringe))
+                    } else {
+                        context.move(to: CGPoint(x: previous.x + fringe, y: previous.y))
+                        context.addLine(to: CGPoint(x: current.x + fringe, y: current.y))
+                    }
+                    context.strokePath()
+                }
+                context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
+                                       alpha: segmentAlpha * (bright ? 0.92 : 1.0))
+                context.setLineWidth(segmentWidth)
+                context.move(to: previous)
+                context.addLine(to: current)
+                context.strokePath()
+                previous = current
+            }
+
+            // 真实划痕常成组出现：旁边跟一条更细、更短的并行划痕。
+            if random.unit() > 0.62 {
+                let shift = coreWidth * random.range(1.6, 4.0) * (random.unit() > 0.5 ? 1 : -1)
+                let startT = random.range(0.10, 0.34)
+                let endT = random.range(0.66, 0.92)
+                var companion: CGPoint?
+                for step in 0...16 {
+                    let t = startT + (endT - startT) * CGFloat(step) / 16
+                    var pointValue = point(t)
+                    if layout.alongX {
+                        pointValue.y += shift
+                    } else {
+                        pointValue.x += shift
+                    }
+                    if let companion {
+                        let taper = sin((t - startT) / max(0.01, endT - startT) * .pi)
+                        context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
+                                               alpha: alpha * 0.42 * (0.25 + 0.75 * taper))
+                        context.setLineWidth(max(0.35, coreWidth * 0.5))
+                        context.move(to: companion)
+                        context.addLine(to: pointValue)
+                        context.strokePath()
+                    }
+                    companion = pointValue
+                }
+            }
+        }
+        context.restoreGState()
+    }
+
+    /// 灰尘：小颗粒为主、少量大尘粒与绒毛；亮尘带柔边，暗尘是片基上的细小黑点。
+    private static func drawDust(_ context: CGContext, layout: MFilmBorderLayout,
+                                 config: MFilmBorderConfig, photoID: String,
+                                 areaScale: CGFloat) {
+        guard config.dust > 0.001 else { return }
+        let width = layout.canvas.width
+        let height = layout.canvas.height
+        var random = MFilmBorderRandom(seed: "aging-dust-\(photoID)-\(config.gauge)")
+        let count = max(4, Int((config.dust * 320 * areaScale).rounded()))
+        let strength = 0.45 + config.dust * 0.55
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let brightGradient = CGGradient(
+                colorsSpace: colorSpace,
+                colors: [
+                    CGColor(red: 1.0, green: 0.975, blue: 0.90, alpha: 1),
+                    CGColor(red: 1.0, green: 0.975, blue: 0.90, alpha: 0),
+                ] as CFArray,
+                locations: [0, 1]),
+              let darkGradient = CGGradient(
+                colorsSpace: colorSpace,
+                colors: [
+                    CGColor(red: 0.045, green: 0.038, blue: 0.030, alpha: 1),
+                    CGColor(red: 0.045, green: 0.038, blue: 0.030, alpha: 0),
+                ] as CFArray,
+                locations: [0, 1])
+        else { return }
+
+        for index in 0..<count {
+            // 约三成尘粒靠近片边，其余均匀落在画面上。
+            let edgeBias = index % 10 < 3
             let x: CGFloat
             let y: CGFloat
-            if layout.alongX {
-                x = random.range(0, layout.canvas.width)
-                y = firstEdge
-                    ? random.range(0, layout.marginY * 0.95)
-                    : random.range(layout.canvas.height - layout.marginY * 0.95, layout.canvas.height)
+            if edgeBias {
+                if layout.alongX {
+                    x = random.range(0, width)
+                    y = random.unit() > 0.5
+                        ? random.range(0, height * 0.18)
+                        : random.range(height * 0.82, height)
+                } else {
+                    x = random.unit() > 0.5
+                        ? random.range(0, width * 0.18)
+                        : random.range(width * 0.82, width)
+                    y = random.range(0, height)
+                }
             } else {
-                x = firstEdge
-                    ? random.range(0, layout.marginX * 0.95)
-                    : random.range(layout.canvas.width - layout.marginX * 0.95, layout.canvas.width)
-                y = random.range(0, layout.canvas.height)
+                x = random.range(0, width)
+                y = random.range(0, height)
             }
-            let radius = layout.pxPerMM * random.range(0.03, 0.16)
-            let light = random.unit() > 0.4
-            context.setFillColor(red: light ? 1 : 0, green: light ? 0.98 : 0,
-                                 blue: light ? 0.94 : 0,
-                                 alpha: random.range(0.12, 0.38))
-            context.fillEllipse(in: CGRect(x: x, y: y, width: radius, height: radius))
+            let sized = pow(random.unit(), 2.6)
+            let radius = max(0.4, layout.pxPerMM * (0.010 + sized * 0.10))
+            let bright = random.unit() > 0.30
+            let alpha = random.range(0.10, 0.32) * strength
+            let tone: (CGFloat, CGFloat, CGFloat) = bright
+                ? (1.0, 0.975, 0.90)
+                : (0.045, 0.038, 0.030)
+
+            if radius < 1.1 {
+                // 极小的尘点直接落笔，省掉上千个渐变。
+                context.setFillColor(red: tone.0, green: tone.1, blue: tone.2, alpha: alpha)
+                context.fillEllipse(in: CGRect(x: x, y: y,
+                                               width: radius * 1.4, height: radius * 1.4))
+            } else {
+                // 亮尘先落一圈更深的投影，让颗粒有厚度，而不是浮在画面上的白点。
+                if bright {
+                    let shadowCenter = CGPoint(x: x + radius * 0.24, y: y + radius * 0.30)
+                    context.saveGState()
+                    context.setAlpha(alpha * 0.48)
+                    context.drawRadialGradient(
+                        darkGradient, startCenter: shadowCenter, startRadius: 0,
+                        endCenter: shadowCenter, endRadius: radius * 1.35, options: [])
+                    context.restoreGState()
+                }
+                let blobs = 1 + Int(random.unit() * 3)
+                for blob in 0..<blobs {
+                    let dx = random.range(-radius * 0.55, radius * 0.55)
+                    let dy = random.range(-radius * 0.55, radius * 0.55)
+                    let r = radius * random.range(0.55, 1.0)
+                    let center = CGPoint(x: x + dx, y: y + dy)
+                    context.saveGState()
+                    context.setAlpha(alpha * (blob == 0 ? 1.0 : 0.68))
+                    context.drawRadialGradient(
+                        bright ? brightGradient : darkGradient,
+                        startCenter: center, startRadius: 0,
+                        endCenter: center, endRadius: r, options: [])
+                    context.restoreGState()
+                }
+            }
+
+            // 尘粒常结成小簇：主尘点旁边再撒几颗更小的同色颗粒。
+            if random.unit() > 0.78 {
+                let clusterCount = 2 + Int(random.unit() * 3)
+                for _ in 0..<clusterCount {
+                    let cx = x + random.range(-radius * 3.2, radius * 3.2)
+                    let cy = y + random.range(-radius * 3.2, radius * 3.2)
+                    let cr = max(0.35, radius * random.range(0.20, 0.55))
+                    context.setFillColor(red: tone.0, green: tone.1, blue: tone.2,
+                                         alpha: alpha * random.range(0.55, 0.90))
+                    context.fillEllipse(in: CGRect(x: cx, y: cy, width: cr, height: cr))
+                }
+            }
+
+            // 极少数是纤维 / 绒线：短而弯的细丝，比圆点更像真实灰尘。
+            if random.unit() > 0.95 {
+                let fiberLength = max(2, layout.pxPerMM * random.range(0.06, 0.24))
+                let angle = random.range(0, .pi * 2)
+                let path = CGMutablePath()
+                path.move(to: CGPoint(x: x, y: y))
+                path.addQuadCurve(
+                    to: CGPoint(x: x + cos(angle) * fiberLength,
+                                y: y + sin(angle) * fiberLength),
+                    control: CGPoint(x: x + cos(angle + 0.9) * fiberLength * 0.7,
+                                     y: y + sin(angle + 0.9) * fiberLength * 0.7))
+                context.setStrokeColor(red: 0.96, green: 0.93, blue: 0.84,
+                                       alpha: alpha * 0.8)
+                context.setLineWidth(max(0.4, radius * 0.5))
+                context.setLineCap(.round)
+                context.addPath(path)
+                context.strokePath()
+            }
         }
     }
 
-    private static func drawEdgeFog(_ context: CGContext, layout: MFilmBorderLayout,
-                                    config: MFilmBorderConfig) {
+    /// 雾化：整体薄雾 + 沿片边向画面渗出的有机雾团，角落更重。
+    private static func drawFog(_ context: CGContext, layout: MFilmBorderLayout,
+                                config: MFilmBorderConfig, photoID: String) {
         guard config.fog > 0.001 else { return }
         let width = layout.canvas.width
         let height = layout.canvas.height
-        let depth = max(2, layout.pxPerMM * 1.4)
-        let alpha = config.fog * 0.22
-        guard let gradient = CGGradient(
-            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
-            colors: [
-                CGColor(red: 0.88, green: 0.76, blue: 0.58, alpha: alpha),
-                CGColor(red: 0.88, green: 0.76, blue: 0.58, alpha: 0),
-            ] as CFArray,
-            locations: [0, 1]
-        ) else { return }
-        context.drawLinearGradient(gradient,
-                                   start: CGPoint(x: 0, y: 0),
-                                   end: CGPoint(x: 0, y: depth), options: [])
-        context.drawLinearGradient(gradient,
-                                   start: CGPoint(x: 0, y: height),
-                                   end: CGPoint(x: 0, y: height - depth), options: [])
-        context.drawLinearGradient(gradient,
-                                   start: CGPoint(x: 0, y: 0),
-                                   end: CGPoint(x: depth, y: 0), options: [])
-        context.drawLinearGradient(gradient,
-                                   start: CGPoint(x: width, y: 0),
-                                   end: CGPoint(x: width - depth, y: 0), options: [])
+        let level = CGFloat(config.fog)
+        let shortSide = min(width, height)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+
+        // 整体薄雾：轻抬黑位，像药膜轻微老化，而不是盖一层白纱。
+        context.setFillColor(red: 0.80, green: 0.74, blue: 0.64, alpha: 0.06 * level)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        var random = MFilmBorderRandom(seed: "aging-fog-\(photoID)-\(config.gauge)")
+        let blobs = 6 + Int(level * 10)
+        for index in 0..<blobs {
+            let side = index % 4
+            let along = random.range(0.05, 0.95)
+            let depth = random.range(-0.04, 0.10) * shortSide
+            let center: CGPoint
+            switch side {
+            case 0: center = CGPoint(x: width * along, y: depth)
+            case 1: center = CGPoint(x: width * along, y: height - depth)
+            case 2: center = CGPoint(x: depth, y: height * along)
+            default: center = CGPoint(x: width - depth, y: height * along)
+            }
+            let radius = shortSide * random.range(0.14, 0.38)
+            let alpha = level * random.range(0.07, 0.18)
+            let warm = random.unit() > 0.35
+            let tint: (CGFloat, CGFloat, CGFloat) = warm
+                ? (0.94, 0.84, 0.68)
+                : (0.74, 0.80, 0.82)
+            guard let gradient = CGGradient(
+                colorsSpace: colorSpace,
+                colors: [
+                    CGColor(red: tint.0, green: tint.1, blue: tint.2, alpha: alpha),
+                    CGColor(red: tint.0, green: tint.1, blue: tint.2, alpha: 0),
+                ] as CFArray,
+                locations: [0, 1])
+            else { continue }
+            context.drawRadialGradient(gradient, startCenter: center, startRadius: 0,
+                                       endCenter: center, endRadius: radius, options: [])
+        }
+
+        // 画面里的大块不均匀雾：低频斑块，避免整张雾像一层均匀的灰纱。
+        let interiorBlobs = 2 + Int(level * 4)
+        for _ in 0..<interiorBlobs {
+            let center = CGPoint(x: random.range(width * 0.12, width * 0.88),
+                                 y: random.range(height * 0.12, height * 0.88))
+            let radius = shortSide * random.range(0.24, 0.50)
+            let alpha = level * random.range(0.02, 0.055)
+            let tint: (CGFloat, CGFloat, CGFloat) = random.unit() > 0.4
+                ? (0.92, 0.86, 0.76)
+                : (0.78, 0.82, 0.84)
+            guard let gradient = CGGradient(
+                colorsSpace: colorSpace,
+                colors: [
+                    CGColor(red: tint.0, green: tint.1, blue: tint.2, alpha: alpha),
+                    CGColor(red: tint.0, green: tint.1, blue: tint.2, alpha: 0),
+                ] as CFArray,
+                locations: [0, 1])
+            else { continue }
+            context.drawRadialGradient(gradient, startCenter: center, startRadius: 0,
+                                       endCenter: center, endRadius: radius, options: [])
+        }
+
+        // 四角再压一层：药膜老化时总是角部最先发雾。
+        let corners = [
+            CGPoint(x: 0, y: 0), CGPoint(x: width, y: 0),
+            CGPoint(x: 0, y: height), CGPoint(x: width, y: height),
+        ]
+        for corner in corners {
+            let radius = shortSide * random.range(0.22, 0.42)
+            let alpha = level * random.range(0.08, 0.17)
+            guard let gradient = CGGradient(
+                colorsSpace: colorSpace,
+                colors: [
+                    CGColor(red: 0.90, green: 0.82, blue: 0.70, alpha: alpha),
+                    CGColor(red: 0.90, green: 0.82, blue: 0.70, alpha: 0),
+                ] as CFArray,
+                locations: [0, 1])
+            else { continue }
+            context.drawRadialGradient(gradient, startCenter: corner, startRadius: 0,
+                                       endCenter: corner, endRadius: radius, options: [])
+        }
     }
 
     // MARK: 日期戳
@@ -1793,7 +2185,7 @@ enum MFilmBorderRenderer {
         let position = config.datePositionValue
         let aperture = layout.aperture
         let shortSide = min(aperture.width, aperture.height)
-        let fontSize = max(4, min(220, shortSide * 0.042))
+        let baseFontSize = max(4, min(220, shortSide * 0.042 * CGFloat(config.dateScale)))
         let legacyFont: String
         let color: (CGFloat, CGFloat, CGFloat)
         switch style {
@@ -1819,7 +2211,11 @@ enum MFilmBorderRenderer {
             fontName = legacyFont
         }
         // 自定义字体保留原字距；旧系统字体沿用原来的 tracking。
-        let tracking = fontChoice == .system ? fontSize * (style == .thin ? 0.14 : 0.10) : 0
+        func tracking(for size: CGFloat) -> CGFloat {
+            fontChoice == .system ? size * (style == .thin ? 0.14 : 0.10) : 0
+        }
+        var fontSize = baseFontSize
+        var trackingValue = tracking(for: fontSize)
         let custom = config.dateText.trimmingCharacters(in: .whitespacesAndNewlines)
         let dateText = custom.isEmpty
             ? dateLabel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1844,31 +2240,63 @@ enum MFilmBorderRenderer {
         }
         guard !primary.isEmpty || !secondary.isEmpty else { return }
 
-        let (runs, textWidthValue) = dateStampRuns(
+        var (runs, textWidthValue) = dateStampRuns(
             primary: primary, secondary: secondary, isDSEG: fontChoice.isDSEG7,
-            fontName: fontName, fontSize: fontSize, tracking: tracking)
+            fontName: fontName, fontSize: fontSize, tracking: trackingValue)
         let inset = max(6, shortSide * 0.045)
-        let x: CGFloat
-        let baseline: CGFloat
-        switch position {
-        case .bottomRight:
-            x = aperture.maxX - inset - textWidthValue
-            baseline = aperture.maxY - inset
-        case .bottomLeft:
-            x = aperture.minX + inset
-            baseline = aperture.maxY - inset
-        case .topRight:
-            x = aperture.maxX - inset - textWidthValue
-            baseline = aperture.minY + inset + fontSize
-        case .topLeft:
-            x = aperture.minX + inset
-            baseline = aperture.minY + inset + fontSize
+        let vertical = config.dateOrientationValue == .vertical
+        // 日期变长或字号拉大时按可用的画幅宽度 / 高度回缩，避免被画幅裁掉。
+        let available = vertical
+            ? aperture.height - inset * 2
+            : aperture.width - inset * 2
+        if textWidthValue > available, textWidthValue > 0 {
+            fontSize = max(4, fontSize * available / textWidthValue)
+            trackingValue = tracking(for: fontSize)
+            (runs, textWidthValue) = dateStampRuns(
+                primary: primary, secondary: secondary, isDSEG: fontChoice.isDSEG7,
+                fontName: fontName, fontSize: fontSize, tracking: trackingValue)
+        }
+        let anchor: CGPoint
+        let rotation: CGFloat
+        if vertical {
+            // 竖排：整块文字绕角落转 90°，左列向下读、右列向上读（底角不越界）。
+            switch position {
+            case .topLeft:
+                anchor = CGPoint(x: aperture.minX + inset, y: aperture.minY + inset)
+                rotation = .pi / 2
+            case .bottomLeft:
+                anchor = CGPoint(x: aperture.minX + inset + fontSize, y: aperture.maxY - inset)
+                rotation = -.pi / 2
+            case .topRight:
+                anchor = CGPoint(x: aperture.maxX - inset - fontSize, y: aperture.minY + inset)
+                rotation = .pi / 2
+            case .bottomRight:
+                anchor = CGPoint(x: aperture.maxX - inset, y: aperture.maxY - inset)
+                rotation = -.pi / 2
+            }
+        } else {
+            rotation = 0
+            switch position {
+            case .bottomRight:
+                anchor = CGPoint(x: aperture.maxX - inset - textWidthValue,
+                                 y: aperture.maxY - inset)
+            case .bottomLeft:
+                anchor = CGPoint(x: aperture.minX + inset, y: aperture.maxY - inset)
+            case .topRight:
+                anchor = CGPoint(x: aperture.maxX - inset - textWidthValue,
+                                 y: aperture.minY + inset + fontSize)
+            case .topLeft:
+                anchor = CGPoint(x: aperture.minX + inset,
+                                 y: aperture.minY + inset + fontSize)
+            }
         }
 
         context.saveGState()
         // 只画在画面内，不越到片基。
         context.addPath(aperturePath(layout, config: config))
         context.clip()
+        context.translateBy(x: anchor.x, y: anchor.y)
+        if vertical { context.rotate(by: rotation) }
         let textColor = CGColor(red: color.0, green: color.1, blue: color.2, alpha: 0.95)
         if style == .amber || style == .red {
             // 数码日期后背的发光感：同色阴影往外晕开一圈。
@@ -1881,14 +2309,14 @@ enum MFilmBorderRenderer {
         for run in runs {
             if run.isDot {
                 context.setFillColor(textColor)
-                context.fill(CGRect(x: x + run.x - run.dotSize / 2,
-                                    y: baseline - run.dotSize,
+                context.fill(CGRect(x: run.x - run.dotSize / 2,
+                                    y: -run.dotSize,
                                     width: run.dotSize, height: run.dotSize))
             } else if !run.text.isEmpty {
                 drawText(context, text: run.text,
-                         origin: CGPoint(x: x + run.x, y: baseline),
+                         origin: CGPoint(x: run.x, y: 0),
                          rotation: 0, fontSize: fontSize, color: textColor,
-                         tracking: tracking, fontName: fontName)
+                         tracking: trackingValue, fontName: fontName)
             }
         }
         context.setShadow(offset: .zero, blur: 0, color: nil)
@@ -1964,13 +2392,24 @@ enum MFilmBorderRenderer {
 
     // MARK: 文字内容
 
-    /// 片边品牌字 + 幅面规格（135 / 120 / 110 / 16MM …）。
+    /// 片边品牌字：随胶片 / OLTRAFILM / 自定义内容，后两者按幅面补规格后缀。
     private static func edgeLabelText(_ config: MFilmBorderConfig, filmID: String) -> String {
-        let custom = config.customText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !custom.isEmpty { return custom.uppercased() }
-        let base = edgeLabel(filmID: filmID, custom: "")
         let suffix = config.gaugeValue.formatSuffix
-        return suffix.isEmpty ? base : "\(base) \(suffix)"
+        switch config.edgeTextModeValue {
+        case .followFilm:
+            let base = edgeLabel(filmID: filmID, custom: "")
+            return suffix.isEmpty ? base : "\(base) \(suffix)"
+        case .oltrafilm:
+            return suffix.isEmpty ? "OLTRAFILM" : "OLTRAFILM \(suffix)"
+        case .custom:
+            let custom = config.customText.trimmingCharacters(in: .whitespacesAndNewlines)
+            // 自定义内容留空时退回随胶片，避免整条片边没有字。
+            if custom.isEmpty {
+                let base = edgeLabel(filmID: filmID, custom: "")
+                return suffix.isEmpty ? base : "\(base) \(suffix)"
+            }
+            return custom.uppercased()
+        }
     }
 
     static func edgeLabel(filmID: String, custom: String) -> String {

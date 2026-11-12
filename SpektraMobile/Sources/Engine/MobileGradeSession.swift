@@ -111,9 +111,12 @@ final class MobileGradeSession: ObservableObject {
         self.previewScale = saved >= 0.125 && saved <= 1.0 ? saved : 1.0
         self.presets = GradePresetStore.shared.all
         self.luts = GradePresetStore.shared.luts()
-        if let data = photo.borderData,
-           let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
-            self.border = decoded.normalized()
+        if let remembered = MFilmBorderMemory.load() {
+            self.border = remembered
+        } else if let data = photo.borderData,
+                  let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
+            // 旧版本按照片保存：迁移成记忆参数，但片边开关与做旧归零。
+            self.border = MFilmBorderMemory.remembered(decoded)
         }
         if let data = photo.cropData,
            let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
@@ -444,6 +447,8 @@ final class MobileGradeSession: ObservableObject {
     }
 
     private func persistBorderNow() {
+        // 参数记忆跨照片生效；片边开关与做旧不写入记忆。
+        MFilmBorderMemory.save(border)
         guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
         photo.borderData = try? JSONEncoder().encode(border)
         try? store.update(photo)

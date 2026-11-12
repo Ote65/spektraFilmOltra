@@ -1553,8 +1553,14 @@ struct GradeScreen: View {
 
                     MToggleRow(label: "边字", isOn: borderBool(\.edgeText), compact: true)
                     if session.border.edgeText {
-                        MTextFieldRow(label: "边字内容", text: borderText,
-                                      placeholder: "自动（随胶片）")
+                        MChoiceRow(label: "边字内容", value: edgeTextModeValue.label,
+                                   options: edgeTextModeOptions) { raw in
+                            session.updateBorder { $0.edgeTextMode = raw }
+                        }
+                        if session.border.edgeTextModeValue == .custom {
+                            MTextFieldRow(label: "自定义内容", text: borderText,
+                                          placeholder: "输入边字")
+                        }
                         MChoiceRow(label: "边字颜色", value: textToneValue.label,
                                    options: textToneOptions) { raw in
                             session.updateBorder { $0.textTone = raw }
@@ -1581,6 +1587,13 @@ struct GradeScreen: View {
                                    options: dateFontOptions) { raw in
                             session.updateBorder { $0.dateFont = raw }
                         }
+                        MParamSlider(label: "日期大小", value: borderDouble(\.dateScale),
+                                     base: 1, range: 0.4...2.5, step: 0.01, decimals: 2,
+                                     suffix: "×", compact: true)
+                        MChoiceRow(label: "日期方向", value: dateOrientationValue.label,
+                                   options: dateOrientationOptions) { raw in
+                            session.updateBorder { $0.dateOrientation = raw }
+                        }
                         MChoiceRow(label: "日期颜色", value: dateStyleValue.label,
                                    options: dateStyleOptions) { raw in
                             session.updateBorder { $0.dateStyle = raw }
@@ -1591,14 +1604,14 @@ struct GradeScreen: View {
                         MToggleRow(label: "片缺口", isOn: borderBool(\.notch), compact: true)
                     }
 
-                    MSectionHead(title: "做旧", trailing: "默认关闭", compact: true)
+                    MSectionHead(title: "做旧", trailing: "默认关闭 · 作用于画面", compact: true)
                     MParamSlider(label: "划痕", value: borderDouble(\.scratches),
                                  base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
                     MParamSlider(label: "灰尘", value: borderDouble(\.dust),
                                  base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
-                    MParamSlider(label: "边缘雾化", value: borderDouble(\.fog),
+                    MParamSlider(label: "雾化", value: borderDouble(\.fog),
                                  base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
                 }
@@ -1807,6 +1820,14 @@ struct GradeScreen: View {
         session.border.dateFontValue
     }
 
+    private var dateOrientationValue: MFilmBorderDateOrientation {
+        session.border.dateOrientationValue
+    }
+
+    private var edgeTextModeValue: MFilmBorderTextContent {
+        session.border.edgeTextModeValue
+    }
+
     private var gaugeOptions: [MProOption] {
         MFilmBorderGauge.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
@@ -1843,6 +1864,14 @@ struct GradeScreen: View {
         MFilmBorderDateFont.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
 
+    private var dateOrientationOptions: [MProOption] {
+        MFilmBorderDateOrientation.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var edgeTextModeOptions: [MProOption] {
+        MFilmBorderTextContent.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
     private func borderPresetIsSelected(_ preset: MFilmBorderPreset) -> Bool {
         guard session.border.enabled == preset.config.enabled else { return false }
         return preset.config.matches(session.border)
@@ -1854,7 +1883,12 @@ struct GradeScreen: View {
             set: { isOn in
                 if isOn, session.border.preset == "none",
                    let preset = MFilmBorderPreset.preset(id: "kodak135") {
-                    withAnimation(MMotion.state) { session.setBorderPreset(preset) }
+                    // 记忆里有改过的参数就原样恢复，只有参数仍为默认值才套预设。
+                    if session.border.matches(MFilmBorderConfig()) {
+                        withAnimation(MMotion.state) { session.setBorderPreset(preset) }
+                    } else {
+                        session.updateBorder { $0.enabled = true }
+                    }
                 } else {
                     session.updateBorder { $0.enabled = isOn }
                 }
