@@ -26,6 +26,7 @@ struct HomeScreen: View {
     @FocusState private var searchFocused: Bool
     @AppStorage(MobileSettings.allowNonRawKey) private var allowNonRaw = false
     @Environment(\.mSafeInsets) private var insets
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -84,6 +85,11 @@ struct HomeScreen: View {
         .task {
             // 主页直接映射系统相册，不需要先「导入」。
             await engine.refreshAssets()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // 从后台回来（相册里可能刚多了照片）自动重新映射，不必手动下拉。
+            guard phase == .active else { return }
+            Task { await engine.refreshAssets() }
         }
         .onChange(of: allowNonRaw) { _, _ in
             // 设置里切换「支持 JPEG」后按新范围重新映射，当前选中的相簿保持不变。
@@ -942,13 +948,14 @@ struct HomeScreen: View {
 
     // MARK: - 数据
 
-    /// 相册里所有照片；没有相册权限时退化为已入库照片。
+    /// 相册权限被拒时才退化显示已入库照片；
+    /// 扫描中显示相册结果（空就是加载态），避免把库里的 RAW 误看成「主页只剩 RAW」。
     private var sourceAssets: [MLibraryAsset] {
-        engine.assetPhase == .ready
-            ? engine.assets
-            : engine.photos.map {
+        engine.assetPhase == .denied
+            ? engine.photos.map {
                 MLibraryAsset(id: $0.id, filename: $0.filename, photo: $0, phAsset: nil)
             }
+            : engine.assets
     }
 
     /// 主页可见数据源：类型由 engine.scope 决定，这里只叠加颜色标签、搜索与排序。
