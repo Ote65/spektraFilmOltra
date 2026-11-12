@@ -1799,119 +1799,129 @@ enum MFilmBorderRenderer {
         drawFog(context, layout: layout, config: config, photoID: photoID)
     }
 
-    /// 划痕：沿片长方向的长丝，带轻微弯曲、两端渐隐，亮痕有一圈很淡的光晕。
+    /// 划痕：真实片基划痕是极细、极淡、走向随机且断续的瑕疵，
+    /// 不是贯穿画面的直线。这里按「微痕 / 中等 / 长丝」三档生成，
+    /// 每条都带随机游走抖动、断点和沿程明暗变化。
     private static func drawScratches(_ context: CGContext, layout: MFilmBorderLayout,
                                       config: MFilmBorderConfig, photoID: String,
                                       areaScale: CGFloat) {
         guard config.scratches > 0.001 else { return }
         let width = layout.canvas.width
         let height = layout.canvas.height
-        let length = layout.alongX ? width : height
-        let cross = layout.alongX ? height : width
+        let diagonal = sqrt(width * width + height * height)
         var random = MFilmBorderRandom(seed: "aging-scratch-\(photoID)-\(config.gauge)")
-        let count = max(1, Int((config.scratches * 12 * areaScale).rounded()))
-        let strength = 0.35 + config.scratches * 0.65
+        let level = min(1, max(0, config.scratches))
+        let count = max(3, Int((level * 90 * areaScale).rounded()))
+        let baseAngle = layout.alongX ? 0 : CGFloat.pi / 2
+        let minWidth = max(0.42, layout.pxPerMM * 0.006)
+
         context.saveGState()
         context.setLineCap(.round)
+        context.setLineJoin(.round)
 
         for _ in 0..<count {
-            let bright = random.unit() > 0.30
-            let long = random.unit() > 0.35
-            let span = length * (long ? random.range(0.55, 1.0) : random.range(0.16, 0.42))
-            let start = random.range(-0.08 * length, length * 0.96 - span)
-            let fixed = random.range(cross * 0.04, cross * 0.96)
-            let slope = random.range(-0.012, 0.012)
-            // 弯曲幅度跟随分辨率缩放，预览与导出看起来是同一条划痕。
-            let scale = max(0.8, layout.pxPerMM / 45)
-            let amplitude = (random.unit() > 0.6
-                ? random.range(0.4, 1.6)
-                : random.range(0.08, 0.45)) * scale
-            let frequency = random.range(0.6, 2.2)
-            let phase = random.range(0, .pi * 2)
-            let coreWidth = max(0.45, layout.pxPerMM * random.range(0.012, 0.05))
-            let alpha = random.range(0.12, 0.34) * strength
-            let dark = !bright && random.unit() > 0.55
-            let segments = 28
-
-            func point(_ t: CGFloat) -> CGPoint {
-                let along = start + span * t
-                let wobble = sin(t * .pi * frequency * 2 + phase) * sin(t * .pi) * amplitude
-                let drift = fixed + (t - 0.5) * span * slope
-                return layout.alongX
-                    ? CGPoint(x: along, y: drift + wobble)
-                    : CGPoint(x: drift + wobble, y: along)
-            }
-
-            var previous = point(0)
-            let tone: (CGFloat, CGFloat, CGFloat)
-            if bright {
-                tone = (1.0, 0.985, 0.94)
-            } else if dark {
-                tone = (0.03, 0.028, 0.022)
+            // 长度分布：七成是几乎看不清的微痕，少量中等，偶尔一条长丝。
+            let roll = random.unit()
+            let span: CGFloat
+            let samples: Int
+            if roll < 0.70 {
+                span = diagonal * random.range(0.004, 0.030)
+                samples = 3
+            } else if roll < 0.94 {
+                span = diagonal * random.range(0.030, 0.120)
+                samples = 7
             } else {
-                tone = (0.72, 0.68, 0.60)
+                span = diagonal * random.range(0.120, 0.360)
+                samples = 16
             }
-            for step in 1...segments {
-                let t = CGFloat(step) / CGFloat(segments)
-                let current = point(t)
-                let taper = sin(t * .pi)
-                let segmentAlpha = alpha * (0.20 + 0.80 * taper)
-                let segmentWidth = coreWidth * (0.30 + 0.70 * taper)
-                // 亮划痕：先铺一圈极淡的晕，再压细芯；暗划痕只留细线。
+
+            // 走向：多数顺着片长但明显偏摆，另有约四分之一是斜向擦痕，
+            // 用来打散「一排竖条」的刻板感。
+            let angle = baseAngle + (random.unit() < 0.26
+                ? random.range(-1.15, 1.15)
+                : random.range(-0.38, 0.38))
+            let dir = CGPoint(x: cos(angle), y: sin(angle))
+            let normal = CGPoint(x: -dir.y, y: dir.x)
+            let start = CGPoint(x: random.range(-0.02 * width, 1.02 * width),
+                                y: random.range(-0.02 * height, 1.02 * height))
+
+            // 弯曲：低幅随机游走，长划痕抖动更明显。
+            let jitter = layout.pxPerMM * random.range(0.015, 0.075) * (roll > 0.94 ? 2.0 : 1)
+            let bright = random.unit() > 0.70
+            let tone: (CGFloat, CGFloat, CGFloat) = bright
+                ? (1.0, 0.99, 0.95)
+                : (0.09, 0.085, 0.075)
+            let peak = random.range(0.020, 0.090) * (0.55 + level * 0.45)
+            let lineWidth = minWidth * random.range(1.0, 2.4)
+
+            // 断点：真实划痕沿线会突然消失一小段。
+            var breaks: [(CGFloat, CGFloat)] = []
+            for _ in 0..<Int(random.range(0, 2.99)) {
+                let from = random.range(0.05, 0.85)
+                breaks.append((from, from + random.range(0.03, 0.16)))
+            }
+
+            var points: [CGPoint] = []
+            var lateral: CGFloat = 0
+            for index in 0...samples {
+                let t = CGFloat(index) / CGFloat(samples)
+                if index > 0 {
+                    lateral += random.range(-1, 1) * jitter
+                }
+                let along = span * t
+                points.append(CGPoint(
+                    x: start.x + dir.x * along + normal.x * lateral,
+                    y: start.y + dir.y * along + normal.y * lateral))
+            }
+
+            for index in 1...samples {
+                let t0 = CGFloat(index - 1) / CGFloat(samples)
+                let t1 = CGFloat(index) / CGFloat(samples)
+                let mid = (t0 + t1) * 0.5
+                if breaks.contains(where: { mid >= $0.0 && mid <= $0.1 }) { continue }
+                let taper = pow(sin(mid * .pi), 0.7)
+                guard taper > 0.02 else { continue }
+                let alpha = peak * taper * random.range(0.55, 1.0)
                 if bright {
-                    context.setStrokeColor(red: 1.0, green: 0.98, blue: 0.92,
-                                           alpha: segmentAlpha * 0.26)
-                    context.setLineWidth(segmentWidth * 3.0)
-                    context.move(to: previous)
-                    context.addLine(to: current)
-                    context.strokePath()
-                    // 药膜划痕的彩色边缘：极淡的冷色偏移线。
-                    let fringe = coreWidth * 1.15
-                    context.setStrokeColor(red: 0.55, green: 0.80, blue: 1.0,
-                                           alpha: segmentAlpha * 0.14)
-                    context.setLineWidth(max(0.35, segmentWidth * 0.5))
-                    if layout.alongX {
-                        context.move(to: CGPoint(x: previous.x, y: previous.y + fringe))
-                        context.addLine(to: CGPoint(x: current.x, y: current.y + fringe))
-                    } else {
-                        context.move(to: CGPoint(x: previous.x + fringe, y: previous.y))
-                        context.addLine(to: CGPoint(x: current.x + fringe, y: current.y))
-                    }
+                    // 反光划痕只有一圈极淡的暖白光晕。
+                    context.setStrokeColor(red: 1.0, green: 0.98, blue: 0.93,
+                                           alpha: alpha * 0.20)
+                    context.setLineWidth(lineWidth * 2.6)
+                    context.move(to: points[index - 1])
+                    context.addLine(to: points[index])
                     context.strokePath()
                 }
                 context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
-                                       alpha: segmentAlpha * (bright ? 0.92 : 1.0))
-                context.setLineWidth(segmentWidth)
-                context.move(to: previous)
-                context.addLine(to: current)
+                                       alpha: alpha)
+                context.setLineWidth(max(0.34, lineWidth * (0.60 + 0.40 * taper)))
+                context.move(to: points[index - 1])
+                context.addLine(to: points[index])
                 context.strokePath()
-                previous = current
             }
 
-            // 真实划痕常成组出现：旁边跟一条更细、更短的并行划痕。
-            if random.unit() > 0.62 {
-                let shift = coreWidth * random.range(1.6, 4.0) * (random.unit() > 0.5 ? 1 : -1)
-                let startT = random.range(0.10, 0.34)
-                let endT = random.range(0.66, 0.92)
-                var companion: CGPoint?
-                for step in 0...16 {
-                    let t = startT + (endT - startT) * CGFloat(step) / 16
-                    var pointValue = point(t)
-                    if layout.alongX {
-                        pointValue.y += shift
-                    } else {
-                        pointValue.x += shift
-                    }
-                    if let companion {
-                        let taper = sin((t - startT) / max(0.01, endT - startT) * .pi)
+            // 成组出现的伴生划痕：更短、更淡、紧贴主线。
+            if roll >= 0.70, random.unit() > 0.72 {
+                let shift = minWidth * random.range(0.8, 2.4) * (random.unit() > 0.5 ? 1 : -1)
+                let fromT = random.range(0.15, 0.45)
+                let toT = random.range(0.55, 0.90)
+                var previous: CGPoint?
+                for step in 0...6 {
+                    let t = fromT + (toT - fromT) * CGFloat(step) / 6
+                    let wobble = sin(t * .pi) * jitter * 0.6
+                    let base = CGPoint(x: start.x + dir.x * span * t,
+                                       y: start.y + dir.y * span * t)
+                    let point = CGPoint(x: base.x + normal.x * (shift + wobble),
+                                        y: base.y + normal.y * (shift + wobble))
+                    if let previous {
+                        let taper = sin((t - fromT) / max(0.01, toT - fromT) * .pi)
                         context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
-                                               alpha: alpha * 0.42 * (0.25 + 0.75 * taper))
-                        context.setLineWidth(max(0.35, coreWidth * 0.5))
-                        context.move(to: companion)
-                        context.addLine(to: pointValue)
+                                               alpha: peak * 0.45 * (0.25 + 0.75 * taper))
+                        context.setLineWidth(max(0.30, lineWidth * 0.55))
+                        context.move(to: previous)
+                        context.addLine(to: point)
                         context.strokePath()
                     }
-                    companion = pointValue
+                    previous = point
                 }
             }
         }
