@@ -50,8 +50,6 @@ final class MobileEngine: ObservableObject {
     private var assetRefreshToken = 0
     /// 上次成功映射的相册快照：冷启动先出列表，再后台刷新。
     private var snapshotURL: URL { store.root.appendingPathComponent("album-snapshot.json") }
-    /// 本次运行内各筛选的结果缓存：切回已看过的筛选时直接出列表，不再等重新取图。
-    private var scopeCache: [MAssetScope: [MLibraryAsset]] = [:]
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -90,22 +88,10 @@ final class MobileEngine: ObservableObject {
 
     // MARK: - 相册映射
 
-    /// 切换主页筛选：有缓存时立刻换列表，再后台刷新该筛选。
+    /// 切换主页筛选：立即按目标相簿重新映射相册。
     func selectScope(_ newScope: MAssetScope) {
         guard scope != newScope else { return }
         scope = newScope
-        if case .graded = newScope {
-            // 已调色是本地库数据，同步算出来，切过去立刻生效。
-            assets = gradedAssets()
-            scopeCache[.graded] = assets
-            assetPhase = .ready
-        } else if let cached = scopeCache[newScope], !cached.isEmpty {
-            assets = cached
-            assetPhase = .ready
-        } else if newScope == .all {
-            // 还没有「全部」缓存时，至少用上次的快照先铺满列表，避免停在旧筛选上。
-            _ = restoreSnapshotIfNeeded()
-        }
         Task { await refreshAssets() }
     }
 
@@ -128,7 +114,6 @@ final class MobileEngine: ObservableObject {
         let scope = self.scope
         if case .graded = scope {
             assets = gradedAssets()
-            scopeCache[scope] = assets
             assetPhase = .ready
             return
         }
@@ -152,7 +137,6 @@ final class MobileEngine: ObservableObject {
             )
         }
         assetPhase = .ready
-        scopeCache[scope] = assets
         if case .all = scope {
             saveSnapshot(scanned)
         }
@@ -170,7 +154,7 @@ final class MobileEngine: ObservableObject {
     /// 冷启动恢复：读上次的资产 id 列表，一次性按 id 取回 PHAsset，列表立即可见。
     /// 只用于「全部」，其余相簿由用户点选后现取；快照不在时退回正常加载。
     private func restoreSnapshotIfNeeded() -> Bool {
-        guard case .all = scope, scopeCache[.all] == nil else { return false }
+        guard assets.isEmpty, case .all = scope else { return false }
         guard let data = try? Data(contentsOf: snapshotURL),
               let list = try? JSONDecoder().decode([AlbumSnapshot].self, from: data) else {
             return false
@@ -197,7 +181,6 @@ final class MobileEngine: ObservableObject {
             if let asset = item.phAsset { phAssetByFilename[item.filename] = asset }
         }
         assets = restored
-        scopeCache[.all] = restored
         return true
     }
 
@@ -266,8 +249,6 @@ final class MobileEngine: ObservableObject {
             return MLibraryAsset(id: asset.id, filename: asset.filename,
                                  photo: makePhoto(photo), phAsset: asset.phAsset)
         }
-        // 编辑记录变化后同步缓存，切回这个筛选时不会看到旧状态。
-        scopeCache[scope] = assets
     }
 
     /// 点开一张还没入库的相册照片：取回原片（iCloud 上也允许下载）→ 入库。
