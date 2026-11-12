@@ -27,6 +27,23 @@ struct ToneAnalysis: Equatable {
 struct GradeRenderResult {
     var image: ImageRGB
     var analysis: ToneAnalysis
+    /// 非 nil 表示配方里的 LUT 存在但解析失败：画面按无 LUT 渲染，调用方负责提示用户。
+    var lutError: LUTParseError? = nil
+}
+
+/// LUT 解析失败：导入时阻止无效文件入库，渲染与导出时把原因交给界面提示。
+struct LUTParseError: LocalizedError {
+    let name: String
+    let reason: String
+
+    init(path: String, reason: String = "不是有效的 3D .cube 文件") {
+        self.name = URL(fileURLWithPath: path).lastPathComponent
+        self.reason = reason
+    }
+
+    var errorDescription: String? {
+        "LUT 解析失败：\(name)（\(reason)）"
+    }
 }
 
 enum GradeEngine {
@@ -113,12 +130,13 @@ enum GradeEngine {
         applySharpening(&data, width: width, height: height, quality: recipe.quality)
         applyOptics(&data, width: width, height: height, optics: recipe.optics)
         try checkCancel()
-        applyLUT(&data, count: count, path: recipe.lut.path, strength: recipe.lut.strength)
+        let lutError = applyLUT(&data, count: count, path: recipe.lut.path, strength: recipe.lut.strength)
 
         postprocess(&data)
         return GradeRenderResult(
             image: ImageRGB(width: width, height: height, data: data),
-            analysis: analysis
+            analysis: analysis,
+            lutError: lutError
         )
     }
 
@@ -1056,44 +1074,60 @@ enum GradeEngine {
         var domainMin = Vec3(0, 0, 0)
         var domainMax = Vec3(1, 1, 1)
         var values: [Double] = []
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        var is1D = false
+        // 兼容 CRLF / CR / LF 与空格 / 制表符：Windows 导出的 .cube 常见 CRLF + tab，
+        // 只按 "\n" 和 " " 切分会把整份文件当成一行，造成解析静默失败。
+        for rawLine in text.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty, !line.hasPrefix("#") else { continue }
-            let upper = line.uppercased()
-            if upper.hasPrefix("LUT_3D_SIZE") {
-                size = line.split(separator: " ").last.flatMap { Int($0) } ?? 0
-            } else if upper.hasPrefix("DOMAIN_MIN") {
-                let parts = line.split(separator: " ").dropFirst().prefix(3).compactMap { Double($0) }
-                if parts.count == 3 { domainMin = Vec3(parts[0], parts[1], parts[2]) }
-            } else if upper.hasPrefix("DOMAIN_MAX") {
-                let parts = line.split(separator: " ").dropFirst().prefix(3).compactMap { Double($0) }
-                if parts.count == 3 { domainMax = Vec3(parts[0], parts[1], parts[2]) }
-            } else if upper.hasPrefix("TITLE") || upper.hasPrefix("LUT_1D")
-                        || upper.hasPrefix("LUT_3D_INPUT") {
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard let key = fields.first?.uppercased() else { continue }
+            switch key {
+            case "LUT_3D_SIZE":
+                size = fields.dropFirst().first.flatMap { Int($0) } ?? 0
+            case "LUT_1D_SIZE":
+                is1D = true
+            case "DOMAIN_MIN", "DOMAIN_MAX":
+                let parts = fields.dropFirst().prefix(3).compactMap { Double($0) }
+                if parts.count == 3 {
+                    if key == "DOMAIN_MIN" {
+                        domainMin = Vec3(parts[0], parts[1], parts[2])
+                    } else {
+                        domainMax = Vec3(parts[0], parts[1], parts[2])
+                    }
+                }
+            case "TITLE":
                 continue
-            } else {
-                let parts = line.split(separator: " ").prefix(3).compactMap { Double($0) }
-                if parts.count >= 3 { values.append(contentsOf: parts) }
+            default:
+                if key.hasPrefix("LUT_3D_INPUT") || key.hasPrefix("LUT_1D_INPUT") { continue }
+                let parts = fields.prefix(3).compactMap { Double($0) }
+                if parts.count == 3 { values.append(contentsOf: parts) }
             }
         }
-        guard size >= 2 else { throw NSError(domain: "grade", code: 1, userInfo: [
-            NSLocalizedDescriptionKey: "不是有效的 3D .cube 文件"
-        ]) }
+        guard !is1D else {
+            throw LUTParseError(path: path, reason: "只支持 3D .cube，1D LUT 暂不支持")
+        }
+        guard size >= 2 else { throw LUTParseError(path: path) }
         let expected = size * size * size * 3
-        guard values.count >= expected else { throw NSError(domain: "grade", code: 2, userInfo: [
-            NSLocalizedDescriptionKey: "LUT 数据行数不足"
-        ]) }
+        guard values.count >= expected else {
+            throw LUTParseError(path: path, reason: "LUT 数据行数不足")
+        }
         return (size, Array(values.prefix(expected)), domainMin, domainMax)
     }
 
-    private static func cachedCube(path: String) -> LUTCube? {
+    /// 导入校验：把 .cube 完整解析一次并写入缓存，失败直接抛错；成功后点击即可命中缓存。
+    static func preloadCube(path: String) throws {
+        _ = try loadCube(path: path)
+    }
+
+    private static func loadCube(path: String) throws -> LUTCube {
         lutLock.lock()
         if let cached = lutCache[path] {
             lutLock.unlock()
             return cached
         }
         lutLock.unlock()
-        guard let parsed = try? parseCube(path: path) else { return nil }
+        let parsed = try parseCube(path: path)
         let cube = LUTCube(size: parsed.0, values: parsed.1,
                            domainMin: parsed.2, domainMax: parsed.3)
         lutLock.lock()
@@ -1103,9 +1137,18 @@ enum GradeEngine {
         return cube
     }
 
+    /// 返回 nil 表示 LUT 已应用或配方本来就没启用 LUT；非 nil 表示解析失败，调用方需提示用户。
     private static func applyLUT(_ data: inout [Double], count: Int, path: String,
-                                 strength: Double) {
-        guard !path.isEmpty, strength > 1e-6, let cube = cachedCube(path: path) else { return }
+                                 strength: Double) -> LUTParseError? {
+        guard !path.isEmpty, strength > 1e-6 else { return nil }
+        let cube: LUTCube
+        do {
+            cube = try loadCube(path: path)
+        } catch let error as LUTParseError {
+            return error
+        } catch {
+            return LUTParseError(path: path)
+        }
         let size = cube.size
         let spanX = max(cube.domainMax.x - cube.domainMin.x, 1e-6)
         let spanY = max(cube.domainMax.y - cube.domainMin.y, 1e-6)
@@ -1147,5 +1190,6 @@ enum GradeEngine {
                 data[i * 3 + channel] = data[i * 3 + channel] * (1 - mix) + graded * mix
             }
         }
+        return nil
     }
 }

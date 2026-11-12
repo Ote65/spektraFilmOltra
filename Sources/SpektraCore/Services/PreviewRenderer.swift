@@ -54,10 +54,11 @@ final class PreviewRenderer {
         let token = generation
         lock.unlock()
         let capacity = maxSize ?? params.settings.previewMaxSize
-        let prepared = Self.prepared(image, maxSize: capacity)
         queue.async { [weak self] in
             guard let self else { return }
             if self.currentGeneration() != token { return }
+            // 缩放放到渲染队列：1600→1008 的逐像素双线性在主线程会顶掉交互帧。
+            let prepared = Self.prepared(image, maxSize: capacity)
             var working = params
             let lut = self.lutService(for: working)
             let pipeline = SimulationPipeline(params: working, lutService: lut, keepTaps: false)
@@ -74,10 +75,9 @@ final class PreviewRenderer {
         }
     }
 
+    /// 预览/导出准备：双线性降采样。最近邻在非整数倍缩小（如 1600→1008）时会产生锯齿。
     static func prepared(_ image: ImageRGB, maxSize: Int) -> ImageRGB {
-        let longEdge = max(image.width, image.height)
-        guard maxSize > 0, longEdge > maxSize else { return image }
-        return Resize.smallPreview(image, maxSize: maxSize)
+        Resize.longEdge(image, maxSize: maxSize)
     }
 
     /// 8-bit sRGB 显示图（预览仅用于屏幕显示）。

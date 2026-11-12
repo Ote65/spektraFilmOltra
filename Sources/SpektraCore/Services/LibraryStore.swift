@@ -16,12 +16,17 @@ struct PhotoEdit: Codable {
     var quickIntents: [String: Double] = [:]
     /// RAW 解码参数（白平衡/色温/色调/镜头校正）。改变后需要重新解码原图。
     var loadRaw = LoadRawParams()
+    /// 手动旋转：0–3 表示顺时针 90° 的倍数；只改变几何方向，不重新解码。
+    var rotationTurns = 0
+    /// 黑白模式：移动端在显影结果之后做亮度归一，属于展示层的显影预设，不进入核心参数。
+    var monochrome = false
 
     init() {}
 
     private enum CodingKeys: String, CodingKey {
         case filmStock, printStock, camera, enlarger, filmRender, printRender
-        case scanner, io, settings, debug, quickIntents, loadRaw
+        case scanner, io, settings, debug, quickIntents, loadRaw, rotationTurns
+        case monochrome
     }
 
     /// 逐字段解码：旧索引缺少新字段时回退默认值，避免整库解码失败后读成空库。
@@ -39,6 +44,8 @@ struct PhotoEdit: Codable {
         debug = try container.decodeIfPresent(DebugParams.self, forKey: .debug) ?? DebugParams()
         quickIntents = try container.decodeIfPresent([String: Double].self, forKey: .quickIntents) ?? [:]
         loadRaw = try container.decodeIfPresent(LoadRawParams.self, forKey: .loadRaw) ?? LoadRawParams()
+        rotationTurns = try container.decodeIfPresent(Int.self, forKey: .rotationTurns) ?? 0
+        monochrome = try container.decodeIfPresent(Bool.self, forKey: .monochrome) ?? false
     }
 
     /// RAW 解码选项：白平衡/色温/色调/镜头校正。解码尺寸由调用方另行传入。
@@ -80,10 +87,14 @@ struct LibraryPhoto: Codable, Identifiable, Hashable {
     var colorLabel: String?
     var importedAt: Date = Date()
     var edit = PhotoEdit()
+    /// 导入时的初始编辑状态：重置调色时用它还原，避免把拍摄曝光等出厂值一起抹掉。
+    var initialEditData: Data? = nil
     /// 快速控制的基线（编码后的 PhotoEdit）；缺失时以当前 edit 为准。
     var quickBaselineData: Data? = nil
     /// 片边参数（移动端展示层配置，不参与核心显影，也不进交接图）。
     var borderData: Data? = nil
+    /// 裁切与校正几何（移动端调色台配置，作用于交接图本身，片边后再合成）。
+    var cropData: Data? = nil
 
     static func == (lhs: LibraryPhoto, rhs: LibraryPhoto) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -96,11 +107,14 @@ final class LibraryStore {
     private(set) var photos: [LibraryPhoto] = []
     let root: URL
     private let ioQueue = DispatchQueue(label: "spektrafilm.library.io", qos: .utility)
+    /// 移动端打开「支持 JPEG」后需要保留编码图记录，桌面端仍只保留 RAW。
+    private let keepsEncodedRecords: Bool
     private var indexURL: URL { root.appendingPathComponent("index.json") }
     private var originalsURL: URL { root.appendingPathComponent("Originals", isDirectory: true) }
     private var thumbnailsURL: URL { root.appendingPathComponent("Thumbnails", isDirectory: true) }
 
-    init(root: URL? = nil) {
+    init(root: URL? = nil, keepsEncodedRecords: Bool = false) {
+        self.keepsEncodedRecords = keepsEncodedRecords
         let base = root ?? FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         )[0].appendingPathComponent("Spektrafilm/Library", isDirectory: true)
@@ -117,8 +131,9 @@ final class LibraryStore {
             photos = []
             return
         }
-        // 显影台只接受 RAW；旧索引里的 JPEG/TIFF 不再进入库。
-        photos = decoded.filter {
+        // 移动端要保留编码图记录（关掉「支持 JPEG」时只在主页隐藏）；
+        // 桌面端维持只收 RAW，避免历史索引里的编码图重新出现在库中。
+        photos = keepsEncodedRecords ? decoded : decoded.filter {
             ImageLoader.rawSuffixes.contains(
                 URL(fileURLWithPath: $0.originalPath).pathExtension.lowercased()
             )
@@ -192,10 +207,18 @@ final class LibraryStore {
         let cctfDecoding: Bool
     }
 
-    /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。
-    func stageImport(from source: URL) throws -> StagedImport {
+    /// 允许入库的扩展名：默认仅 RAW；打开「支持 JPEG」后只额外放行 JPEG。
+    /// PNG / HEIC 等编码图不进库，避免网络保存图和截屏混入。
+    static func accepts(_ source: URL, allowingEncoded: Bool) -> Bool {
         let ext = source.pathExtension.lowercased()
-        guard ImageLoader.rawSuffixes.contains(ext) else {
+        if ImageLoader.rawSuffixes.contains(ext) { return true }
+        return allowingEncoded && (ext == "jpg" || ext == "jpeg")
+    }
+
+    /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。
+    func stageImport(from source: URL, allowingEncoded: Bool = false) throws -> StagedImport {
+        let ext = source.pathExtension.lowercased()
+        guard Self.accepts(source, allowingEncoded: allowingEncoded) else {
             throw NSError(domain: "Spektrafilm.Library", code: 2,
                           userInfo: [NSLocalizedDescriptionKey:
                             "显影台只支持 RAW，拒绝导入 \(source.lastPathComponent)"])
@@ -236,8 +259,11 @@ final class LibraryStore {
             thumbnailPath: nil,
             width: staged.width,
             height: staged.height,
-            isRaw: true,
-            edit: edit
+            isRaw: ImageLoader.rawSuffixes.contains(
+                URL(fileURLWithPath: staged.originalPath).pathExtension.lowercased()
+            ),
+            edit: edit,
+            initialEditData: try? JSONEncoder().encode(edit)
         )
         photos.append(photo)
         try save()
@@ -245,9 +271,9 @@ final class LibraryStore {
     }
 
     @discardableResult
-    func importPhoto(from source: URL) throws -> LibraryPhoto {
+    func importPhoto(from source: URL, allowingEncoded: Bool = false) throws -> LibraryPhoto {
         let ext = source.pathExtension.lowercased()
-        guard ImageLoader.rawSuffixes.contains(ext) else {
+        guard Self.accepts(source, allowingEncoded: allowingEncoded) else {
             throw NSError(domain: "Spektrafilm.Library", code: 2,
                           userInfo: [NSLocalizedDescriptionKey:
                             "显影台只支持 RAW，拒绝导入 \(source.lastPathComponent)"])
@@ -267,6 +293,12 @@ final class LibraryStore {
         var edit = PhotoEdit()
         edit.io.inputColorSpace = detected.space
         edit.io.inputCCTFDecoding = detected.cctfDecoding
+        // 相机内调过的曝光已写进 RAW 的感光数据；显影管线的自动曝光会把它归一化掉，
+        // 这里把拍摄时的补偿读回来重新施加，让显影台与导出和相册观感一致。
+        let bias = ImageLoader.capturedExposureBias(url: source)
+        if abs(bias) > 0.01 {
+            edit.camera.exposureCompensationEV = bias
+        }
         let photo = LibraryPhoto(
             id: id,
             filename: source.lastPathComponent,
@@ -274,8 +306,9 @@ final class LibraryStore {
             thumbnailPath: nil,
             width: dimensions.width,
             height: dimensions.height,
-            isRaw: true,
-            edit: edit
+            isRaw: ImageLoader.rawSuffixes.contains(ext),
+            edit: edit,
+            initialEditData: try? JSONEncoder().encode(edit)
         )
         photos.append(photo)
         try save()

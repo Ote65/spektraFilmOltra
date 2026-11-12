@@ -244,3 +244,25 @@ enum Resize {
     }
 }
 
+extension ImageRGB {
+    /// 顺时针旋转 90° × turns（0–3）。只做像素重排，不重新采样。
+    func rotatedClockwise(_ turns: Int) -> ImageRGB {
+        let t = ((turns % 4) + 4) % 4
+        guard t != 0 else { return self }
+        let swapped = t % 2 == 1
+        var output = ImageRGB(width: swapped ? height : width,
+                              height: swapped ? width : height)
+        for y in 0..<height {
+            for x in 0..<width {
+                let value = pixel(x, y)
+                switch t {
+                case 1: output.setPixel(height - 1 - y, x, value)
+                case 2: output.setPixel(width - 1 - x, height - 1 - y, value)
+                default: output.setPixel(y, width - 1 - x, value)
+                }
+            }
+        }
+        return output
+    }
+}
+

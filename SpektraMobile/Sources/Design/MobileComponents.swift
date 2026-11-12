@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - iOS 26 玻璃材质
 //
@@ -262,6 +263,182 @@ struct MUnderlineTabs: View {
     }
 }
 
+// MARK: - 分栏页签（iPad 横屏）
+
+/// 左轨顶部的下划线页签：与 macOS 版的下划线 tab 同一语言。
+struct MSideRailTab: View {
+    let title: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Text(title)
+                    .font(.mSans(12.5, selected ? .semibold : .medium))
+                    .foregroundStyle(selected ? MColor.brass : MColor.text3)
+                Rectangle()
+                    .fill(selected ? MColor.brass : MColor.clear)
+                    .frame(height: 2)
+            }
+            .frame(minWidth: 46)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 分栏参数栏顶部的胶囊页签行：换页只换内容，不再压在画布底部。
+struct MSplitTabRow: View {
+    let titles: [String]
+    let selection: Int
+    let onSelect: (Int) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(titles.indices, id: \.self) { index in
+                Button {
+                    MHaptic.tick()
+                    onSelect(index)
+                } label: {
+                    Text(titles[index])
+                        .font(.mSans(11, selection == index ? .semibold : .medium))
+                        .foregroundStyle(selection == index ? MColor.brass : MColor.text3)
+                        .padding(.horizontal, 12)
+                        .frame(height: 30)
+                        .background(
+                            Capsule().fill(selection == index
+                                           ? MColor.brassWash
+                                           : MColor.surface2.opacity(0.6))
+                        )
+                        .overlay(
+                            Capsule().strokeBorder(
+                                selection == index ? MColor.brass.opacity(0.28) : MColor.hairline,
+                                lineWidth: 1
+                            )
+                        )
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+// MARK: - 直方图（分栏参数栏）
+
+/// RGB 直方图数据：每通道 64 桶的原始计数，视图内做联合归一化。
+struct MHistogramData: Equatable {
+    let red: [Double]
+    let green: [Double]
+    let blue: [Double]
+
+    static let empty = MHistogramData(
+        red: .init(repeating: 0, count: 64),
+        green: .init(repeating: 0, count: 64),
+        blue: .init(repeating: 0, count: 64)
+    )
+}
+
+/// 从屏幕图计算 RGB 直方图：先降采样到 160pt 宽的 RGBA8，再逐像素分桶。
+/// 与 macOS 版 Inspector 的直方图同一呈现口径（亮度/RGB 三条折线）。
+enum MHistogramSampler {
+    static func compute(_ image: MPlatformImage, bins: Int = 64) -> MHistogramData? {
+        #if os(macOS)
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        #else
+        guard let cg = image.cgImage else { return nil }
+        #endif
+        let width = 160
+        let height = max(1, Int((CGFloat(cg.height) / CGFloat(max(1, cg.width))) * CGFloat(width)))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        ctx.interpolationQuality = .low
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let data = ctx.data else { return nil }
+
+        let pixels = data.bindMemory(to: UInt8.self, capacity: width * height * 4)
+        var red = [Double](repeating: 0, count: bins)
+        var green = [Double](repeating: 0, count: bins)
+        var blue = [Double](repeating: 0, count: bins)
+        let shift = 8 - Int(log2(Double(bins)))
+
+        for index in 0..<(width * height) {
+            let offset = index * 4
+            red[Int(pixels[offset]) >> shift] += 1
+            green[Int(pixels[offset + 1]) >> shift] += 1
+            blue[Int(pixels[offset + 2]) >> shift] += 1
+        }
+        return MHistogramData(red: red, green: green, blue: blue)
+    }
+}
+
+/// 亮度/RGB 三色折线直方图：画法与 macOS 版 SkinHistogram 一致。
+struct MHistogram: View {
+    let data: MHistogramData
+
+    var body: some View {
+        Canvas { context, size in
+            for fraction in [0.25, 0.5, 0.75] {
+                var line = Path()
+                line.move(to: CGPoint(x: 0, y: size.height * fraction))
+                line.addLine(to: CGPoint(x: size.width, y: size.height * fraction))
+                context.stroke(line, with: .color(.white.opacity(0.045)), lineWidth: 1)
+            }
+
+            let sums = (0..<data.red.count).map { data.red[$0] + data.green[$0] + data.blue[$0] }
+            let maxValue = max(0.01, sums.max() ?? 1)
+
+            draw(data.red, color: Color(hex: 0xC0705E).opacity(0.58),
+                 maxValue: maxValue, context: context, size: size)
+            draw(data.green, color: Color(hex: 0x7E9B77).opacity(0.55),
+                 maxValue: maxValue, context: context, size: size)
+            draw(data.blue, color: Color(hex: 0x6D8BA7).opacity(0.55),
+                 maxValue: maxValue, context: context, size: size)
+        }
+        .frame(height: 52)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.black.opacity(0.16))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.035), lineWidth: 1)
+        )
+    }
+
+    private func draw(
+        _ values: [Double],
+        color: Color,
+        maxValue: Double,
+        context: GraphicsContext,
+        size: CGSize
+    ) {
+        guard values.count > 1 else { return }
+        var path = Path()
+        for (index, value) in values.enumerated() {
+            let x = size.width * CGFloat(index) / CGFloat(values.count - 1)
+            let y = size.height - 2 - CGFloat(value / maxValue) * (size.height - 4) * 0.92
+            if index == 0 {
+                path.move(to: CGPoint(x: x, y: y))
+            } else {
+                path.addLine(to: CGPoint(x: x, y: y))
+            }
+        }
+        context.stroke(
+            path,
+            with: .color(color),
+            style: StrokeStyle(lineWidth: 1.2, lineJoin: .round)
+        )
+    }
+}
+
 // MARK: - 分组标题
 
 struct MSectionHead: View {
@@ -334,12 +511,18 @@ struct MParamSlider: View {
     var suffix: String = ""
     var isEnabled: Bool = true
     var compact: Bool = false
+    /// 吸附点：拖到附近自动回到该值（0 = 默认状态），并给出一次吸附触感。
+    var snapTarget: Double? = nil
+    /// 吸附半径（数值单位）；不填时按 1.5 个步进算。
+    var snapDistance: Double? = nil
 
     @State private var dragging = false
     @State private var lastTick: Double = 0
     /// 按下时的锚点：值按「位移增量」换算，而不是手指的绝对位置。
     @State private var dragStartValue: Double = 0
     @State private var dragStartX: CGFloat = 0
+    /// 当前是否吸附在 `snapTarget` 上：用来做迟滞，避免在边界来回抖。
+    @State private var snapActive = false
 
     var body: some View {
         // 栅格化布局：每个单元 = 标签区 + 滑轨区，所有滑轨严格等间距。
@@ -444,10 +627,29 @@ struct MParamSlider: View {
                 let delta = Double((gesture.location.x - dragStartX) / width) * span
                 let raw = dragStartValue + delta
                 let stepped = step > 0 ? (raw / step).rounded() * step : raw
-                let clamped = min(range.upperBound, max(range.lowerBound, stepped))
+                var clamped = min(range.upperBound, max(range.lowerBound, stepped))
+                // 吸附：进入半径后锁在默认值上；迟滞 1.4 倍，避免在边界来回抖。
+                var didSnap = false
+                if let target = snapTarget {
+                    let radius = snapDistance ?? max(abs(step) * 1.5, 0.5)
+                    let near = abs(clamped - target) <= (snapActive ? radius * 1.4 : radius)
+                    if near {
+                        clamped = target
+                        if !snapActive {
+                            snapActive = true
+                            didSnap = true
+                        }
+                    } else {
+                        snapActive = false
+                    }
+                }
                 if abs(clamped - value) > 1e-9 {
                     value = clamped
-                    if abs(clamped - lastTick) >= max(step, 1e-9) {
+                    if didSnap {
+                        // 吸附瞬间只给一次更明确的触感，不再叠步进 tick。
+                        lastTick = clamped
+                        MHaptic.light()
+                    } else if abs(clamped - lastTick) >= max(step, 1e-9) {
                         lastTick = clamped
                         MHaptic.tick()
                     }
@@ -455,6 +657,7 @@ struct MParamSlider: View {
             }
             .onEnded { _ in
                 dragging = false
+                snapActive = false
                 lastTick = value
             }
     }
@@ -487,13 +690,14 @@ struct MParamSlider: View {
 struct MToggleRow: View {
     let label: String
     @Binding var isOn: Bool
+    var isEnabled: Bool = true
     var compact: Bool = false
 
     var body: some View {
         HStack {
             Text(label)
                 .font(.mSans(compact ? 11 : 12.5))
-                .foregroundStyle(MColor.text2)
+                .foregroundStyle(isEnabled ? MColor.text2 : MColor.text4)
             Spacer()
             Button {
                 MHaptic.tick()
@@ -511,9 +715,11 @@ struct MToggleRow: View {
                             .frame(width: compact ? 16 : 18, height: compact ? 16 : 18)
                             .padding(.horizontal, 3)
                     }
+                    .opacity(isEnabled ? 1 : 0.4)
                     .contentShape(Capsule())
             }
             .buttonStyle(.plain)
+            .disabled(!isEnabled)
         }
         .frame(height: compact ? 42 : 48)
     }
@@ -1191,12 +1397,24 @@ struct MLUTCard: View {
 }
 
 // MARK: - 曲线
+//
+// 点曲线默认没有任何控制点（恒等曲线）。只有落点本身接收拖动，
+// 框内其余拖动一律交给外层 ScrollView；点击空白处新增一个点，点被选中后旁边出现删除按钮。
 
 struct MCurveEditor: View {
     @Binding var points: [CGPoint]
     var channel: String = "RGB"
 
+    @State private var selected: Int? = nil
     @State private var dragIndex: Int? = nil
+    @State private var lastTick = CGPoint(x: -1, y: -1)
+
+    /// 控制点上限：再多曲线会碎成折线，也不利于手指命中。
+    private let maxPoints = 8
+    /// 命中的距离阈值：只包住圆点本身，不扩到整块画布。
+    private let hitRadius: CGFloat = 20
+    /// 左右各留一点余量，避免控制点贴边时删除按钮无处安放。
+    private let xInset: Double = 0.02
 
     var body: some View {
         GeometryReader { geo in
@@ -1214,37 +1432,173 @@ struct MCurveEditor: View {
                         channel == "RGB" ? MColor.brass : MColor.text1,
                         style: StrokeStyle(lineWidth: 1.6, lineCap: .round)
                     )
+                    .clipShape(RoundedRectangle(cornerRadius: MRadius.control, style: .continuous))
 
                 ForEach(Array(points.enumerated()), id: \.offset) { item in
-                    Circle()
-                        .fill(dragIndex == item.offset ? MColor.brassHigh : Color(hex: 0xF1ECE3))
-                        .frame(width: dragIndex == item.offset ? 12 : 9, height: dragIndex == item.offset ? 12 : 9)
-                        .overlay(Circle().strokeBorder(Color.black.opacity(0.4), lineWidth: 1))
-                        .position(x: item.element.x * size.width, y: (1 - item.element.y) * size.height)
+                    pointHandle(index: item.offset, point: item.element, size: size)
+                }
+
+                if let selected, points.indices.contains(selected) {
+                    deleteButton(at: points[selected], size: size)
                 }
             }
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { gesture in
-                        if dragIndex == nil {
-                            dragIndex = nearest(to: gesture.location, size: size)
-                            MHaptic.light()
+                SpatialTapGesture()
+                    .onEnded { value in
+                        // 只有曲线本身可交互：点已有点 = 选中，点曲线 = 新增，
+                        // 框内其余位置不响应点击，纵向拖动照常滚动面板。
+                        if let index = nearest(to: value.location, size: size) {
+                            select(index)
+                        } else if isNearCurve(value.location, size: size) {
+                            addPointOnCurve(x: Double(value.location.x / max(1, size.width)))
                         }
-                        guard let index = dragIndex, index > 0, index < points.count - 1 else { return }
-                        let x = min(1, max(0, gesture.location.x / size.width))
-                        let y = min(1, max(0, 1 - gesture.location.y / size.height))
-                        let low = points[index - 1].x + 0.03
-                        let high = points[index + 1].x - 0.03
-                        points[index] = CGPoint(x: min(high, max(low, x)), y: y)
                     }
-                    .onEnded { _ in dragIndex = nil }
             )
             .overlay(
                 RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
                     .strokeBorder(MColor.hairline, lineWidth: 1)
             )
         }
+    }
+
+    // MARK: 点
+
+    private func pointHandle(index: Int, point: CGPoint, size: CGSize) -> some View {
+        let position = projected(point, size: size)
+        let active = selected == index || dragIndex == index
+        return ZStack {
+            if active {
+                Circle()
+                    .strokeBorder(MColor.brass.opacity(0.5), lineWidth: 1)
+                    .frame(width: 17, height: 17)
+            }
+            Circle()
+                .fill(active ? MColor.brassHigh : Color(hex: 0xF1ECE3))
+                .frame(width: active ? 11 : 9, height: active ? 11 : 9)
+                .overlay(Circle().strokeBorder(Color.black.opacity(0.42), lineWidth: 1))
+                .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+        }
+        // 可交互区只围着圆点；框内其他位置不挂手势，纵向拖动照常滚动面板。
+        .frame(width: 44, height: 44)
+        .contentShape(Circle())
+        .position(position)
+        .gesture(dragGesture(index: index, size: size))
+    }
+
+    private func dragGesture(index: Int, size: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { gesture in
+                guard points.indices.contains(index) else { return }
+                if dragIndex == nil {
+                    dragIndex = index
+                    selected = index
+                    lastTick = points[index]
+                    MHaptic.light()
+                }
+                let rawX = Double(gesture.location.x / max(1, size.width))
+                let rawY = Double(1 - gesture.location.y / max(1, size.height))
+                let low = index > 0 ? Double(points[index - 1].x) + 0.03 : xInset
+                let high = index < points.count - 1 ? Double(points[index + 1].x) - 0.03 : 1 - xInset
+                // 相邻两点过近时保持原位，绝不允许拖动把顺序拖反。
+                let x = high > low ? min(max(rawX, low), high) : Double(points[index].x)
+                let y = min(max(rawY, 0), 1)
+                points[index] = CGPoint(x: x, y: y)
+                // 每移动约 2% 给一次轻震动，既跟手又不会震成蜂鸣器。
+                if abs(x - Double(lastTick.x)) >= 0.02 || abs(y - Double(lastTick.y)) >= 0.02 {
+                    lastTick = CGPoint(x: x, y: y)
+                    MHaptic.tick()
+                }
+            }
+            .onEnded { _ in
+                dragIndex = nil
+            }
+    }
+
+    /// 在曲线上新增一个点：y 取当前曲线在该 x 的高度，之后靠拖动塑形。
+    private func addPointOnCurve(x rawX: Double) {
+        guard points.count < maxPoints else { return }
+        let x = min(max(rawX, xInset), 1 - xInset)
+        // x 方向留出最小间距，避免两个点叠在同一列导致拖动互相卡住。
+        if let crowded = points.enumerated().first(where: { abs(Double($0.element.x) - x) < 0.035 }) {
+            selected = crowded.offset
+            MHaptic.tick()
+            return
+        }
+        let y = min(max(curveValue(at: x), 0), 1)
+        points.append(CGPoint(x: x, y: y))
+        points.sort { $0.x < $1.x }
+        selected = points.firstIndex { abs($0.x - x) < 1e-9 }
+        MHaptic.tick()
+    }
+
+    /// 曲线在归一化 x 处的线性读数（用于判断点击是否落在曲线上、以及新点的初始 y）。
+    private func curveValue(at x: Double) -> Double {
+        var knots: [(x: Double, y: Double)] = [(0, 0)]
+        knots.append(contentsOf: points.sorted { $0.x < $1.x }
+            .map { (Double($0.x), Double($0.y)) })
+        knots.append((1, 1))
+        let clamped = min(max(x, 0), 1)
+        for index in 1..<knots.count {
+            let left = knots[index - 1]
+            let right = knots[index]
+            if clamped >= left.x, clamped <= right.x {
+                let dx = right.x - left.x
+                guard dx > 1e-9 else { return right.y }
+                let t = (clamped - left.x) / dx
+                return left.y + (right.y - left.y) * t
+            }
+        }
+        return clamped
+    }
+
+    private func isNearCurve(_ location: CGPoint, size: CGSize) -> Bool {
+        let x = min(max(Double(location.x / max(1, size.width)), 0), 1)
+        let curveY = (1 - curveValue(at: x)) * Double(size.height)
+        return abs(curveY - Double(location.y)) <= 18
+    }
+
+    private func select(_ index: Int) {
+        guard points.indices.contains(index) else { return }
+        guard selected != index else { return }
+        selected = index
+        MHaptic.tick()
+    }
+
+    private func removePoint(_ index: Int) {
+        guard points.indices.contains(index) else { return }
+        MHaptic.medium()
+        points.remove(at: index)
+        selected = nil
+    }
+
+    // MARK: 删除按钮
+
+    private func deleteButton(at point: CGPoint, size: CGSize) -> some View {
+        let position = projected(point, size: size)
+        let x = min(max(position.x + 20, 16), max(16, size.width - 16))
+        let y = min(max(position.y - 20, 16), max(16, size.height - 16))
+        return Button {
+            if let selected { removePoint(selected) }
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(MColor.text1)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(MColor.surface3.opacity(0.96)))
+                .overlay(Circle().strokeBorder(MColor.hairlineStrong, lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 4, y: 1)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .position(x: x, y: y)
+        .accessibilityLabel("删除曲线点")
+    }
+
+    // MARK: 绘制
+
+    private func projected(_ point: CGPoint, size: CGSize) -> CGPoint {
+        CGPoint(x: point.x * size.width, y: (1 - point.y) * size.height)
     }
 
     private func grid(size: CGSize) -> some View {
@@ -1269,10 +1623,13 @@ struct MCurveEditor: View {
         .stroke(Color.white.opacity(0.12), style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
     }
 
+    /// 曲线始终以 (0,0)、(1,1) 为端点；用户点只作为中间控制点。
     private func curvePath(size: CGSize) -> Path {
         var path = Path()
-        guard points.count > 1 else { return path }
-        let mapped = points.map { CGPoint(x: $0.x * size.width, y: (1 - $0.y) * size.height) }
+        let sorted = points.sorted { $0.x < $1.x }
+        var mapped = [CGPoint(x: 0, y: size.height)]
+        mapped.append(contentsOf: sorted.map { projected($0, size: size) })
+        mapped.append(CGPoint(x: size.width, y: 0))
         path.move(to: mapped[0])
         for i in 0..<(mapped.count - 1) {
             let p0 = mapped[max(i - 1, 0)]
@@ -1289,10 +1646,11 @@ struct MCurveEditor: View {
     private func nearest(to location: CGPoint, size: CGSize) -> Int? {
         var best: (index: Int, distance: CGFloat)? = nil
         for (index, point) in points.enumerated() {
-            let dx = point.x * size.width - location.x
-            let dy = (1 - point.y) * size.height - location.y
+            let target = projected(point, size: size)
+            let dx = target.x - location.x
+            let dy = target.y - location.y
             let distance = sqrt(dx * dx + dy * dy)
-            if distance < 34 {
+            if distance <= hitRadius {
                 if best == nil || distance < best!.distance {
                     best = (index, distance)
                 }
@@ -1531,5 +1889,302 @@ enum MImageFit {
             width: width,
             height: height
         )
+    }
+}
+
+/// iOS 原相机同款刻度尺：中心指示固定，刻度随手势滚动，松手后按指数阻尼滑行。
+/// 相机曝光/色温与调色台裁切页共用，保证两处手感完全一致。
+struct MTickRuler: View {
+    let range: ClosedRange<Double>
+    let step: Double
+    @Binding var value: Double
+    var spacing: CGFloat = 13
+    var rulerHeight: CGFloat = 26
+    var haptics = false
+
+    @State private var dragStart: Double?
+    /// 连续滚动值（未量化）：刻度位置由它决定，读数由量化后的 `value` 决定。
+    @State private var scrollValue: Double?
+    @State private var inertia: Task<Void, Never>?
+
+    var body: some View {
+        GeometryReader { _ in
+            let span = range.upperBound - range.lowerBound
+            let current = scrollValue ?? value
+            let position = (current - range.lowerBound) / step
+            Canvas { context, size in
+                let centerX = size.width / 2
+                let half = Int(centerX / spacing) + 2
+                let center = Int(position.rounded())
+                let maxIndex = Int(span / step)
+                for index in (center - half)...(center + half) {
+                    guard index >= 0, index <= maxIndex else { continue }
+                    let x = centerX + (CGFloat(index) - CGFloat(position)) * spacing
+                    let distance = abs(x - centerX)
+                    let near = max(0, 1 - distance / (spacing * 4.2))
+                    let height: CGFloat = 9 + 17 * near * near
+                    let highlighted = distance < spacing / 2
+                    let rect = CGRect(x: x - 0.75, y: (size.height - height) / 2,
+                                      width: 1.5, height: height)
+                    context.fill(
+                        Path(roundedRect: rect, cornerRadius: 0.75),
+                        with: .color(highlighted
+                                     ? MColor.brass
+                                     : Color.white.opacity(0.26 + 0.22 * near))
+                    )
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { drag in
+                        inertia?.cancel()
+                        inertia = nil
+                        if dragStart == nil { dragStart = scrollValue ?? value }
+                        let base = dragStart ?? value
+                        let raw = base - Double(drag.translation.width / spacing) * step
+                        let clamped = min(max(raw, range.lowerBound), range.upperBound)
+                        scrollValue = clamped
+                        commit(clamped)
+                    }
+                    .onEnded { drag in
+                        let residual = drag.predictedEndTranslation.width - drag.translation.width
+                        dragStart = nil
+                        glide(residual: residual)
+                    }
+            )
+        }
+        .frame(height: rulerHeight)
+        .onChange(of: value) { _, newValue in
+            guard dragStart == nil, inertia == nil else { return }
+            scrollValue = newValue
+        }
+        .onDisappear { inertia?.cancel() }
+    }
+
+    private func commit(_ raw: Double) {
+        let quantized = min(max((raw / step).rounded() * step,
+                                range.lowerBound), range.upperBound)
+        if abs(quantized - value) > 1e-6 {
+            if haptics { MHaptic.tick() }
+            value = quantized
+        }
+    }
+
+    /// 惯性滑行：指数阻尼 + 边界收口，模仿 UIScrollView 的减速曲线。
+    private func glide(residual: CGFloat) {
+        guard abs(residual) > 3 else { return }
+        inertia?.cancel()
+        var remaining = residual
+        var last = Date()
+        inertia = Task { @MainActor in
+            while !Task.isCancelled {
+                let now = Date()
+                let dt = min(max(now.timeIntervalSince(last), 0.004), 0.05)
+                last = now
+                let decay = CGFloat(pow(0.93, dt * 60))
+                let delta = remaining * (1 - decay)
+                remaining *= decay
+                let base = scrollValue ?? value
+                let raw = base - Double(delta / spacing) * step
+                let clamped = min(max(raw, range.lowerBound), range.upperBound)
+                scrollValue = clamped
+                commit(clamped)
+                if abs(remaining) < 2
+                    || clamped == range.lowerBound
+                    || clamped == range.upperBound { break }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+            inertia = nil
+        }
+    }
+}
+
+// MARK: - 画布手势层
+
+/// 用 UIKit 识别器接管预览画布：
+/// - 单指拖动 = 平移（任意倍率下都生效）；
+/// - 双指 = 捏合缩放 + 双指拖动平移，两个信号分开接，缩放锚在双指中心；
+/// - 双击 = 放大 / 回默认；单击 = 显示 / 隐藏 UI；长按 = 看原片。
+/// SwiftUI 的 DragGesture 只跟一根手指，双指时会被单指带偏，所以下沉到 UIKit。
+struct MCanvasGestureLayer: UIViewRepresentable {
+    var onTap: () -> Void
+    var onDoubleTap: (CGPoint) -> Void
+    var onMultiTouchBegin: (CGPoint) -> Void
+    var onMultiTouchChange: (CGFloat, CGSize) -> Void
+    var onMultiTouchEnd: () -> Void
+    var onPanBegin: () -> Void
+    var onPanChange: (CGSize) -> Void
+    var onPanEnd: () -> Void
+    var onLongPress: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        view.isMultipleTouchEnabled = true
+        let coordinator = context.coordinator
+
+        // 缩放与双指平移是两个独立手势：捏合的 location 只给锚点，
+        // 平移必须由双指 UIPanGestureRecognizer 的 translation 提供。
+        let pinch = UIPinchGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handlePinch(_:)))
+        let twoFingerPan = UIPanGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handleTwoFingerPan(_:)))
+        twoFingerPan.minimumNumberOfTouches = 2
+        twoFingerPan.maximumNumberOfTouches = 2
+        pinch.delegate = coordinator
+        twoFingerPan.delegate = coordinator
+
+        let pan = UIPanGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handlePan(_:)))
+        pan.maximumNumberOfTouches = 1
+
+        let doubleTap = UITapGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        let tap = UITapGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handleTap(_:)))
+        tap.require(toFail: doubleTap)
+
+        let longPress = UILongPressGestureRecognizer(
+            target: coordinator, action: #selector(Coordinator.handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.28
+        longPress.allowableMovement = 14
+        tap.require(toFail: longPress)
+        // 捏合 / 拖动过的这一组触摸不能再被识别成单击，
+        // 否则双指松开时可能误触「隐藏 UI」并顺带把画布重置回默认位置。
+        tap.require(toFail: pinch)
+        tap.require(toFail: twoFingerPan)
+        tap.require(toFail: pan)
+        doubleTap.require(toFail: pinch)
+        doubleTap.require(toFail: twoFingerPan)
+        doubleTap.require(toFail: pan)
+
+        for recognizer in [pinch, twoFingerPan, pan, doubleTap, tap, longPress] {
+            view.addGestureRecognizer(recognizer)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.parent = self
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var parent: MCanvasGestureLayer
+        /// 双指序列（捏合 + 双指平移）的合并状态：只回调一次 begin / end。
+        private var multiTouchActive = false
+        private var pinchActive = false
+        private var twoFingerPanActive = false
+        private var pinchScale: CGFloat = 1
+        private var twoFingerTranslation: CGSize = .zero
+
+        init(_ parent: MCanvasGestureLayer) { self.parent = parent }
+
+        @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            switch recognizer.state {
+            case .began:
+                pinchActive = true
+                pinchScale = 1
+                beginMultiTouchIfNeeded(at: recognizer.location(in: view))
+            case .changed:
+                pinchScale = recognizer.scale
+                emitMultiTouch()
+            case .ended, .cancelled, .failed:
+                // 保留最后的 scale：双指平移可能还活着，清掉会导致倍率回跳。
+                pinchActive = false
+                endMultiTouchIfNeeded()
+            default:
+                break
+            }
+        }
+
+        @objc func handleTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            switch recognizer.state {
+            case .began:
+                twoFingerPanActive = true
+                twoFingerTranslation = .zero
+                beginMultiTouchIfNeeded(at: recognizer.location(in: view))
+            case .changed:
+                let translation = recognizer.translation(in: view)
+                twoFingerTranslation = CGSize(width: translation.x, height: translation.y)
+                emitMultiTouch()
+            case .ended, .cancelled, .failed:
+                // 同理保留位移，等捏合也结束再统一收尾。
+                twoFingerPanActive = false
+                endMultiTouchIfNeeded()
+            default:
+                break
+            }
+        }
+
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard recognizer.numberOfTouches <= 1, let view = recognizer.view else { return }
+            switch recognizer.state {
+            case .began:
+                parent.onPanBegin()
+            case .changed:
+                let translation = recognizer.translation(in: view)
+                parent.onPanChange(CGSize(width: translation.x, height: translation.y))
+            case .ended, .cancelled, .failed:
+                parent.onPanEnd()
+            default:
+                break
+            }
+        }
+
+        @objc func handleTap(_ recognizer: UITapGestureRecognizer) {
+            parent.onTap()
+        }
+
+        @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            parent.onDoubleTap(recognizer.location(in: view))
+        }
+
+        @objc func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            switch recognizer.state {
+            case .began:
+                parent.onLongPress(true)
+            case .ended, .cancelled, .failed:
+                parent.onLongPress(false)
+            default:
+                break
+            }
+        }
+
+        /// 捏合和双指拖动同时识别，才能做到「边放大边拖」。
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool {
+            let pair = [gestureRecognizer, other]
+            let hasPinch = pair.contains { $0 is UIPinchGestureRecognizer }
+            let hasPan = pair.contains { $0 is UIPanGestureRecognizer }
+            return hasPinch && hasPan
+        }
+
+        private func beginMultiTouchIfNeeded(at point: CGPoint) {
+            guard !multiTouchActive else { return }
+            multiTouchActive = true
+            pinchScale = 1
+            twoFingerTranslation = .zero
+            parent.onMultiTouchBegin(point)
+        }
+
+        private func emitMultiTouch() {
+            guard multiTouchActive else { return }
+            parent.onMultiTouchChange(pinchScale, twoFingerTranslation)
+        }
+
+        private func endMultiTouchIfNeeded() {
+            guard multiTouchActive, !pinchActive, !twoFingerPanActive else { return }
+            multiTouchActive = false
+            parent.onMultiTouchEnd()
+        }
     }
 }

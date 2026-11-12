@@ -16,13 +16,16 @@ enum PreviewAdjustments {
         var gamma: Double = 1
         /// 层间抑制（1 = 中性）。LUT 烘焙时该轴固定为 1，这里补绝对强度。
         var saturation: Double = 1
+        /// 高光柔和 0…1：对应密度曲线 morph 的 developerExhaustion / 0.6。
+        /// LUT 烘焙时整块 morph 被归零，这里补「当前肩部舒展程度」的近似。
+        var highlightSoften: Double = 0
         /// 清晰度 -1…1：正加锐、负柔化。
         var clarity: Double = 0
 
         var isNeutral: Bool {
             abs(yShift) < 1e-6 && abs(mShift) < 1e-6
                 && abs(gamma - 1) < 1e-6 && abs(saturation - 1) < 1e-6
-                && abs(clarity) < 1e-6
+                && abs(highlightSoften) < 1e-6 && abs(clarity) < 1e-6
         }
     }
 
@@ -78,6 +81,9 @@ enum PreviewAdjustments {
         if abs(params.gamma - 1) > 1e-6 {
             output = applyContrast(output, gamma: params.gamma)
         }
+        if params.highlightSoften > 1e-6 {
+            output = applyHighlightSoften(output, amount: params.highlightSoften)
+        }
         if abs(params.clarity) > 1e-6 {
             output = applyClarity(output, amount: params.clarity)
         }
@@ -102,6 +108,44 @@ enum PreviewAdjustments {
                 for p in start..<(start + width * 3) {
                     let value = Double(source[p])
                     base[p] = Float(min(max(pivot + (value - pivot) * strength, 0), 1))
+                }
+            }
+            Interpolation.parallelRows(height: height, pixels: width * height, row)
+        }
+        return output
+    }
+
+    /// 高光柔和：物理侧 developerExhaustion 拉伸密度曲线的 Gumbel 肩部，
+    /// 实测（exhaustion 0.6）表现为中高调被压暗、肩顶轻微回提，峰值约 −0.016。
+    /// 这里用一条以 0.68 为谷、左宽右窄的平滑凹陷复现同一走向；
+    /// 肩顶 <0.005 的回提在预测帧里不可见，省略。
+    private static func applyHighlightSoften(_ image: ImageRGB, amount: Double) -> ImageRGB {
+        let strength = min(max(amount, 0), 1)
+        let depth = 0.016 * strength
+        let center = 0.68
+        let leftWidth = 0.24
+        let rightWidth = 0.16
+        let resolution = 4096
+        var lut = [Double](repeating: 0, count: resolution + 1)
+        for i in 0...resolution {
+            let x = Double(i) / Double(resolution)
+            let u = x < center ? (x - center) / leftWidth : (x - center) / rightWidth
+            let window = max(0, 1 - u * u)
+            lut[i] = x - depth * window * window
+        }
+
+        let width = image.width
+        let height = image.height
+        let source = image.data
+        var output = image
+        output.data.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            func row(_ y0: Int) {
+                let start = y0 * width * 3
+                for p in start..<(start + width * 3) {
+                    let value = min(max(Double(source[p]), 0), 1)
+                    let index = Int(value * Double(resolution) + 0.5)
+                    base[p] = Float(lut[min(index, resolution)])
                 }
             }
             Interpolation.parallelRows(height: height, pixels: width * height, row)

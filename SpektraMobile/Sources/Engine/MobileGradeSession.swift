@@ -26,21 +26,48 @@ final class MobileGradeSession: ObservableObject {
     @Published private(set) var luts: [GradeLUTEntry] = []
     @Published private(set) var isExporting = false
     @Published private(set) var lastSavedURL: URL?
+    /// 配方引用的 LUT 解析失败时的提示；同一原因只提示一次，切换 LUT 后自动清空。
+    @Published private(set) var lutFailure: String?
     @Published private(set) var previewAspect: CGFloat = 4.0 / 3.0
     /// 片边：只影响预览与导出，不写入调色配方。
     @Published private(set) var border = MFilmBorderConfig()
+    /// 裁切与校正几何：只作用于照片本身，片边在裁切完成后才合成。
+    @Published private(set) var geometry = MPhotoGeometry()
+    /// 裁切页取景底图：完整交接图的调色结果，不含任何几何变换。
+    @Published private(set) var cropBaseImage: CGImage?
+    /// 裁切底图生成失败的原因；非 nil 时裁切页展示错误与重试入口，而不是无限转圈。
+    @Published private(set) var cropBaseFailure: String?
     /// 调色台预览比例（相对 1600 交接图）：1/8、1/4、1/2、1/1。
     @Published private(set) var previewScale: Double
 
+    /// 片边日期戳的默认字样：拍摄日期与时间（EXIF 缺失时为空，不画日期戳）。
+    private let captureDateLabel: String
+    private let captureTimeLabel: String
+
     private let gradeQueue = DispatchQueue(label: "spektra.mobile.grade", qos: .userInitiated)
     private var source: ImageRGB?
+    /// 未经裁切/校正的完整交接图；几何变化时从它重新生成 source。
+    private var pristineSource: ImageRGB?
     /// 最近一帧「无片边」的调色结果 / 原片显示图；改片边时只重合成这两张。
     private var basePreviewCG: CGImage?
     private var originalBaseCG: CGImage?
+    /// 未经几何变换的原片显示图。
+    private var pristineOriginalCG: CGImage?
     private var borderPersistWork: DispatchWorkItem?
+    private var geometryPersistWork: DispatchWorkItem?
+    /// 裁切取景底图的目标长边：取景只需要屏幕分辨率，压缩快照能显著降低拖动期采样成本。
+    private let cropBaseEdge = 1200
+    /// 生成快照时的配方与 LUT，用于下次进裁切页时判断能否直接复用。
+    private var cropBaseRecipe: MGradeRecipe?
+    private var cropBaseLUTPath: String?
+    /// 裁切几何重采样专用队列：整幅 apply 不堵调色预览所在的 gradeQueue。
+    private let geometryQueue = DispatchQueue(label: "spektra.mobile.grade.geometry", qos: .userInitiated)
+    /// 在算的几何帧取消标记：新几何请求一到就取消旧帧计算。
+    private var geometryFlag: MCancelFlag?
     /// 片边重合成单独一条队列：滑条拖动时只保留最新一帧，主线程只做赋值。
     private let borderQueue = DispatchQueue(label: "spektra.mobile.grade.border", qos: .userInitiated)
-    private var borderToken = 0
+    /// 新的片边请求一来就取消上一帧合成，避免拖动滑条时任务排队造成延迟。
+    private var borderFlag: MCancelFlag?
     private var displayRecipe = MGradeRecipe()
     private var lutPath = ""
     private var token = 0
@@ -66,6 +93,9 @@ final class MobileGradeSession: ObservableObject {
         self.filename = photo.filename
         self.store = store
         self.develop = develop
+        let stamp = MFilmBorderRenderer.captureStamp(url: store.originalURL(for: photo))
+        self.captureDateLabel = stamp.date
+        self.captureTimeLabel = stamp.time
         let saved = UserDefaults.standard.double(forKey: Self.previewScaleKey)
         self.previewScale = saved >= 0.125 && saved <= 1.0 ? saved : 1.0
         self.presets = GradePresetStore.shared.all
@@ -73,6 +103,10 @@ final class MobileGradeSession: ObservableObject {
         if let data = photo.borderData,
            let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
             self.border = decoded.normalized()
+        }
+        if let data = photo.cropData,
+           let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
+            self.geometry = decoded.normalized()
         }
     }
 
@@ -86,6 +120,7 @@ final class MobileGradeSession: ObservableObject {
         errorMessage = nil
         let filmID = develop.filmID
         let borderConfig = border
+        let geometry = geometry
         develop.prepareHandoff(maxEdge: sourceEdge) { [weak self] image in
             guard let self else { return }
             guard let image else {
@@ -101,25 +136,36 @@ final class MobileGradeSession: ObservableObject {
             // 交接图是线性 ProPhoto；对比原图必须先转成线性 sRGB 再显示编码，
             // 否则会把 ProPhoto 当成 sRGB 直接编码，出现明显偏色。
             let display = PreviewLUTService.displayImage(fromLinear: linear)
-            let baseOriginal = PreviewRenderer.cgImage(from: display)
-            let framedOriginal = baseOriginal.map {
+            let pristineOriginal = PreviewRenderer.cgImage(from: display)
+            let warped = geometry.apply(to: linear)
+            let warpedOriginal = pristineOriginal.flatMap { geometry.apply(to: $0) }
+            let framedOriginal = warpedOriginal.map {
                 MFilmBorderRenderer.preview(
-                    photo: $0, config: borderConfig, filmID: filmID, photoID: self.photoID
+                    photo: $0, config: borderConfig, filmID: filmID, photoID: self.photoID,
+                    dateLabel: self.captureDateLabel,
+                    timeLabel: self.captureTimeLabel
                 ) ?? $0
             }
             Task { @MainActor in
-                self.source = linear
+                self.pristineSource = linear
+                self.source = warped
+                // 交接图重做后旧的裁切快照失效。
+                self.cropBaseImage = nil
+                self.cropBaseRecipe = nil
+                self.cropBaseLUTPath = nil
+                self.cropBaseFailure = nil
                 self.sourceReady = true
                 self.sourceFailure = nil
                 self.errorMessage = nil
                 self.isRendering = false
                 self.phaseLabel = ""
-                self.originalBaseCG = baseOriginal
+                self.pristineOriginalCG = pristineOriginal
+                self.originalBaseCG = warpedOriginal ?? pristineOriginal
                 if let framedOriginal {
                     self.originalImage = MImage.make(cgImage: framedOriginal)
                     self.previewAspect = CGFloat(framedOriginal.width) / CGFloat(max(1, framedOriginal.height))
                 } else {
-                    self.previewAspect = CGFloat(image.width) / CGFloat(max(1, image.height))
+                    self.previewAspect = CGFloat(warped.width) / CGFloat(max(1, warped.height))
                 }
                 self.schedule(immediate: true)
             }
@@ -132,12 +178,146 @@ final class MobileGradeSession: ObservableObject {
         start()
     }
 
+    // MARK: - 裁切与校正
+
+    /// 裁切页取景底图：完整交接图按当前配方调色，但不带任何几何变换。
+    /// 所有失败路径都会回写 `cropBaseFailure`，保证裁切页有错误文案与重试入口。
+    /// 生成时先压到 `cropBaseEdge`：取景只需要屏幕分辨率，压缩快照换来拖动期的分钟级成本下降。
+    func prepareCropBase() {
+        cropBaseFailure = nil
+        guard let pristine = pristineSource else {
+            cropBaseFailure = "交接图还在准备中，稍后再试裁切。"
+            return
+        }
+        guard !isExporting else {
+            cropBaseFailure = "正在导出，完成后再试。"
+            return
+        }
+        // 同一配方下直接复用上一次的快照，第二次进裁切页不再等调色。
+        if cropBaseImage != nil, cropBaseRecipe == displayRecipe, cropBaseLUTPath == lutPath {
+            return
+        }
+        cropBaseImage = nil
+        let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
+        let uiRecipe = displayRecipe
+        let recipeKey = lutPath
+        let edge = cropBaseEdge
+        gradeQueue.async { [weak self] in
+            var image: CGImage?
+            var failure: String?
+            do {
+                let input = GradeEngine.downsampleLinear(pristine, maxLongEdge: edge)
+                let result = try GradeEngine.render(input, recipe: recipe)
+                image = PreviewRenderer.cgImage(from: result.image)
+                if image == nil { failure = "裁切底图生成失败，请重试。" }
+            } catch {
+                failure = (error as? LUTParseError)?.errorDescription
+                    ?? "裁切底图生成失败，请重试。"
+            }
+            Task { @MainActor [weak self] in
+                guard let self, !self.isExporting else { return }
+                self.cropBaseImage = image
+                self.cropBaseFailure = failure
+                if failure == nil {
+                    self.cropBaseRecipe = uiRecipe
+                    self.cropBaseLUTPath = recipeKey
+                }
+            }
+        }
+    }
+
+    /// 关闭裁切页：只清错误态，保留已生成的压缩快照供下次直接复用。
+    func clearCropBase() {
+        cropBaseFailure = nil
+    }
+
+    /// 确认裁切：几何只作用在交接图本身，片边随后才合成，不会裁到片边。
+    /// 整幅重采样放在专用队列（不堵 gradeQueue 的调色预览），
+    /// 且带行级取消标记：新几何请求一到就取消旧帧计算，只保留最新一帧。
+    func setGeometry(_ value: MPhotoGeometry) {
+        let target = value.normalized()
+        guard target != geometry else { return }
+        geometry = target
+        persistGeometrySoon()
+        guard sourceReady, !isExporting, let pristine = pristineSource else { return }
+
+        geometryFlag?.cancel()
+        let flag = MCancelFlag()
+        geometryFlag = flag
+
+        token += 1
+        pendingProxy?.cancel()
+        pendingSettle?.cancel()
+        proxyInFlight = false
+        isRendering = true
+        phaseLabel = "应用裁切"
+        phaseProgress = 0
+
+        let original = pristineOriginalCG
+        let borderConfig = border
+        let filmID = develop.filmID
+        let photoID = self.photoID
+        let dateLabel = captureDateLabel
+        let timeLabel = captureTimeLabel
+
+        geometryQueue.async { [weak self] in
+            let warped = target.apply(to: pristine) { flag.isCancelled }
+            guard !flag.isCancelled else { return }
+            let warpedOriginal = original.flatMap {
+                flag.isCancelled ? nil : target.apply(to: $0) { flag.isCancelled }
+            }
+            guard !flag.isCancelled else { return }
+            let framed = warpedOriginal.map {
+                MFilmBorderRenderer.preview(
+                    photo: $0, config: borderConfig, filmID: filmID, photoID: photoID,
+                    dateLabel: dateLabel, timeLabel: timeLabel
+                ) ?? $0
+            }
+            Task { @MainActor [weak self] in
+                guard let self, self.geometry == target, !flag.isCancelled else { return }
+                self.source = warped
+                self.originalBaseCG = warpedOriginal ?? original
+                if let framed {
+                    self.originalImage = MImage.make(cgImage: framed)
+                    self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
+                } else {
+                    self.previewAspect = CGFloat(warped.width) / CGFloat(max(1, warped.height))
+                }
+                self.isRendering = false
+                self.phaseLabel = ""
+                self.schedule(immediate: true)
+            }
+        }
+    }
+
+    func resetGeometry() {
+        setGeometry(MPhotoGeometry())
+    }
+
+    private func persistGeometrySoon() {
+        geometryPersistWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.persistGeometryNow() }
+        geometryPersistWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func persistGeometryNow() {
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        photo.cropData = try? JSONEncoder().encode(geometry)
+        try? store.update(photo)
+    }
+
     func cancel() {
         token += 1
         exportToken += 1
+        borderFlag?.cancel()
+        geometryFlag?.cancel()
         pendingProxy?.cancel()
         pendingSettle?.cancel()
     }
+
+    /// LUT 卡片沿用当前胶片的图标，保持调色台与显影台同一套视觉。
+    var filmID: String { develop.filmID }
 
     /// 导出面板显示用：原图真实长边。
     var exportOriginalEdge: Int {
@@ -163,24 +343,33 @@ final class MobileGradeSession: ObservableObject {
         let base = basePreviewCG
         let original = originalBaseCG
         guard base != nil || original != nil else { return }
-        borderToken += 1
-        let current = borderToken
+        borderFlag?.cancel()
+        let flag = MCancelFlag()
+        borderFlag = flag
         let config = border
         let filmID = develop.filmID
         let identifier = photoID
+        let dateLabel = captureDateLabel
+        let timeLabel = captureTimeLabel
         borderQueue.async { [weak self] in
+            // 排到队首时已有更新的请求就直接放弃，旧帧不再合成。
+            guard !flag.isCancelled else { return }
             let framed = base.map {
                 MFilmBorderRenderer.preview(
-                    photo: $0, config: config, filmID: filmID, photoID: identifier
+                    photo: $0, config: config, filmID: filmID, photoID: identifier,
+                    dateLabel: dateLabel, timeLabel: timeLabel
                 ) ?? $0
             }
+            guard !flag.isCancelled else { return }
             let framedOriginal = original.map {
                 MFilmBorderRenderer.preview(
-                    photo: $0, config: config, filmID: filmID, photoID: identifier
+                    photo: $0, config: config, filmID: filmID, photoID: identifier,
+                    dateLabel: dateLabel, timeLabel: timeLabel
                 ) ?? $0
             }
+            guard !flag.isCancelled else { return }
             Task { @MainActor [weak self] in
-                guard let self, self.borderToken == current else { return }
+                guard let self, self.borderFlag === flag else { return }
                 if let framed {
                     self.previewImage = MImage.make(cgImage: framed)
                     self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
@@ -259,6 +448,11 @@ final class MobileGradeSession: ObservableObject {
         schedule()
     }
 
+    /// 按 LUT 名称回写会话内的 LUT 路径（撤销 / 重置配方时与 UI 的 lutName 保持同步）。
+    func syncLUTPath(name: String) {
+        lutPath = name == "无 LUT" ? "" : (luts.first { $0.name == name }?.path ?? "")
+    }
+
     func applyPreset(_ preset: GradePreset) {
         let name = preset.recipe.lut.path.isEmpty
             ? "无 LUT"
@@ -270,10 +464,10 @@ final class MobileGradeSession: ObservableObject {
     }
 
     @discardableResult
-    func importLUT(url: URL) -> GradeLUTEntry? {
+    func importLUT(url: URL) throws -> GradeLUTEntry {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        guard let entry = try? GradePresetStore.shared.importLUT(from: url) else { return nil }
+        let entry = try GradePresetStore.shared.importLUT(from: url)
         luts = GradePresetStore.shared.luts()
         setLUT(entry: entry)
         return entry
@@ -324,6 +518,8 @@ final class MobileGradeSession: ObservableObject {
         let borderConfig = border
         let filmID = develop.filmID
         let photoID = self.photoID
+        let dateLabel = captureDateLabel
+        let timeLabel = captureTimeLabel
         proxyInFlight = edge <= proxyEdge
         isRendering = true
         phaseLabel = edge <= proxyEdge ? "调色代理" : "调色精修"
@@ -334,15 +530,18 @@ final class MobileGradeSession: ObservableObject {
                 let result = try GradeEngine.render(
                     input, recipe: recipe,
                     shouldCancel: { flag.isCancelled })
+                let lutMessage = result.lutError?.errorDescription
                 let cgImage = PreviewRenderer.cgImage(from: result.image)
                 let framed = cgImage.map {
                     MFilmBorderRenderer.preview(
-                        photo: $0, config: borderConfig, filmID: filmID, photoID: photoID
+                        photo: $0, config: borderConfig, filmID: filmID, photoID: photoID,
+                        dateLabel: dateLabel, timeLabel: timeLabel
                     ) ?? $0
                 }
                 Task { @MainActor [weak self] in
                     guard let self, self.activeFlag === flag, let framed else { return }
                     self.basePreviewCG = cgImage
+                    self.lutFailure = lutMessage
                     if self.border == borderConfig {
                         self.previewImage = MImage.make(cgImage: framed)
                         self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
@@ -368,8 +567,9 @@ final class MobileGradeSession: ObservableObject {
 
     // MARK: - 导出
 
-    /// `jpegQuality` 仅在 JPEG 档生效，取值 0…1。
+    /// `jpegQuality` 仅在 JPEG 档生效，取值 0…1；`includeWatermark` 是导出面板的单次水印开关。
     func export(format: Int, longEdgeIndex: Int, jpegQuality: Double = 0.95,
+                includeWatermark: Bool = true,
                 completion: @escaping (Result<URL, Error>) -> Void) {
         guard !isExporting, sourceReady else {
             completion(.failure(MobileExportError.busy))
@@ -379,12 +579,17 @@ final class MobileGradeSession: ObservableObject {
                                store.photos.first(where: { $0.id == photoID })?.height ?? 0)
         let borderConfig = border
         let filmID = develop.filmID
+        let dateLabel = captureDateLabel
+        let timeLabel = captureTimeLabel
+        let watermarkEnabled = includeWatermark
+        let watermark = MWatermarkStore.load()
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
         // 片边会把成品放大一圈：开启片边时「原始」也按内存余量钳位，避免大图导出被 jetsam。
         let edge = (longEdgeIndex == 0 && !borderConfig.enabled)
             ? rawEdge
             : ExportEdge.clampToMemoryBudget(rawEdge)
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
+        let geometry = geometry
         let targetSpace: String
         let targetCCTF: Bool
         let ext: String
@@ -420,15 +625,29 @@ final class MobileGradeSession: ObservableObject {
             self.gradeQueue.async {
                 do {
                     let linear = GradeEngine.prepareSource(image)
-                    let result = try GradeEngine.render(linear, recipe: recipe)
+                    let warped = geometry.apply(to: linear)
+                    let result = try GradeEngine.render(warped, recipe: recipe)
+                    if let lutError = result.lutError { throw lutError }
                     var output = Self.convertForExport(
                         result.image, colorSpace: targetSpace, cctfEncoding: targetCCTF)
+                    // 水印属于照片本身：先压进画面，再合成片边，避免盖到片基与边字上。
+                    if watermarkEnabled {
+                        Task { @MainActor in self.exportLabel = "合成水印" }
+                        var config = watermark
+                        // 导出面板的勾选是这次导出的最终决定，覆盖设置里的启用位。
+                        config.enabled = true
+                        output = MWatermarkRenderer.composite(
+                            image: output, config: config,
+                            colorSpace: targetSpace, cctfEncoding: targetCCTF
+                        )
+                    }
                     if borderConfig.enabled {
                         Task { @MainActor in self.exportLabel = "合成片边" }
                         output = MFilmBorderRenderer.composite(
                             image: output, config: borderConfig,
                             filmID: filmID, photoID: exportPhotoID,
-                            colorSpace: targetSpace, cctfEncoding: targetCCTF
+                            colorSpace: targetSpace, cctfEncoding: targetCCTF,
+                            dateLabel: dateLabel, timeLabel: timeLabel
                         )
                     }
                     try FileManager.default.createDirectory(

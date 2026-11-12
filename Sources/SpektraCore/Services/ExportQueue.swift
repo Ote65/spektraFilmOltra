@@ -45,7 +45,8 @@ final class ExportQueue {
                 }
                 let original = URL(fileURLWithPath: photo.originalPath)
                 var params = try photo.makeParams()
-                let loaded = try ImageLoader.load(url: original)
+                // 只有移动端可能存在的编码图记录才放行；RAW 记录保持原有严格解码路径。
+                let loaded = try ImageLoader.load(url: original, allowEncoded: !photo.isRaw)
                 params.io.inputColorSpace = loaded.colorSpace
                 params.io.inputCCTFDecoding = loaded.cctfDecoding
                 let colorSpace = request.colorSpace ?? params.io.outputColorSpace

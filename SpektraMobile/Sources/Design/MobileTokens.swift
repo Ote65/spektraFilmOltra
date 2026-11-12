@@ -11,6 +11,7 @@ import UIKit
 // 其余全部交给亮度台阶与发丝线。
 
 enum MColor {
+    static let clear = Color.clear
     static let app = Color(hex: 0x0E0D0B)
     static let canvas = Color(hex: 0x080706)
     static let surface1 = Color(hex: 0x17150F)
@@ -120,6 +121,52 @@ extension EnvironmentValues {
     }
 }
 
+// MARK: - 自适应布局
+//
+// iPad 横屏走左右分栏（左画布 / 右参数），竖屏与分屏（宽度小于高度）保持 iPhone 的单列布局。
+// 判断只看当前真实窗口尺寸，不解析机型：分屏、台前调度、旋转都能自然切换。
+
+enum MLayout {
+    static var isPad: Bool {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .pad
+        #else
+        return false
+        #endif
+    }
+
+    /// 横屏且画布放得下三栏时才分栏；接近手机竖屏比例的竖条窗口、
+    /// 以及台前调度那种挤不下左右轨的小横窗，一律退回 iPhone 的单列布局。
+    /// 判断只看当前真实窗口尺寸，不解析机型：分屏、台前调度、旋转都能自然切换。
+    /// `--force-split` 为截图验收用：在竖屏窗口上也强制走分栏版式。
+    static func usesSplit(_ size: CGSize) -> Bool {
+        if DebugLaunch.forceSplit { return true }
+        let size = DebugLaunch.windowOverride ?? size
+        guard isPad, size.width > size.height * 1.02 else { return false }
+        // 左轨 + 右栏之外要给画布留出最小宽度，放不下就别硬分。
+        let canvas = size.width - inspectorWidth(for: size) - sideRailWidth(for: size)
+        return size.width >= 800 && size.height >= 640 && canvas >= 470
+    }
+
+    /// 分栏右栏宽度：随屏宽增长，但给画布留足空间。
+    static func inspectorWidth(for size: CGSize) -> CGFloat {
+        min(430, max(330, size.width * 0.34))
+    }
+
+    /// 分栏左轨宽度（胶片相纸 / LUT 预设）：参考 macOS 的侧栏比例，触控目标不放太小。
+    static func sideRailWidth(for size: CGSize) -> CGFloat {
+        min(320, max(250, size.width * 0.21))
+    }
+
+    /// 主页网格列数：按可用宽度决定，iPad 横屏不再固定两列。
+    static func gridColumns(for width: CGFloat) -> Int {
+        if width >= 1180 { return 5 }
+        if width >= 980 { return 4 }
+        if width >= 720 { return 3 }
+        return 2
+    }
+}
+
 /// 真实屏幕度量：整屏尺寸 + 安全区。
 ///
 /// 不能从 `GeometryReader.safeAreaInsets` 取——根视图一旦 `ignoresSafeArea()`
@@ -209,6 +256,8 @@ enum MMotion {
     static let state = Animation.easeOut(duration: 0.2)
     static let quick = Animation.easeOut(duration: 0.14)
     static let press = Animation.easeOut(duration: 0.16)
+    /// 预览画布的缩放 / 归位：系统相册同款弹簧，收尾带一点回弹。
+    static let canvas = Animation.spring(response: 0.4, dampingFraction: 0.86)
 }
 
 // MARK: - 预览调试参数
@@ -218,6 +267,17 @@ enum DebugLaunch {
 
     static var showSheet: Bool { args.contains("--sheet") }
     static var exportOpen: Bool { args.contains("--export") }
+    /// 截图验收用：iPadOS 27 模拟器窗口模式禁止程序化转向，用这个参数在竖屏上直接验收分栏版式。
+    static var forceSplit: Bool { args.contains("--force-split") }
+    /// 截图验收用：假装窗口是给定的逻辑尺寸（`--window 1024x768`），验证台前调度小窗下的单列回退。
+    static var windowOverride: CGSize? {
+        guard let index = args.firstIndex(of: "--window"), args.indices.contains(index + 1) else {
+            return nil
+        }
+        let parts = args[index + 1].split(separator: "x").compactMap { Double($0) }
+        guard parts.count == 2 else { return nil }
+        return CGSize(width: parts[0], height: parts[1])
+    }
     /// 截图验收用：等原片读完（`canExport` 为真）后自动开跑导出，好截到「导出中」的进度行。
     static var exportAutoStart: Bool { args.contains("--export-run") }
     /// 截图验收用：调色「调整」面板默认从底部开始，好截到「质感」分区。
@@ -261,9 +321,10 @@ enum DebugLaunch {
     static var developPage: Int {
         guard let index = args.firstIndex(of: "--page"), args.indices.contains(index + 1) else { return 0 }
         switch args[index + 1] {
-        case "tone": return 1
-        case "color": return 2
-        case "detail": return 3
+        case "film": return 1
+        case "tone": return 2
+        case "color": return 3
+        case "detail": return 4
         default: return 0
         }
     }

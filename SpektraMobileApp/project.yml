@@ -25,26 +25,48 @@ targets:
         name: Data
       - path: ../SpektraMobile/Resources/Icons
         type: folder
+      - path: ../SpektraMobile/Resources/Fonts
+        type: folder
       - path: Assets.xcassets
     info:
       path: Info.plist
       properties:
         CFBundleDisplayName: Spektrafilm
-        CFBundleShortVersionString: 0.4.0
-        CFBundleVersion: 2
+        CFBundleShortVersionString: 0.4.1
+        CFBundleVersion: 4
         LSRequiresIPhoneOS: true
         UILaunchScreen:
           UIColorName: LaunchBackground
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        UIAppFonts:
+          - Fonts/DSEG7Classic-Bold.ttf
+          - Fonts/SpecialElite-Regular.ttf
+          - Fonts/CourierPrime-Bold.ttf
+          - Fonts/Caveat-Bold.ttf
+          - Fonts/Kalam-Bold.ttf
+          - Fonts/Doto.ttf
+          - Fonts/Silkscreen-Regular.ttf
+          - Fonts/VT323-Regular.ttf
+          - Fonts/ZenDots-Regular.ttf
+          - Fonts/ShareTechMono-Regular.ttf
+          - Fonts/PressStart2P-Regular.ttf
+          - Fonts/LaBelleAurore.ttf
+          - Fonts/Yellowtail-Regular.ttf
+          - Fonts/Rye-Regular.ttf
         NSPhotoLibraryAddUsageDescription: "导出成片会保存到系统相册，方便直接在照片 App 里查看与分享。"
         NSCameraUsageDescription: "取景拍照需要访问相机：只拍摄 RAW（DNG），拍完直接入库显影。"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.spektrafilm.mobile
-        TARGETED_DEVICE_FAMILY: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
 schemes:

@@ -74,3 +74,37 @@ final class MThumbnailCache {
         lock.unlock()
     }
 }
+
+extension CGImage {
+    /// 顺时针旋转 90°：纯几何重排，不插值。
+    var quarterTurnedClockwise: CGImage? {
+        let targetWidth = height
+        let targetHeight = width
+        guard let space = colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                data: nil, width: targetWidth, height: targetHeight,
+                bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        context.translateBy(x: CGFloat(targetWidth) / 2, y: CGFloat(targetHeight) / 2)
+        context.rotate(by: .pi / 2)
+        context.translateBy(x: -CGFloat(width) / 2, y: -CGFloat(height) / 2)
+        context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+}
+
+extension MPlatformImage {
+    /// 屏幕显示图的 90° 顺时针旋转。
+    var quarterTurnedClockwise: MPlatformImage? {
+        #if os(iOS)
+        guard let rotated = cgImage?.quarterTurnedClockwise else { return nil }
+        return UIImage(cgImage: rotated, scale: scale, orientation: .up)
+        #else
+        guard let cg = cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let rotated = cg.quarterTurnedClockwise else { return nil }
+        return NSImage(cgImage: rotated,
+                       size: NSSize(width: rotated.width, height: rotated.height))
+        #endif
+    }
+}

@@ -107,6 +107,11 @@ enum Illuminants {
     }
 
     static func standard(_ name: String) throws -> [Double] {
+        // 与 Python 参考实现的别名保持一致：
+        // 电影印片（2383/2393）的观察光源写的是 K75P，实际数据键为 Kinoton 75P；
+        // 钨丝灯胶片参考光源写 T，实际数据键为 Incandescent。
+        if name == "K75P" { return try standard("Kinoton 75P") }
+        if name == "T" { return try standard("Incandescent") }
         var values: [Double]
         if name.hasPrefix("BB") {
             let temperature = Double(name.dropFirst(2)) ?? 3400

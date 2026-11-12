@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct GradeScreen: View {
@@ -7,17 +8,25 @@ struct GradeScreen: View {
     let onBack: () -> Void
     let onGoHome: () -> Void
     let onToast: (String) -> Void
+    /// 分栏底部胶片条的数据源：库内全部照片（iPad 横屏切换照片用）。
+    let library: [MPhoto]
+    /// 点击胶片条缩略图时切换调色对象。
+    let onSwitchPhoto: (String) -> Void
 
     @Environment(\.mHousing) private var housingSetting
     private var housing: MHousingKind { MDeviceHousing.resolved(housingSetting) }
 
     @State private var recipe = MGradeRecipe()
+    /// 撤销栈：每一轮连续调参只记录一次改动前的状态（配方 + 裁切几何）。
+    @State private var undoStack: [MGradeUndoSnapshot] = []
+    @State private var lastChangeTime = Date.distantPast
     @State private var tabIndex = DebugLaunch.gradeTab
     @State private var drawerHeight: CGFloat = MMetric.drawerMin
     @State private var panelContentHeight: CGFloat = 0
     @State private var panelViewportHeight: CGFloat = 0
     @State private var drawerChrome: CGFloat = 0
     @State private var exportOpen = DebugLaunch.exportOpen
+    @State private var cropOpen = false
     @State private var showLUTImporter = false
     @State private var hslBand = 0
     @State private var gradingZone = 1
@@ -31,18 +40,23 @@ struct GradeScreen: View {
     @State private var imageRevealed = false
 
     @State private var showOriginal = false
-    @State private var pressToken = 0
     @State private var zoom: CGFloat = DebugLaunch.canvasZoom
+    /// 点击照片进入纯预览：顶栏、抽屉、底栏全部隐去，照片移到整屏中心。
+    @State private var chromeHidden = false
+    /// 自由画布：平移不再受倍率限制。
     @State private var pan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
-    @State private var lastPan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
+    /// 进入纯预览前的画布状态；回来时恢复（纯预览里动过画布就不恢复）。
+    @State private var savedZoom: CGFloat = 1
+    @State private var savedPan: CGSize = .zero
+    @State private var canvasTouchedWhileHidden = false
+    /// 捏合缩放：锚在双指中心，双指的整体位移同时转成平移。
+    @State private var pinchBaseZoom: CGFloat = 1
+    @State private var pinchBasePan: CGSize = .zero
+    @State private var pinchAnchorOffset: CGSize = .zero
+    @State private var dragBasePan: CGSize = .zero
 
-    @State private var curvePoints: [CGPoint] = [
-        CGPoint(x: 0.0, y: 0.0),
-        CGPoint(x: 0.26, y: 0.26),
-        CGPoint(x: 0.52, y: 0.52),
-        CGPoint(x: 0.78, y: 0.78),
-        CGPoint(x: 1.0, y: 1.0),
-    ]
+    /// 曲线默认没有任何控制点，恒等曲线；用户点击曲线才新增点。
+    @State private var curvePoints: [CGPoint] = []
     @State private var curveChannel = "RGB"
     @Namespace private var toolPill
 
@@ -50,12 +64,165 @@ struct GradeScreen: View {
 
     @Environment(\.mSafeInsets) private var insets
 
+    /// iPad 横屏：左画布 + 右参数栏。竖屏与分屏保持原来的单列布局。
+    private var isSplit: Bool { MLayout.usesSplit(insets.size) }
+
     var body: some View {
         ZStack(alignment: .bottom) {
             MColor.app
 
+            if isSplit {
+                splitLayout
+            } else {
+                stackedLayout
+            }
+        }
+        .background(MColor.app)
+        .overlay {
+            if exportOpen {
+                MExportSheet(
+                    filename: session.filename,
+                    phaseLabel: session.exportLabel,
+                    originalLongEdge: session.exportOriginalEdge,
+                    canExport: session.sourceReady,
+                    readFailed: session.sourceFailure != nil,
+                    onClose: { withAnimation(MMotion.pill) { exportOpen = false } },
+                    onReturnHome: {
+                        exportOpen = false
+                        onGoHome()
+                    },
+                    onNote: onToast,
+                    onExport: { format, edge, quality, watermark, done in
+                        session.export(format: format, longEdgeIndex: edge,
+                                       jpegQuality: quality,
+                                       includeWatermark: watermark) { result in
+                            if case .failure(let error) = result {
+                                onToast((error as? LUTParseError)?.errorDescription ?? "导出失败")
+                            }
+                            done(result)
+                        }
+                    }
+                )
+            }
+        }
+        .overlay(alignment: .top) {
+            // iPad 开孔为 .none：与显影台同一守卫，避免顶部画出假光效。
+            if housing != .none {
+                MHousingAura(
+                    housing: housing,
+                    isActive: session.isRendering || !session.sourceReady,
+                    label: "显影中"
+                )
+            }
+        }
+        .onChange(of: stageSize) { _, _ in popCardIfReady() }
+        .onChange(of: session.previewImage != nil) { _, hasImage in
+            if hasImage { popCardIfReady() }
+        }
+        .onChange(of: isSplit) { _, split in
+            // 进入分栏后预设 / 边框移到左轨：右栏参数页签停在其上时回落到光影。
+            if split && (tabIndex == 0 || tabIndex == 4) { tabIndex = 1 }
+        }
+        .onChange(of: recipe) { oldValue, newValue in
+            pushUndo(oldValue)
+            session.apply(newValue)
+        }
+        .onChange(of: session.lutFailure) { _, message in
+            // 只在失败原因发生变化时提示一次，避免每次调参渲染重复弹窗。
+            if let message { onToast(message) }
+        }
+        .onChange(of: curvePoints) { _, _ in
+            syncCurve()
+        }
+        .fileImporter(
+            isPresented: $showLUTImporter,
+            allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                do {
+                    let entry = try session.importLUT(url: url)
+                    recipe.lutName = entry.name
+                    recipe.lutStrength = 60
+                    onToast("已导入 \(entry.name)")
+                } catch {
+                    onToast(error.localizedDescription)
+                }
+            case .failure:
+                onToast("LUT 导入失败")
+            }
+        }
+        .sheet(isPresented: $cropOpen, onDismiss: { session.clearCropBase() }) {
+            ZStack {
+                MColor.app.ignoresSafeArea()
+                if let base = session.cropBaseImage {
+                    MCropEditor(
+                        base: base,
+                        initial: session.geometry,
+                        onCancel: { cropOpen = false },
+                        onDone: { geometry in
+                            cropOpen = false
+                            // 裁切确认前压一步栈，撤销可以连同裁切一起回退。
+                            pushUndo(recipe, force: true)
+                            session.setGeometry(geometry)
+                        }
+                    )
+                } else if let failure = session.cropBaseFailure {
+                    // 底图失败不再无限转圈：给出原因与重试入口。
+                    VStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 22, weight: .light))
+                            .foregroundStyle(MColor.brassHigh)
+                        Text("裁切底图生成失败")
+                            .font(.mSans(12, .semibold))
+                            .foregroundStyle(MColor.text1)
+                        Text(failure)
+                            .font(.mSans(10, .regular))
+                            .foregroundStyle(MColor.text3)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            MHaptic.light()
+                            session.prepareCropBase()
+                        } label: {
+                            Text("重试")
+                                .font(.mSans(11, .semibold))
+                                .foregroundStyle(MColor.brassInk)
+                                .padding(.horizontal, 20)
+                                .frame(height: 32)
+                                .background(Capsule().fill(MColor.brass))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 18)
+                    .frame(maxWidth: 270)
+                    .mGlassSurface(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous),
+                        fallbackFill: MColor.surface2.opacity(0.96)
+                    )
+                } else {
+                    ProgressView()
+                        .tint(MColor.brass)
+                }
+            }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(MColor.app)
+        }
+    }
+
+    // MARK: - 单列布局（iPhone / iPad 竖屏 / 分屏）
+
+    private var stackedLayout: some View {
+        Group {
             VStack(spacing: 0) {
                 navigationBar
+                    .opacity(chromeHidden ? 0 : 1)
+                    .allowsHitTesting(!chromeHidden)
+                    .animation(MMotion.quick, value: chromeHidden)
                 previewStage
                     .frame(height: max(60, availableHeight - MMetric.navHeight - drawerHeight))
                     .overlay {
@@ -77,78 +244,178 @@ struct GradeScreen: View {
 
             // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
             drawer
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
                 .padding(.horizontal, MMetric.floatingPanelInset)
                 .frame(height: drawerHeight)
                 .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
                     + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
 
-            toolbar
+            toolbar(bottomPadding: 8 + insets.bottom)
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
 
             MBackSwipe(action: onBack)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .padding(.top, insets.top)
         }
-        .background(MColor.app)
-        .overlay {
-            if exportOpen {
-                MExportSheet(
-                    filename: session.filename,
-                    phaseLabel: session.exportLabel,
-                    originalLongEdge: session.exportOriginalEdge,
-                    canExport: session.sourceReady,
-                    readFailed: session.sourceFailure != nil,
-                    onClose: { withAnimation(MMotion.pill) { exportOpen = false } },
-                    onReturnHome: {
-                        exportOpen = false
-                        onGoHome()
-                    },
-                    onNote: onToast,
-                    onExport: { format, edge, quality, done in
-                        session.export(format: format, longEdgeIndex: edge,
-                                       jpegQuality: quality) { result in
-                            if case .failure = result { onToast("导出失败") }
-                            done(result)
+    }
+
+    // MARK: - 分栏布局（iPad 横屏，参考 macOS 三栏：LUT 边框轨 / 画布 / 调色参数）
+
+    private var splitLayout: some View {
+        VStack(spacing: 0) {
+            navigationBar
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
+
+            HStack(spacing: 0) {
+                gradeSideRail
+                    .frame(width: MLayout.sideRailWidth(for: insets.size))
+
+                Rectangle()
+                    .fill(MColor.hairline)
+                    .frame(width: 1)
+
+                VStack(spacing: 0) {
+                    previewStage
+                        .overlay {
+                            if cardVisible {
+                                MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
+                                    .allowsHitTesting(false)
+                            }
                         }
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear
+                                    .onAppear { stageSize = geo.size }
+                                    .onChange(of: geo.size) { _, newValue in stageSize = newValue }
+                            }
+                        )
+                        .frame(maxHeight: .infinity)
+
+                    if library.count > 1 {
+                        gradeFilmstrip
                     }
-                )
-            }
-        }
-        .overlay(alignment: .top) {
-            MHousingAura(
-                housing: housing,
-                isActive: session.isRendering || !session.sourceReady,
-                label: "显影中"
-            )
-        }
-        .onChange(of: stageSize) { _, _ in popCardIfReady() }
-        .onChange(of: session.previewImage != nil) { _, hasImage in
-            if hasImage { popCardIfReady() }
-        }
-        .onChange(of: recipe) { _, newValue in
-            session.apply(newValue)
-        }
-        .onChange(of: curvePoints) { _, _ in
-            syncCurve()
-        }
-        .fileImporter(
-            isPresented: $showLUTImporter,
-            allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data],
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                if let entry = session.importLUT(url: url) {
-                    recipe.lutName = entry.name
-                    recipe.lutStrength = 60
-                    onToast("已导入 \(entry.name)")
-                } else {
-                    onToast("LUT 导入失败")
                 }
-            case .failure:
-                onToast("LUT 导入失败")
+                .frame(maxWidth: .infinity)
+                .overlay(alignment: .leading) {
+                    MBackSwipe(action: onBack)
+                        .frame(width: 22)
+                }
+
+                Rectangle()
+                    .fill(MColor.hairline)
+                    .frame(width: 1)
+
+                VStack(spacing: 0) {
+                    // 调色参数页签在参数栏顶部（光影 / 色调 / 质感）。
+                    MSplitTabRow(
+                        titles: ["光影", "色调", "质感"],
+                        selection: gradeParamTabIndex,
+                        onSelect: { index in
+                            selectTab(gradeParamTabIndices[index])
+                        }
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.top, 10)
+
+                    // 裁切 / 预览比例：参数栏的固定工具行。
+                    drawerToolRow
+                        .padding(.horizontal, 12)
+                        .padding(.top, 8)
+
+                    gradeParamPanel
+                        .frame(maxHeight: .infinity)
+                        .padding(.bottom, insets.bottom)
+                }
+                .frame(width: MLayout.inspectorWidth(for: insets.size))
             }
+            .frame(maxHeight: .infinity)
         }
+        .padding(.top, insets.top)
+    }
+
+    /// 分栏右栏的调色参数页 → tabIndex 的下标映射（预设 / 边框已移到左轨）。
+    private let gradeParamTabIndices = [1, 2, 3]
+    private var gradeParamTabIndex: Int { gradeParamTabIndices.firstIndex(of: tabIndex) ?? 0 }
+
+    @ViewBuilder private var gradeParamPanel: some View {
+        switch tabIndex {
+        case 2: colorPanel
+        case 3: texturePanel
+        default: lightPanel
+        }
+    }
+
+    /// 左轨：LUT 预设 / 边框切换（参考 macOS 的左侧预设栏）。
+    private var gradeSideRail: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 16) {
+                MSideRailTab(title: "预设", selected: tabIndex != 4) {
+                    withAnimation(MMotion.drawer) { tabIndex = 0 }
+                }
+                MSideRailTab(title: "边框", selected: tabIndex == 4) {
+                    withAnimation(MMotion.drawer) { tabIndex = 4 }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 42)
+
+            Group {
+                if tabIndex == 4 {
+                    borderPanel
+                } else {
+                    presetPanel
+                }
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .background(MColor.app)
+    }
+
+    /// 底部胶片条：横向缩略图切换照片（参考 macOS 的 Filmstrip）。
+    private var gradeFilmstrip: some View {
+        VStack(spacing: 0) {
+            MHairline()
+
+            ScrollView(.horizontal) {
+                // 懒加载：只为可见格子建视图、解缩略图，照片多时不会一次解全库。
+                LazyHStack(spacing: 8) {
+                    ForEach(library) { photo in
+                        Button {
+                            MHaptic.tick()
+                            onSwitchPhoto(photo.id)
+                        } label: {
+                            ZStack {
+                                Rectangle().fill(MColor.surface2)
+                                if let image = MPhotoImage.load(photo) {
+                                    image.resizable().scaledToFill()
+                                }
+                            }
+                            .frame(width: 64, height: 44)
+                            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .strokeBorder(
+                                        photo.id == session.photoID ? MColor.brass : MColor.hairline,
+                                        lineWidth: photo.id == session.photoID ? 1.6 : 1
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+            }
+            .scrollIndicators(.never)
+        }
+        .padding(.bottom, insets.bottom)
     }
 
     // MARK: - 预览就绪：白色画布弹出并显影成照片
@@ -209,6 +476,107 @@ struct GradeScreen: View {
         }
     }
 
+    // MARK: - 画布交互
+
+    private var stageCenter: CGPoint {
+        CGPoint(x: stageSize.width / 2, y: stageSize.height / 2)
+    }
+
+    /// 纯预览时照片要从「偏上的默认位置」挪到整屏中心；显示 UI 时回到默认位置。
+    /// 取景区顶边 = 顶部安全区 + 顶栏，两种布局（单列 / 分栏）都一样，
+    /// 所以直接用布局常量算，不依赖全局坐标抓取。
+    private var hiddenCenterOffsetY: CGFloat {
+        guard chromeHidden else { return 0 }
+        let stageCenterY = insets.top + MMetric.navHeight + stageSize.height / 2
+        return insets.size.height / 2 - stageCenterY
+    }
+
+    /// 纯预览里动过画布：回到带 UI 时不恢复进入前的缩放 / 位移。
+    private func markCanvasInteraction() {
+        guard chromeHidden else { return }
+        canvasTouchedWhileHidden = true
+    }
+
+    /// 单击切换纯预览：隐去 UI 时照片回到居中整幅，再点回来恢复原状态。
+    private func toggleChrome() {
+        if chromeHidden {
+            withAnimation(MMotion.canvas) {
+                chromeHidden = false
+                if !canvasTouchedWhileHidden {
+                    zoom = savedZoom
+                    pan = savedPan
+                }
+            }
+        } else {
+            savedZoom = zoom
+            savedPan = pan
+            canvasTouchedWhileHidden = false
+            withAnimation(MMotion.canvas) {
+                chromeHidden = true
+                zoom = 1
+                pan = .zero
+            }
+        }
+    }
+
+    /// 双击切换：默认倍率下以点击点为锚放大，已放大则回到默认状态。
+    private func doubleTapped(at point: CGPoint) {
+        MHaptic.light()
+        markCanvasInteraction()
+        if zoom > 1.001 {
+            withAnimation(MMotion.canvas) {
+                zoom = 1
+                pan = .zero
+            }
+            return
+        }
+        let target: CGFloat = 2.2
+        let anchor = CGPoint(x: point.x - stageCenter.x,
+                             y: point.y - stageCenter.y - hiddenCenterOffsetY)
+        let scale = target / max(zoom, 0.001)
+        withAnimation(MMotion.canvas) {
+            zoom = target
+            pan = CGSize(
+                width: pan.width * scale + anchor.x * (1 - scale),
+                height: pan.height * scale + anchor.y * (1 - scale))
+        }
+    }
+
+    /// 双指按下：记录基线，之后缩放与整体位移一起生效。
+    private func pinchBegan(at point: CGPoint) {
+        pinchBaseZoom = zoom
+        pinchBasePan = pan
+        pinchAnchorOffset = CGSize(
+            width: point.x - stageCenter.x,
+            height: point.y - stageCenter.y - hiddenCenterOffsetY)
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
+    /// 双指更新：缩放倍率和双指整体位移是两个独立信号，必须分别接。
+    /// 之前从捏合手势的 location 推平移，手指整体移动时 location 不动，
+    /// 结果就是只能缩放、不能平移。
+    private func pinchChanged(scale: CGFloat, translation: CGSize) {
+        let next = min(4, max(0.5, pinchBaseZoom * scale))
+        let ratio = pinchBaseZoom > 0 ? next / pinchBaseZoom : 1
+        zoom = next
+        pan = CGSize(
+            width: pinchBasePan.width + pinchAnchorOffset.width * (1 - ratio)
+                + translation.width,
+            height: pinchBasePan.height + pinchAnchorOffset.height * (1 - ratio)
+                + translation.height)
+    }
+
+    private func pinchEnded() {
+        // 松手不再改动画布：位置和倍率由用户决定，双击才回默认。
+    }
+
+    private func panBegan() {
+        dragBasePan = pan
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
     // MARK: - 顶栏
 
     private var navigationBar: some View {
@@ -233,8 +601,10 @@ struct GradeScreen: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            // 与显影台同一入口：预览分辨率档位始终可见，不随抽屉高度变化。
-            gradeScaleMenu
+            MCircleIconButton(icon: "arrow.counterclockwise", size: 13, frame: 32) {
+                resetAllGrade()
+            }
+            .accessibilityLabel("重置全部调整")
 
             MBrassPill(title: "导出", icon: "square.and.arrow.up", height: 32) {
                 withAnimation(MMotion.pill) { exportOpen = true }
@@ -273,9 +643,8 @@ struct GradeScreen: View {
                         .scaledToFit()
                         .padding(.horizontal, 14)
                         .scaleEffect(zoom)
-                        .offset(pan)
+                        .offset(x: pan.width, y: pan.height + hiddenCenterOffsetY)
                         .animation(MMotion.state, value: showOriginal)
-                        .animation(MMotion.drawer, value: zoom)
                 } else {
                     Image(systemName: "photo")
                         .font(.system(size: 30, weight: .light))
@@ -284,52 +653,35 @@ struct GradeScreen: View {
             }
             // 画布是整个页面：放大后的照片可以延伸到顶栏与抽屉下面，只由屏幕边界裁切。
             .opacity(imageRevealed ? 1 : 0)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                MHaptic.light()
-                withAnimation(MMotion.drawer) {
-                    if zoom > 1 {
-                        zoom = 1
-                        pan = .zero
-                        lastPan = .zero
-                    } else {
-                        zoom = 2.2
-                    }
+            .allowsHitTesting(false)
+
+            // 手势层：只有 UIKit 识别器能准确区分单指拖动与双指缩放。
+            // 双指同时缩放 + 平移（与系统相册一致），单指拖动，双击放大 / 缩小。
+            MCanvasGestureLayer(
+                onTap: {
+                    MHaptic.light()
+                    toggleChrome()
+                },
+                onDoubleTap: { point in doubleTapped(at: point) },
+                onMultiTouchBegin: { point in pinchBegan(at: point) },
+                onMultiTouchChange: { scale, translation in
+                    pinchChanged(scale: scale, translation: translation)
+                },
+                onMultiTouchEnd: { pinchEnded() },
+                onPanBegin: { panBegan() },
+                onPanChange: { translation in
+                    pan = CGSize(
+                        width: dragBasePan.width + translation.width,
+                        height: dragBasePan.height + translation.height)
+                },
+                onPanEnd: {},
+                onLongPress: { pressed in
+                    if pressed { MHaptic.light() }
+                    withAnimation(MMotion.quick) { showOriginal = pressed }
                 }
-            }
-            .gesture(
-                MagnificationGesture()
-                    .onChanged { value in zoom = min(4, max(1, value)) }
-                    .onEnded { value in
-                        zoom = min(4, max(1, value))
-                        if zoom <= 1 { pan = .zero; lastPan = .zero }
-                    }
             )
-            .simultaneousGesture(
-                DragGesture()
-                    .onChanged { gesture in
-                        guard zoom > 1 else { return }
-                        pan = CGSize(
-                            width: lastPan.width + gesture.translation.width,
-                            height: lastPan.height + gesture.translation.height
-                        )
-                    }
-                    .onEnded { _ in lastPan = pan }
-            )
-            .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 18, pressing: { pressing in
-                if pressing {
-                    pressToken += 1
-                    let token = pressToken
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        guard token == pressToken else { return }
-                        MHaptic.light()
-                        withAnimation(MMotion.quick) { showOriginal = true }
-                    }
-                } else {
-                    pressToken += 1
-                    withAnimation(MMotion.quick) { showOriginal = false }
-                }
-            }, perform: {})
+            .opacity(imageRevealed ? 1 : 0)
+            .allowsHitTesting(imageRevealed)
 
             if let failure = session.sourceFailure, !session.sourceReady {
                 sourceFailureCard(failure)
@@ -347,7 +699,8 @@ struct GradeScreen: View {
                 )
                 .frame(height: 78)
                 .allowsHitTesting(false)
-                .opacity(drawerHeight > 500 ? 0 : 1)
+                .opacity(chromeHidden || drawerHeight > 500 ? 0 : 1)
+                .animation(MMotion.quick, value: chromeHidden)
                 .animation(MMotion.quick, value: drawerHeight)
             }
             .allowsHitTesting(false)
@@ -358,17 +711,17 @@ struct GradeScreen: View {
 
                     Button {
                         MHaptic.tick()
-                        withAnimation(MMotion.drawer) {
-                            if zoom > 1 {
+                        markCanvasInteraction()
+                        withAnimation(MMotion.canvas) {
+                            if abs(zoom - 1) > 0.001 {
                                 zoom = 1
                                 pan = .zero
-                                lastPan = .zero
                             } else {
                                 zoom = 2.2
                             }
                         }
                     } label: {
-                        Text(zoom > 1 ? "\(Int(zoom * 100))%" : "1×")
+                        Text(abs(zoom - 1) > 0.001 ? "\(Int(zoom * 100))%" : "1×")
                             .font(.mSans(9, .medium).monospacedDigit())
                             .foregroundStyle(MColor.text3)
                             .padding(.horizontal, 8)
@@ -404,7 +757,7 @@ struct GradeScreen: View {
 
                     Spacer()
 
-                    if showOriginal || zoom > 1 {
+                    if showOriginal || abs(zoom - 1) > 0.001 {
                         Text(showOriginal ? "原片" : "\(Int(zoom * 100))%")
                             .font(.mSans(9, .medium).monospacedDigit())
                             .foregroundStyle(showOriginal ? MColor.text2 : MColor.text4)
@@ -415,7 +768,8 @@ struct GradeScreen: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
-                .opacity(drawerHeight > 500 ? 0 : 1)
+                .opacity(chromeHidden || drawerHeight > 500 ? 0 : 1)
+                .animation(MMotion.quick, value: chromeHidden)
                 .animation(MMotion.quick, value: drawerHeight)
             }
         }
@@ -523,7 +877,7 @@ struct GradeScreen: View {
         }
         .allowsHitTesting(false)
         .scaleEffect(zoom)
-        .offset(pan)
+        .offset(x: pan.width, y: pan.height + hiddenCenterOffsetY)
     }
 
     private func fittedPreviewRect(in size: CGSize) -> CGRect {
@@ -544,12 +898,94 @@ struct GradeScreen: View {
         )
     }
 
+    // MARK: - 抽屉工具行
+
+    private var drawerToolRow: some View {
+        HStack(spacing: 6) {
+            MCircleIconButton(icon: "crop", size: 12, frame: 28) {
+                MHaptic.tick()
+                session.prepareCropBase()
+                cropOpen = true
+            }
+            .accessibilityLabel("裁切与校正")
+
+            gradeScaleMenu
+
+            Spacer(minLength: 0)
+
+            MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
+                undoGrade()
+            }
+            .opacity(undoStack.isEmpty ? 0.36 : 1)
+            .allowsHitTesting(!undoStack.isEmpty)
+            .accessibilityLabel("撤销")
+        }
+    }
+
+    // MARK: - 撤销 / 重置
+
+    /// 一步撤销快照：调色配方 + 裁切几何，两者一起回退才不会出现「参数回去了、裁切没回去」。
+    private struct MGradeUndoSnapshot {
+        let recipe: MGradeRecipe
+        let geometry: MPhotoGeometry
+    }
+
+    /// 按轮次合并：一轮连续调参只有第一次（新起点）才把改动前的状态压栈。
+    /// `force` 用于裁切确认、整体重置这类一次成型的动作。
+    private func pushUndo(_ previous: MGradeRecipe, force: Bool = false) {
+        let now = Date()
+        defer { lastChangeTime = now }
+        if !force, now.timeIntervalSince(lastChangeTime) <= 0.5 { return }
+        undoStack.append(MGradeUndoSnapshot(recipe: previous, geometry: session.geometry))
+        if undoStack.count > 40 { undoStack.removeFirst() }
+    }
+
+    private func undoGrade() {
+        guard let previous = undoStack.popLast() else { return }
+        session.syncLUTPath(name: previous.recipe.lutName)
+        // 撤回自身会触发 recipe 的 onChange，先刷新时间戳，避免撤回也被压栈。
+        lastChangeTime = Date()
+        withAnimation(MMotion.state) {
+            recipe = previous.recipe
+            restoreCurveFromRecipe()
+        }
+        if previous.geometry != session.geometry {
+            session.setGeometry(previous.geometry)
+        }
+    }
+
+    /// 只重置调色参数（色调页底部按钮）。
+    private func resetGrade() {
+        MHaptic.medium()
+        session.syncLUTPath(name: "无 LUT")
+        withAnimation(MMotion.state) {
+            recipe = MGradeRecipe()
+            resetCurve()
+        }
+        onToast("调色参数已重置")
+    }
+
+    /// 顶栏重置：让照片回到刚从显影台出来的状态 —— 调色参数与裁切几何全部复原。
+    private func resetAllGrade() {
+        MHaptic.medium()
+        pushUndo(recipe, force: true)
+        session.syncLUTPath(name: "无 LUT")
+        withAnimation(MMotion.state) {
+            recipe = MGradeRecipe()
+            resetCurve()
+        }
+        session.resetGeometry()
+        onToast("已重置全部调整")
+    }
+
     // MARK: - 抽屉
 
     private var drawer: some View {
         VStack(spacing: 0) {
-            MDrawerChevron(isExpanded: isDrawerExpanded, isVisible: !isLockedTab) {
-                toggleDrawer()
+            if !isSplit {
+                MDrawerChevron(isExpanded: isDrawerExpanded, isVisible: !isLockedTab) {
+                    toggleDrawer()
+                }
             }
 
             ZStack {
@@ -593,6 +1029,14 @@ struct GradeScreen: View {
         // 阴影分两层：近处极淡、远处大半径，让边界是渐隐而不是一圈硬黑边。
         .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
         .shadow(color: .black.opacity(0.22), radius: 30, y: 12)
+        // 裁切 / 预览比例浮在 sheet 外面顶部，和原本撤销按钮同一行；分栏时移到参数栏顶部固定行。
+        .overlay(alignment: .top) {
+            if !isSplit {
+                drawerToolRow
+                    .padding(.horizontal, 10)
+                    .offset(y: -36)
+            }
+        }
         .onPreferenceChange(MPanelHeightKey.self) { height in
             panelContentHeight = height
             syncDrawerToContent()
@@ -605,6 +1049,8 @@ struct GradeScreen: View {
     /// 面板内容或可视高度变化后，把抽屉对齐到自适应高度。
     /// 布局回调里只赋值，不启动动画，避免 preference → 动画 → 布局的反馈环。
     private func syncDrawerToContent() {
+        // 分栏下面板高度由右栏自然分配，drawerHeight 不参与布局，别再写状态引发多余重绘。
+        guard !isSplit else { return }
         guard panelViewportHeight > 0, panelContentHeight > 0 else { return }
         let fit = fitHeight(for: panelContentHeight)
         let target: CGFloat = isLockedTab ? fit : min(drawerHeight, fit)
@@ -663,62 +1109,39 @@ struct GradeScreen: View {
                 MSectionHead(title: "LUT 胶片查找表", trailing: "\(session.luts.count) 个")
                     .padding(.top, 12)
 
-                ScrollView(.horizontal) {
-                    HStack(spacing: 8) {
-                        MLUTCard(lut: noLUTCard, selected: recipe.lutName == "无 LUT") {
-                            withAnimation(MMotion.state) {
-                                recipe.lutName = "无 LUT"
-                                recipe.lutStrength = 0
-                                session.setLUT(entry: nil)
-                            }
+                // 与显影台的胶片轨同一套样式：图标 + 名称，右侧不做黑色渐隐遮罩。
+                MHScrollRail(itemCount: session.luts.count + 2,
+                             itemWidth: 58, spacing: 5,
+                             leading: MMetric.pageMargin, trailing: 22,
+                             itemHeight: 52, fadeColor: .clear) {
+                    MLUTRailItem(film: currentRailFilm, title: "无 LUT",
+                                 selected: recipe.lutName == "无 LUT") {
+                        withAnimation(MMotion.state) {
+                            recipe.lutName = "无 LUT"
+                            recipe.lutStrength = 0
+                            session.setLUT(entry: nil)
                         }
-
-                        ForEach(session.luts) { entry in
-                            MLUTCard(lut: card(for: entry), selected: recipe.lutName == entry.name) {
-                                withAnimation(MMotion.state) {
-                                    recipe.lutName = entry.name
-                                    recipe.lutStrength = max(60, recipe.lutStrength)
-                                    session.setLUT(entry: entry)
-                                }
-                            }
-                        }
-
-                        Button {
-                            MHaptic.light()
-                            showLUTImporter = true
-                        } label: {
-                            VStack(spacing: 5) {
-                                Image(systemName: "plus")
-                                    .font(.system(size: 14, weight: .medium))
-                                Text("导入 LUT")
-                                    .font(.mSans(9, .medium))
-                            }
-                            .foregroundStyle(MColor.text3)
-                            .frame(width: 90, height: 70)
-                            .background(
-                                RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                                    .fill(MColor.surface2.opacity(0.4))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                                    .strokeBorder(MColor.hairlineStrong, style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                            )
-                        }
-                        .buttonStyle(.plain)
                     }
-                    .padding(.trailing, MMetric.pageMargin)
+
+                    ForEach(session.luts) { entry in
+                        MLUTRailItem(film: currentRailFilm, title: entry.name,
+                                     selected: recipe.lutName == entry.name) {
+                            withAnimation(MMotion.state) {
+                                recipe.lutName = entry.name
+                                recipe.lutStrength = max(60, recipe.lutStrength)
+                                session.setLUT(entry: entry)
+                            }
+                        }
+                    }
+
+                    MLUTImportRailItem {
+                        MHaptic.light()
+                        showLUTImporter = true
+                    }
                 }
-                .scrollIndicators(.never)
+                .frame(height: 52)
+                .padding(.horizontal, -MMetric.pageMargin)
                 .padding(.top, 9)
-                .overlay(alignment: .trailing) {
-                    LinearGradient(
-                        colors: [MColor.surface1.opacity(0), MColor.surface1],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .frame(width: 30)
-                    .allowsHitTesting(false)
-                }
 
                 MParamSlider(
                     label: "LUT 强度",
@@ -749,12 +1172,9 @@ struct GradeScreen: View {
         .scrollIndicators(.never)
     }
 
-    private var noLUTCard: MLUT {
-        MLUT(id: "none", name: "无 LUT", meta: "原始线性", tints: [0x2A251C, 0x17140F])
-    }
-
-    private func card(for entry: GradeLUTEntry) -> MLUT {
-        MLUT(id: entry.path, name: entry.name, meta: "CUBE 3D", tints: [0xE3C08A, 0x8E5F39, 0x241A12])
+    /// LUT 轨的图标沿用当前胶片，和显影台的胶片选择保持同一视觉语言。
+    private var currentRailFilm: MFilm {
+        MobileCatalog.film(id: session.filmID) ?? MobileCatalog.films[0]
     }
 
     private func presetMeta(_ recipe: GradeRecipe) -> String {
@@ -781,6 +1201,7 @@ struct GradeScreen: View {
                 ? "无 LUT"
                 : (session.luts.first { $0.path == preset.recipe.lut.path }?.name ?? "LUT")
             recipe = MGradeRecipe(grade: preset.recipe, lutName: name)
+            restoreCurveFromRecipe()
             session.applyPreset(preset)
             onToast("已套用 \(preset.name)")
         } label: {
@@ -891,24 +1312,26 @@ struct GradeScreen: View {
             MCurveEditor(points: $curvePoints, channel: curveChannel)
                 .frame(height: 208)
                 .padding(.top, 10)
-
-            HStack(spacing: 8) {
-                Spacer()
-                Text("中灰锁定")
-                    .mMeta(8, color: MColor.text4)
-            }
-            .padding(.top, 7)
         }
     }
 
     private func resetCurve() {
-        curvePoints = [
-            CGPoint(x: 0.0, y: 0.0),
-            CGPoint(x: 0.26, y: 0.26),
-            CGPoint(x: 0.52, y: 0.52),
-            CGPoint(x: 0.78, y: 0.78),
-            CGPoint(x: 1.0, y: 1.0),
+        curvePoints = []
+    }
+
+    /// 套用预设后按四个曲线锚点还原控制点；全为 0 时回到恒等曲线。
+    private func restoreCurveFromRecipe() {
+        let anchors: [(Double, Double)] = [
+            (0.12, recipe.curveShadows),
+            (0.35, recipe.curveDarks),
+            (0.62, recipe.curveLights),
+            (0.88, recipe.curveHighlights),
         ]
+        curvePoints = anchors.compactMap { anchor -> CGPoint? in
+            let (x, offset) = anchor
+            guard abs(offset) > 1e-9 else { return nil }
+            return CGPoint(x: x, y: min(1, max(0, x + offset / 100)))
+        }
     }
 
     // MARK: - 色调
@@ -960,12 +1383,7 @@ struct GradeScreen: View {
                 MParamSlider(label: "平衡", value: $recipe.grading.balance, base: 0, range: -100...100, step: 1, decimals: 0, suffix: "", compact: true)
 
                 resetButton("重置调色") {
-                    MHaptic.medium()
-                    withAnimation(MMotion.state) {
-                        recipe = MGradeRecipe()
-                        resetCurve()
-                    }
-                    onToast("调色参数已重置")
+                    resetGrade()
                 }
             }
             .padding(.horizontal, MMetric.pageMargin)
@@ -1051,25 +1469,8 @@ struct GradeScreen: View {
     private var borderPanel: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text("片边")
-                        .mLabel(8.5, color: MColor.text3)
-                    Spacer(minLength: 8)
-                    Text(MFilmBorderPreset.name(for: session.border))
-                        .mMeta(8, color: MColor.text4)
-                    Button {
-                        MHaptic.tick()
-                        withAnimation(MMotion.state) { session.resetBorder() }
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(MColor.text3)
-                            .frame(width: 22, height: 22)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.top, 6)
+                MToggleRow(label: "启用片边", isOn: borderEnabled, compact: true)
+                    .padding(.top, 6)
 
                 MHScrollRail(itemCount: MFilmBorderPreset.all.count, itemWidth: 86,
                              spacing: 8, leading: MMetric.pageMargin, trailing: 22,
@@ -1088,16 +1489,8 @@ struct GradeScreen: View {
                 .padding(.horizontal, -MMetric.pageMargin)
                 .padding(.top, 8)
 
-                MToggleRow(label: "启用片边", isOn: borderEnabled, compact: true)
-
                 if session.border.enabled {
-                    MChoiceRow(label: "片边预设", value: MFilmBorderPreset.name(for: session.border),
-                               options: borderPresetOptions) { id in
-                        guard let preset = MFilmBorderPreset.preset(id: id) else { return }
-                        withAnimation(MMotion.state) { session.setBorderPreset(preset) }
-                    }
-
-                    MChoiceRow(label: "底片规格", value: session.border.gaugeValue.label,
+                    MChoiceRow(label: "比例", value: session.border.gaugeValue.label,
                                options: gaugeOptions) { raw in
                         guard let gauge = MFilmBorderGauge(rawValue: raw) else { return }
                         session.updateBorder {
@@ -1109,9 +1502,16 @@ struct GradeScreen: View {
                         }
                     }
 
+                    borderColorRail
+
                     MParamSlider(label: "片边宽度", value: borderDouble(\.borderScale),
                                  base: 1, range: 0.4...2.0, step: 0.01, decimals: 2,
                                  suffix: "×", compact: true)
+
+                    MChoiceRow(label: "宽度口径", value: session.border.widthModeValue.label,
+                               options: borderWidthModeOptions) { raw in
+                        session.updateBorder { $0.widthMode = raw }
+                    }
 
                     MChoiceRow(label: "画幅角型", value: cornerValue.label,
                                options: cornerOptions) { raw in
@@ -1137,10 +1537,6 @@ struct GradeScreen: View {
                                  base: 0, range: -1...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
 
-                    MChoiceRow(label: "片基色调", value: baseValue.label,
-                               options: baseOptions) { raw in
-                        session.updateBorder { $0.baseTone = raw }
-                    }
                     MParamSlider(label: "片基明暗", value: borderDouble(\.baseBrightness),
                                  base: 0, range: -1...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
@@ -1158,21 +1554,42 @@ struct GradeScreen: View {
                                      suffix: "×", compact: true)
                         MToggleRow(label: "画幅编号", isOn: borderBool(\.frameNumbers),
                                    compact: true)
-                        MToggleRow(label: "DX 码", isOn: borderBool(\.dxCode), compact: true)
+                        MToggleRow(label: "片边编码", isOn: borderBool(\.dxCode), compact: true)
+                    }
+
+                    MToggleRow(label: "日期戳", isOn: borderBool(\.dateStamp), compact: true)
+                    if session.border.dateStamp {
+                        MChoiceRow(label: "日期位置", value: datePositionValue.label,
+                                   options: datePositionOptions) { raw in
+                            session.updateBorder { $0.datePosition = raw }
+                        }
+                        MChoiceRow(label: "日期内容", value: dateModeValue.label,
+                                   options: dateModeOptions) { raw in
+                            session.updateBorder { $0.dateMode = raw }
+                        }
+                        MChoiceRow(label: "日期字体", value: dateFontValue.label,
+                                   options: dateFontOptions) { raw in
+                            session.updateBorder { $0.dateFont = raw }
+                        }
+                        MChoiceRow(label: "日期颜色", value: dateStyleValue.label,
+                                   options: dateStyleOptions) { raw in
+                            session.updateBorder { $0.dateStyle = raw }
+                        }
                     }
 
                     if session.border.gaugeValue.isSheet {
                         MToggleRow(label: "片缺口", isOn: borderBool(\.notch), compact: true)
                     }
 
+                    MSectionHead(title: "做旧", trailing: "默认关闭", compact: true)
                     MParamSlider(label: "划痕", value: borderDouble(\.scratches),
-                                 base: 0.18, range: 0...1, step: 0.01, decimals: 2,
+                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
                     MParamSlider(label: "灰尘", value: borderDouble(\.dust),
-                                 base: 0.14, range: 0...1, step: 0.01, decimals: 2,
+                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
                     MParamSlider(label: "边缘雾化", value: borderDouble(\.fog),
-                                 base: 0.10, range: 0...1, step: 0.01, decimals: 2,
+                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
                 }
             }
@@ -1182,6 +1599,81 @@ struct GradeScreen: View {
         }
         .scrollIndicators(.never)
         .defaultScrollAnchor(DebugLaunch.gradePanelBottom ? .bottom : .top)
+    }
+
+    /// 边框颜色：横向滚动的圆形色板，选色不用再进折叠菜单。
+    private var borderColorRail: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("边框颜色")
+                    .font(.mSans(11))
+                    .foregroundStyle(MColor.text2)
+                Text(baseValue.label)
+                    .mMeta(8, color: MColor.text4)
+                Spacer(minLength: 8)
+                Button {
+                    MHaptic.tick()
+                    withAnimation(MMotion.state) { session.resetBorder() }
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(MColor.text3)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("重置片边")
+            }
+
+            ScrollView(.horizontal) {
+                HStack(spacing: 12) {
+                    ForEach(MFilmBorderBase.allCases) { tone in
+                        borderColorDot(tone)
+                    }
+                }
+                .padding(.horizontal, MMetric.pageMargin)
+                .padding(.vertical, 3)
+            }
+            .scrollIndicators(.never)
+            .padding(.horizontal, -MMetric.pageMargin)
+        }
+        .padding(.top, 12)
+    }
+
+    private func borderColorDot(_ tone: MFilmBorderBase) -> some View {
+        let rgb = MFilmBorderRenderer.baseSwatch(tone, brightness: session.border.baseBrightness)
+        let selected = baseValue == tone
+        return Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) {
+                session.updateBorder { $0.baseTone = tone.rawValue }
+            }
+        } label: {
+            Circle()
+                .fill(Color(red: Double(rgb.0), green: Double(rgb.1), blue: Double(rgb.2)))
+                .frame(width: 30, height: 30)
+                .overlay(
+                    Circle().strokeBorder(selected ? MColor.brass : MColor.hairline,
+                                          lineWidth: selected ? 1.8 : 1)
+                )
+                .overlay(alignment: .bottomTrailing) {
+                    if selected {
+                        Circle()
+                            .fill(MColor.brass)
+                            .frame(width: 10, height: 10)
+                            .overlay(
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 6, weight: .bold))
+                                    .foregroundStyle(MColor.brassInk)
+                            )
+                            .offset(x: 2, y: 2)
+                    }
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(MPressStyle(scale: 0.92))
+        .accessibilityLabel(tone.label)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 
     // MARK: 调色/片边绑定
@@ -1289,12 +1781,28 @@ struct GradeScreen: View {
         MFilmBorderTextTone(rawValue: session.border.textTone) ?? .auto
     }
 
-    private var borderPresetOptions: [MProOption] {
-        MFilmBorderPreset.all.map { MProOption(value: $0.id, label: $0.name) }
+    private var datePositionValue: MFilmBorderDatePosition {
+        session.border.datePositionValue
+    }
+
+    private var dateStyleValue: MFilmBorderDateStyle {
+        session.border.dateStyleValue
+    }
+
+    private var dateModeValue: MFilmBorderDateMode {
+        session.border.dateModeValue
+    }
+
+    private var dateFontValue: MFilmBorderDateFont {
+        session.border.dateFontValue
     }
 
     private var gaugeOptions: [MProOption] {
         MFilmBorderGauge.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var borderWidthModeOptions: [MProOption] {
+        MFilmBorderWidthMode.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
 
     private var cornerOptions: [MProOption] {
@@ -1305,12 +1813,24 @@ struct GradeScreen: View {
         MFilmBorderPerf.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
 
-    private var baseOptions: [MProOption] {
-        MFilmBorderBase.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
     private var textToneOptions: [MProOption] {
         MFilmBorderTextTone.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var datePositionOptions: [MProOption] {
+        MFilmBorderDatePosition.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateStyleOptions: [MProOption] {
+        MFilmBorderDateStyle.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateModeOptions: [MProOption] {
+        MFilmBorderDateMode.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateFontOptions: [MProOption] {
+        MFilmBorderDateFont.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
     }
 
     private func borderPresetIsSelected(_ preset: MFilmBorderPreset) -> Bool {
@@ -1359,7 +1879,7 @@ struct GradeScreen: View {
 
     // MARK: - 工具条
 
-    private var toolbar: some View {
+    private func toolbar(bottomPadding: CGFloat) -> some View {
         MGlassTabCapsule {
             ForEach(Array(toolItems.enumerated()), id: \.offset) { item in
                 Button {
@@ -1395,7 +1915,7 @@ struct GradeScreen: View {
                 .accessibilityAddTraits(tabIndex == item.offset ? [.isSelected] : [])
             }
         }
-        .padding(.bottom, 8 + insets.bottom)
+        .padding(.bottom, bottomPadding)
     }
 
     private var drawerShape: UnevenRoundedRectangle {
@@ -1428,24 +1948,109 @@ struct GradeScreen: View {
     }
 
     private func curveOffset(at x: Double) -> Double {
-        let sorted = curvePoints.sorted { $0.x < $1.x }
-        guard sorted.count > 1 else { return 0 }
-        let clamped = min(max(x, Double(sorted[0].x)), Double(sorted[sorted.count - 1].x))
+        // 没有控制点 = 恒等曲线，不写任何偏移。
+        guard !curvePoints.isEmpty else { return 0 }
+        // 端点由代码固定为 (0,0)、(1,1)，用户点只作为中间控制点。
+        var knots: [(x: Double, y: Double)] = [(0, 0)]
+        knots.append(contentsOf: curvePoints.sorted { $0.x < $1.x }
+            .map { (Double($0.x), Double($0.y)) })
+        knots.append((1, 1))
+        let clamped = min(max(x, 0), 1)
         var y = clamped
-        for index in 1..<sorted.count {
-            let left = sorted[index - 1]
-            let right = sorted[index]
-            if clamped >= Double(left.x), clamped <= Double(right.x) {
-                let dx = Double(right.x - left.x)
+        for index in 1..<knots.count {
+            let left = knots[index - 1]
+            let right = knots[index]
+            if clamped >= left.x, clamped <= right.x {
+                let dx = right.x - left.x
                 if dx > 1e-9 {
-                    let t = (clamped - Double(left.x)) / dx
-                    y = Double(left.y) + (Double(right.y) - Double(left.y)) * t
+                    let t = (clamped - left.x) / dx
+                    y = left.y + (right.y - left.y) * t
                 } else {
-                    y = Double(right.y)
+                    y = right.y
                 }
                 break
             }
         }
         return min(max((y - clamped) * 100, -100), 100)
+    }
+}
+
+// MARK: - LUT 横向轨道
+
+/// 与显影台胶片轨一致的 LUT 项：复用胶片图标，选中时图标外套黄铜描边。
+private struct MLUTRailItem: View {
+    let film: MFilm
+    let title: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button {
+            MHaptic.light()
+            action()
+        } label: {
+            VStack(spacing: 8) {
+                ZStack {
+                    if selected {
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(MColor.surface3)
+                            .frame(width: 33, height: 33)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .strokeBorder(MColor.brass.opacity(0.9), lineWidth: 1)
+                            )
+                    }
+                    MFilmStockIcon(film: film, size: 27)
+                }
+                .frame(width: 33, height: 33)
+
+                Text(title)
+                    .font(.mSans(7.5, selected ? .semibold : .medium))
+                    .foregroundStyle(selected ? MColor.text1 : MColor.text3)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+            }
+            .frame(width: 58)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(MPressStyle(scale: 0.94))
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+}
+
+/// 导入 LUT：和胶片图标同样大小的方框，只用一个加号表达。
+private struct MLUTImportRailItem: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button {
+            MHaptic.light()
+            action()
+        } label: {
+            VStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(MColor.surface2.opacity(0.45))
+                        .frame(width: 33, height: 33)
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(MColor.hairlineStrong, style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                        .frame(width: 33, height: 33)
+                    Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(MColor.text3)
+                }
+                .frame(width: 33, height: 33)
+
+                Text("导入")
+                    .font(.mSans(7.5, .medium))
+                    .foregroundStyle(MColor.text4)
+                    .lineLimit(1)
+            }
+            .frame(width: 58)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(MPressStyle(scale: 0.94))
+        .accessibilityLabel("导入 LUT")
     }
 }

@@ -40,7 +40,7 @@ struct MPhoto: Identifiable, Hashable {
     }
 }
 
-/// 主页网格项：一条来自系统相册的 RAW 资产。
+/// 主页网格项：一条来自系统相册的照片资产（RAW 或编码图）。
 /// 相册里有、但还没入库的照片 `photo` 为 nil；点开时再按需取原片入库。
 struct MLibraryAsset: Identifiable, Hashable {
     /// `PHAsset.localIdentifier`
@@ -55,10 +55,53 @@ struct MLibraryAsset: Identifiable, Hashable {
     var isImported: Bool { photo != nil }
     var isGraded: Bool { photo?.isGraded ?? false }
 
+    var isRawFormat: Bool {
+        ImageLoader.rawSuffixes.contains((filename as NSString).pathExtension.lowercased())
+    }
+
+    /// 卡片左上角的格式角标：显影质量从 RAW 到编码图差别很大，标出来更诚实。
+    var formatLabel: String {
+        let ext = (filename as NSString).pathExtension.lowercased()
+        if ImageLoader.rawSuffixes.contains(ext) { return "RAW" }
+        switch ext {
+        case "jpg", "jpeg": return "JPEG"
+        case "heic", "heif": return "HEIC"
+        case "tif", "tiff": return "TIFF"
+        case "png": return "PNG"
+        case "webp": return "WEBP"
+        default: return ext.isEmpty ? "IMG" : ext.uppercased()
+        }
+    }
+
     static func == (lhs: MLibraryAsset, rhs: MLibraryAsset) -> Bool {
         lhs.id == rhs.id && lhs.photo?.id == rhs.photo?.id
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+/// 主页顶部的类型筛选：全部 / 收藏 / RAW / 已调色 / 某个系统相簿。
+enum MAssetScope: Hashable {
+    case all
+    case favorites
+    case raw
+    case graded
+    case album(String)
+
+    var title: String {
+        switch self {
+        case .all: return "全部"
+        case .favorites: return "收藏"
+        case .raw: return "RAW"
+        case .graded: return "已调色"
+        case .album: return "相簿"
+        }
+    }
+}
+
+/// 系统相册里的用户相簿。
+struct MAlbum: Identifiable, Hashable {
+    let id: String
+    let title: String
 }
 
 struct MFilm: Identifiable, Hashable {
@@ -289,11 +332,82 @@ struct MGradeRecipe: Equatable {
     init() {}
 }
 
+// MARK: - 显影预设
+
+/// 显影阶段预设：只动胶片、相纸、快速显影轴与黑白模式，
+/// 不引入任何调色台参数，避免两套管线互相污染。
+struct MDevelopPreset: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let note: String
+    let filmID: String
+    let paperID: String
+    let quick: [String: Double]
+    let monochrome: Bool
+}
+
+enum MobileDevelopPresets {
+    static let all: [MDevelopPreset] = [
+        MDevelopPreset(
+            id: "standard", name: "标准负片", note: "Portra 400 · 中性基线",
+            filmID: "kodak_portra_400", paperID: "kodak_supra_endura",
+            quick: [:], monochrome: false
+        ),
+        MDevelopPreset(
+            id: "warm-portrait", name: "暖调人像", note: "暖 10 CC · 肤色提亮",
+            filmID: "kodak_portra_400", paperID: "kodak_portra_endura",
+            quick: ["camera_exposure": 0.1, "print_brightness": 0.08,
+                    "temperature": 10, "color_density": 4],
+            monochrome: false
+        ),
+        MDevelopPreset(
+            id: "clear-landscape", name: "清透风光", note: "Ektar 100 · 高清晰",
+            filmID: "kodak_ektar_100", paperID: "kodak_supra_endura",
+            quick: ["tonal_contrast": 12, "scanner_clarity": 18, "color_density": 8],
+            monochrome: false
+        ),
+        MDevelopPreset(
+            id: "fuji-fresh", name: "富士清新", note: "Pro 400H · 冷调干净",
+            filmID: "fujifilm_pro_400h", paperID: "fujifilm_crystal_archive_typeii",
+            quick: ["temperature": -6, "color_density": 10, "tonal_contrast": 4],
+            monochrome: false
+        ),
+        MDevelopPreset(
+            id: "cinema-night", name: "电影夜色", note: "Vision3 500T · 低照度",
+            filmID: "kodak_vision3_500t", paperID: "kodak_2383",
+            quick: ["camera_exposure": -0.2, "print_brightness": -0.12,
+                    "tonal_contrast": 8, "temperature": -8],
+            monochrome: false
+        ),
+        MDevelopPreset(
+            id: "soft-light", name: "柔光", note: "Portra 800 · 低清晰高颗粒",
+            filmID: "kodak_portra_800", paperID: "kodak_portra_endura",
+            quick: ["print_brightness": 0.1, "scanner_clarity": -14, "grain_amount": 12],
+            monochrome: false
+        ),
+        MDevelopPreset(
+            id: "bw-neutral", name: "黑白", note: "中性灰 · 中颗粒",
+            filmID: "kodak_portra_400", paperID: "kodak_supra_endura",
+            quick: ["tonal_contrast": 14, "grain_amount": 18,
+                    "grain_size": 10, "scanner_clarity": 8],
+            monochrome: true
+        ),
+        MDevelopPreset(
+            id: "bw-hard", name: "硬调黑白", note: "高反差 · 深黑",
+            filmID: "kodak_ektar_100", paperID: "kodak_supra_endura",
+            quick: ["camera_exposure": -0.1, "tonal_contrast": 26,
+                    "grain_amount": 8, "grain_size": -10],
+            monochrome: true
+        ),
+    ]
+}
+
 enum MScreen: Hashable {
     case home
     case camera
     case develop
     case grade
+    case settings
 }
 
 enum MGradeEntry: Hashable {

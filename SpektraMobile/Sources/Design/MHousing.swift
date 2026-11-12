@@ -64,6 +64,9 @@ enum MDeviceHousing {
     ///   于是 iPhone 13 / SE 这些机型在模拟器上永远跑不到刘海/无开孔分支；
     /// - 顶部安全区高度是系统按真实屏幕给的值：无开孔 20、刘海 44–50、灵动岛 59–62。
     private static func detect() -> MHousingKind {
+        // iPad 没有开孔：横屏安全区顶部约 24pt，按高度判会误命中「刘海」，
+        // 于是屏幕上会多出一圈假的刘海光效。平板直接判为无开孔。
+        if UIDevice.current.userInterfaceIdiom == .pad { return .none }
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
             .first,

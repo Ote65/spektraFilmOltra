@@ -157,3 +157,13 @@ Python 使用 LibRaw（rawpy）输出 16-bit 线性 ACES；macOS 侧使用 `CIRA
 口径说明：这些偏差全部来自 float32 的存储量化，与算法无关——真正写错（矩阵顺序、插值方向、单位口径）都是 1e-3 以上；
 1e-5 的门禁留了约 150 倍余量，仍能抓住任何算法级回归。若需临时做逐位调查，用
 `SPEKTRA_PARITY_TOL=1e-9 Tools/parity.sh`，此时除 float32 量化项外应全部通过。
+
+## 10. 电影印片观察光源别名（2026-11-11）
+
+`kodak_2383` / `kodak_2393` 的 `viewing_illuminant` 写作 `K75P`，参考实现映射到
+`Kinoton 75P`；Swift 的 `Illuminants.standard` 之前没有这层别名，扫描阶段拿不到光源，
+`wavelengthCount = 0`，整张输出被压成 0（全黑）。`kodak_vision3_*` 的参考光源 `T`
+同样补齐到 `Incandescent`。
+
+修复后 20 支胶片 × 8 种印相纸的全矩阵（含 2383 / 2393）在 2×2 探针上无全黑/全白；
+上述 11 个对拍用例仍全部通过（确定性 ≤3.15e-08，统计项在门禁内）。

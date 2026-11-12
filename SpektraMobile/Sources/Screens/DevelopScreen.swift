@@ -17,13 +17,25 @@ struct DevelopScreen: View {
     @State private var drawerChrome: CGFloat = 0
 
     @State private var showOriginal = false
-    @State private var pressToken = 0
     @State private var zoom: CGFloat = DebugLaunch.canvasZoom
     @State private var pan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
-    @State private var lastPan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
+    /// 点击照片进入纯预览：控件全部隐去，照片移到整屏中心。
+    @State private var chromeHidden = false
+    /// 进入纯预览前的画布状态；回来时恢复（纯预览里动过画布就不恢复）。
+    @State private var savedZoom: CGFloat = 1
+    @State private var savedPan: CGSize = .zero
+    @State private var canvasTouchedWhileHidden = false
+    /// 捏合缩放：锚在双指中心，双指整体位移同时转成平移。
+    @State private var pinchBaseZoom: CGFloat = 1
+    @State private var pinchBasePan: CGSize = .zero
+    @State private var pinchAnchorOffset: CGSize = .zero
+    @State private var dragBasePan: CGSize = .zero
     @State private var exportOpen = DebugLaunch.exportOpen
-    @State private var tabPressStart: Date?
     @State private var stageSize: CGSize = .zero
+    // 分栏右栏的直方图：随预览图刷新，后台采样不阻塞显影渲染。
+    @State private var histogram = MHistogramData.empty
+    @State private var histogramToken = 0
+    @State private var histogramInFlight = false
     // 首帧就绪前先弹出一块白色画布，再显影渐变成照片
     @State private var cardRect: CGRect = .zero
     @State private var cardOpacity: Double = 1
@@ -40,45 +52,18 @@ struct DevelopScreen: View {
     /// 真实可用画布高度：由根视图注入的设备安全区算出，不再写死 852/54/34。
     private var availableHeight: CGFloat { insets.contentHeight }
 
+    /// iPad 横屏：左画布 + 右参数栏。竖屏与分屏保持原来的单列布局。
+    private var isSplit: Bool { MLayout.usesSplit(insets.size) }
+
     var body: some View {
         ZStack(alignment: .bottom) {
             MColor.app
 
-            VStack(spacing: 0) {
-                ZStack(alignment: .top) {
-                    previewStage
-                        .frame(height: max(96, availableHeight - drawerHeight))
-                        .overlay {
-                            if cardVisible {
-                                MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                        .background(
-                            GeometryReader { geo in
-                                Color.clear
-                                    .onAppear { stageSize = geo.size }
-                                    .onChange(of: geo.size) { _, newValue in stageSize = newValue }
-                            }
-                        )
-                    floatingChrome
-                }
-                Spacer(minLength: 0)
+            if isSplit {
+                splitLayout
+            } else {
+                stackedLayout
             }
-            .padding(.top, insets.top)
-
-            // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
-            drawer
-                .padding(.horizontal, MMetric.floatingPanelInset)
-                .frame(height: drawerHeight)
-                .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
-                    + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
-
-            tabBar
-
-            MBackSwipe(action: onBack)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .padding(.top, insets.top)
         }
         .background(MColor.app)
         .overlay {
@@ -95,9 +80,10 @@ struct DevelopScreen: View {
                         onBack()
                     },
                     onNote: onToast,
-                    onExport: { format, edge, quality, done in
+                    onExport: { format, edge, quality, watermark, done in
                         session.export(format: format, longEdgeIndex: edge,
-                                       jpegQuality: quality) { result in
+                                       jpegQuality: quality,
+                                       includeWatermark: watermark) { result in
                             if case .failure = result { onToast("导出失败") }
                             done(result)
                         }
@@ -120,6 +106,357 @@ struct DevelopScreen: View {
         .onChange(of: session.previewImage != nil) { _, hasImage in
             if hasImage { popCardIfReady() }
         }
+        .onChange(of: isSplit) { _, split in
+            // 进入分栏后右栏页签只剩光调/色彩/细节：停在预设或胶片页时回落到光调。
+            if split && (page == 0 || page == 1) { page = 2 }
+            // 直方图只在分栏可见：切入时补算当前预览，切回单列释放数据。
+            if split {
+                refreshHistogram(session.previewImage)
+            } else {
+                histogram = .empty
+            }
+        }
+        .onChange(of: session.previewImage) { _, image in
+            refreshHistogram(image)
+        }
+    }
+
+    /// 后台采样预览图的 RGB 直方图；token 保证只采纳最新一帧。
+    /// 只在分栏计算，且同一时刻只跑一个任务，避免单列白算与拖动期任务堆积。
+    private func refreshHistogram(_ image: MPlatformImage?) {
+        histogramToken += 1
+        let token = histogramToken
+        guard let image else {
+            histogram = .empty
+            return
+        }
+        guard isSplit, !histogramInFlight else { return }
+        histogramInFlight = true
+        Task.detached(priority: .utility) {
+            let data = MHistogramSampler.compute(image) ?? .empty
+            await MainActor.run {
+                histogramInFlight = false
+                guard token == histogramToken else { return }
+                histogram = data
+            }
+        }
+    }
+
+    // MARK: - 单列布局（iPhone / iPad 竖屏 / 分屏）
+
+    private var stackedLayout: some View {
+        Group {
+            VStack(spacing: 0) {
+                ZStack(alignment: .top) {
+                    previewStage
+                        .frame(height: max(96, availableHeight - drawerHeight))
+                        .overlay {
+                            if cardVisible {
+                                MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear
+                                    .onAppear { stageSize = geo.size }
+                                    .onChange(of: geo.size) { _, newValue in stageSize = newValue }
+                            }
+                        )
+                    floatingChrome
+                        .opacity(chromeHidden ? 0 : 1)
+                        .allowsHitTesting(!chromeHidden)
+                        .animation(MMotion.quick, value: chromeHidden)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.top, insets.top)
+
+            // 参数面板是悬浮在底部胶囊上方的圆角窗口：底边与胶囊顶边留固定间距。
+            drawer
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
+                .padding(.horizontal, MMetric.floatingPanelInset)
+                .frame(height: drawerHeight)
+                .padding(.bottom, insets.bottom + MMetric.tabCapsuleBottom
+                    + MMetric.tabCapsuleHeight + MMetric.floatingPanelGap)
+
+            tabBar(bottomPadding: 8 + insets.bottom)
+                .opacity(chromeHidden ? 0 : 1)
+                .allowsHitTesting(!chromeHidden)
+                .animation(MMotion.quick, value: chromeHidden)
+
+            MBackSwipe(action: onBack)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .padding(.top, insets.top)
+        }
+    }
+
+    // MARK: - 分栏布局（iPad 横屏，参考 macOS 三栏：胶片轨 / 画布 / 参数栏）
+
+    private var splitLayout: some View {
+        HStack(spacing: 0) {
+            filmStockRail
+                .frame(width: MLayout.sideRailWidth(for: insets.size))
+
+            Rectangle()
+                .fill(MColor.hairline)
+                .frame(width: 1)
+
+            ZStack(alignment: .top) {
+                previewStage
+                    .overlay {
+                        if cardVisible {
+                            MCanvasCard(rect: cardRect, opacity: cardOpacity, radius: cardRadius)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { stageSize = geo.size }
+                                .onChange(of: geo.size) { _, newValue in stageSize = newValue }
+                        }
+                    )
+
+                floatingChrome
+                    .opacity(chromeHidden ? 0 : 1)
+                    .allowsHitTesting(!chromeHidden)
+                    .animation(MMotion.quick, value: chromeHidden)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .leading) {
+                MBackSwipe(action: onBack)
+                    .frame(width: 22)
+            }
+
+            Rectangle()
+                .fill(MColor.hairline)
+                .frame(width: 1)
+
+            VStack(spacing: 0) {
+                // 快速 / 专业：模式选择从画布悬浮移到参数栏顶部（参考 macOS Inspector）。
+                HStack(spacing: 10) {
+                    MModeCapsule(titles: ["快速", "专业"], mode: $mode)
+                        .overlay { capsuleProgressRing }
+                        .animation(MMotion.quick, value: session.phaseLabel)
+                        .accessibilityLabel("显影模式")
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+
+                // 直方图：macOS 编辑页同款卡片，显影参数调整时观察影调分布。
+                splitHistogramCard
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+
+                // 参数页签在顶部（预设 / 胶片相纸都在左轨）。
+                MSplitTabRow(
+                    titles: ["光调", "色彩", "细节"],
+                    selection: splitPageIndex,
+                    onSelect: { index in
+                        withAnimation(MMotion.state) { page = splitPageIndices[index] }
+                    }
+                )
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+
+                // 旋转 / 预览比例 / 撤销：参数栏的固定工具行。
+                drawerToolRow
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+
+                // 启动即横屏时 onChange 不会触发：渲染侧直接把预设/胶片页兜底成光调。
+                splitPageContent
+                    .frame(maxHeight: .infinity)
+                    .padding(.bottom, insets.bottom)
+            }
+            .frame(width: MLayout.inspectorWidth(for: insets.size))
+        }
+        .padding(.top, insets.top)
+    }
+
+    /// 分栏右栏的参数页 → 原 page 状态的下标映射（预设与胶片页已移到左轨）。
+    private let splitPageIndices = [2, 3, 4]
+    private var splitPageIndex: Int { splitPageIndices.firstIndex(of: page) ?? 0 }
+
+    /// 分栏右栏永远渲染这三个参数页：page 停在预设/胶片页时显示光调。
+    @ViewBuilder private var splitPageContent: some View {
+        switch splitPageIndex {
+        case 1: colorPage
+        case 2: detailPage
+        default: tonePage
+        }
+    }
+
+    /// 直方图卡片：标题行 + RGB 折线，数据随预览图刷新。
+    private var splitHistogramCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("直方图").mLabel(8, color: MColor.text3)
+                Spacer(minLength: 8)
+                Text("亮度 / RGB").mMeta(7.5, color: MColor.text4)
+            }
+            MHistogram(data: histogram)
+        }
+    }
+
+    /// 左轨：显影预设 / 胶片 / 相纸切换 + 竖排列表（参考 macOS 预设栏）。
+    @State private var railTab = 0
+
+    private var filmStockRail: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                MSideRailTab(title: "预设", selected: railTab == 0) {
+                    withAnimation(MMotion.state) { railTab = 0 }
+                }
+                MSideRailTab(title: "胶片", selected: railTab == 1) {
+                    withAnimation(MMotion.state) { railTab = 1 }
+                }
+                MSideRailTab(title: "相纸", selected: railTab == 2) {
+                    withAnimation(MMotion.state) { railTab = 2 }
+                }
+                Spacer(minLength: 0)
+                Text(railCountLabel)
+                    .mMeta(8.5, color: MColor.text4)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 42)
+
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 2) {
+                    switch railTab {
+                    case 0:
+                        ForEach(MobileDevelopPresets.all) { preset in
+                            developPresetRow(preset)
+                        }
+                    case 1:
+                        ForEach(MobileCatalog.films) { film in filmRow(film) }
+
+                        MHairline()
+                            .padding(.vertical, 10)
+
+                        MToggleRow(label: "黑白模式",
+                                   isOn: Binding(
+                                    get: { session.isMonochrome },
+                                    set: { session.setMonochrome($0) }
+                                   ),
+                                   compact: true)
+
+                        if mode == 1 {
+                            proGroupsView(2)
+                            resetButton("重置专业参数", action: resetPro)
+                        }
+                    default:
+                        ForEach(MobileCatalog.papers) { paper in paperRow(paper) }
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 6)
+                .padding(.bottom, insets.bottom + 12)
+            }
+            .scrollIndicators(.never)
+        }
+        .background(MColor.app)
+    }
+
+    private var railCountLabel: String {
+        switch railTab {
+        case 0: return "\(MobileDevelopPresets.all.count) 个"
+        case 1: return "\(MobileCatalog.films.count) 种"
+        default: return "\(MobileCatalog.papers.count) 种"
+        }
+    }
+
+    private func filmRow(_ film: MFilm) -> some View {
+        let selected = film.id == session.filmID
+        return Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) { session.setFilm(film.id) }
+        } label: {
+            HStack(spacing: 10) {
+                MFilmStockIcon(film: film, size: 30)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(selected ? MColor.brassWash : MColor.surface2.opacity(0.6))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(selected ? MColor.brass.opacity(0.5) : MColor.hairline,
+                                          lineWidth: 1)
+                    )
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(film.name)
+                        .font(.mSans(12, selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? MColor.brass : MColor.text1)
+                        .lineLimit(1)
+                    Text("\(film.brand) · \(film.kind)")
+                        .mMeta(8, color: MColor.text4)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(MColor.brass)
+                }
+            }
+            .padding(.horizontal, 6)
+            .frame(height: 50)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func paperRow(_ paper: MPaper) -> some View {
+        let selected = paper.id == session.paperID
+        return Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) { session.setPaper(paper.id) }
+        } label: {
+            HStack(spacing: 10) {
+                MPaperStockIcon(paper: paper, size: 28)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(selected ? MColor.brassWash : MColor.surface2.opacity(0.6))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(selected ? MColor.brass.opacity(0.5) : MColor.hairline,
+                                          lineWidth: 1)
+                    )
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(paper.name)
+                        .font(.mSans(12, selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? MColor.brass : MColor.text1)
+                        .lineLimit(1)
+                    Text(paper.note)
+                        .mMeta(8, color: MColor.text4)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(MColor.brass)
+                }
+            }
+            .padding(.horizontal, 6)
+            .frame(height: 50)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 开孔光效
@@ -135,17 +472,25 @@ struct DevelopScreen: View {
             }
 
             Spacer(minLength: 0)
-            previewScaleMenu
+
+            // 调色入口从底部页签移到顶栏，和调色台的导出按钮同一套黄铜胶囊。
+            MBrassPill(title: "调色", icon: "slider.horizontal.3", height: 32) {
+                openGrade()
+            }
+            .accessibilityLabel("进入调色台")
         }
         .frame(height: 34)
         .padding(.horizontal, 14)
         .overlay(alignment: .center) {
-            MModeCapsule(titles: ["快速", "专业"], mode: $mode)
-                .overlay { capsuleProgressRing }
-                .overlay(alignment: .bottom) { capsuleProgressText }
-                .offset(y: session.isRendering ? 16 : 0)
-                .animation(MMotion.drawer, value: session.isRendering)
-                .animation(MMotion.quick, value: session.phaseLabel)
+            // 分栏下快速/专业移到参数栏顶部：画布顶部只留返回与调色入口。
+            if !isSplit {
+                MModeCapsule(titles: ["快速", "专业"], mode: $mode)
+                    .overlay { capsuleProgressRing }
+                    .overlay(alignment: .bottom) { capsuleProgressText }
+                    .offset(y: session.isRendering ? 16 : 0)
+                    .animation(MMotion.drawer, value: session.isRendering)
+                    .animation(MMotion.quick, value: session.phaseLabel)
+            }
         }
         .padding(.top, 10)
         // 顶部按钮下面铺一层从上到下的黑色渐隐：放大后照片从控件下方经过时，模式胶囊与文件信息仍然可读。
@@ -153,6 +498,20 @@ struct DevelopScreen: View {
             MTopScrim(height: 170)
                 .offset(y: -insets.top)
         }
+    }
+
+    /// 点击调色：把当前预览与落点交给根视图做吸入动画。
+    private func openGrade() {
+        let rect = fittedPreviewRect(in: stageSize)
+        onOpenGrade(
+            session.previewImage,
+            CGRect(
+                x: rect.minX,
+                y: insets.top + rect.minY,
+                width: rect.width,
+                height: rect.height
+            )
+        )
     }
 
     /// 预览渲染比例菜单：1/8、1/4、1/2、1/1，与 Swift 主线的 previewScale 档位一致。
@@ -217,6 +576,98 @@ struct DevelopScreen: View {
         }
     }
 
+    // MARK: - 画布交互
+
+    private var stageCenter: CGPoint {
+        CGPoint(x: stageSize.width / 2, y: stageSize.height / 2)
+    }
+
+    /// 纯预览时照片从默认位置（画布居中偏上）挪到整屏中心；显示控件时归零。
+    private var hiddenCenterOffsetY: CGFloat {
+        guard chromeHidden else { return 0 }
+        let stageTop = isSplit ? 0 : insets.top
+        return insets.size.height / 2 - (stageTop + stageSize.height / 2)
+    }
+
+    /// 纯预览里动过画布：回到带控件时不恢复进入前的缩放 / 位移。
+    private func markCanvasInteraction() {
+        guard chromeHidden else { return }
+        canvasTouchedWhileHidden = true
+    }
+
+    /// 单击切换纯预览：隐去控件时照片居中整幅，再点回来恢复原状态。
+    private func toggleChrome() {
+        if chromeHidden {
+            withAnimation(MMotion.canvas) {
+                chromeHidden = false
+                if !canvasTouchedWhileHidden {
+                    zoom = savedZoom
+                    pan = savedPan
+                }
+            }
+        } else {
+            savedZoom = zoom
+            savedPan = pan
+            canvasTouchedWhileHidden = false
+            withAnimation(MMotion.canvas) {
+                chromeHidden = true
+                zoom = 1
+                pan = .zero
+            }
+        }
+    }
+
+    /// 双击切换：默认倍率下以点击点为锚放大，已放大则回到默认状态。
+    private func doubleTapped(at point: CGPoint) {
+        MHaptic.light()
+        markCanvasInteraction()
+        if zoom > 1.001 {
+            withAnimation(MMotion.canvas) {
+                zoom = 1
+                pan = .zero
+            }
+            return
+        }
+        let target: CGFloat = 2.2
+        let anchor = CGPoint(x: point.x - stageCenter.x,
+                             y: point.y - stageCenter.y - hiddenCenterOffsetY)
+        let scale = target / max(zoom, 0.001)
+        withAnimation(MMotion.canvas) {
+            zoom = target
+            pan = CGSize(
+                width: pan.width * scale + anchor.x * (1 - scale),
+                height: pan.height * scale + anchor.y * (1 - scale))
+        }
+    }
+
+    /// 双指按下：记录基线，之后缩放与双指整体位移一起生效。
+    private func pinchBegan(at point: CGPoint) {
+        pinchBaseZoom = zoom
+        pinchBasePan = pan
+        pinchAnchorOffset = CGSize(
+            width: point.x - stageCenter.x,
+            height: point.y - stageCenter.y - hiddenCenterOffsetY)
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
+    private func pinchChanged(scale: CGFloat, translation: CGSize) {
+        let next = min(4, max(0.5, pinchBaseZoom * scale))
+        let ratio = pinchBaseZoom > 0 ? next / pinchBaseZoom : 1
+        zoom = next
+        pan = CGSize(
+            width: pinchBasePan.width + pinchAnchorOffset.width * (1 - ratio)
+                + translation.width,
+            height: pinchBasePan.height + pinchAnchorOffset.height * (1 - ratio)
+                + translation.height)
+    }
+
+    private func panBegan() {
+        dragBasePan = pan
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
     // MARK: - 预览
 
     private var previewStage: some View {
@@ -227,11 +678,11 @@ struct DevelopScreen: View {
                 if let image = showOriginal ? session.originalImage : session.previewImage {
                     MImage.swiftUI(image)
                         .resizable()
+                        .interpolation(.high)
                         .scaledToFit()
                         .scaleEffect(zoom)
-                        .offset(pan)
+                        .offset(x: pan.width, y: pan.height + hiddenCenterOffsetY)
                         .animation(MMotion.state, value: showOriginal)
-                        .animation(MMotion.drawer, value: zoom)
                 } else {
                     Image(systemName: "photo")
                         .font(.system(size: 30, weight: .light))
@@ -240,56 +691,34 @@ struct DevelopScreen: View {
             }
             // 不再按预览槽裁切：画布是整个页面，放大后照片可以延伸到顶部控件与抽屉下面。
             .opacity(imageRevealed && !previewHidden ? 1 : 0)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                MHaptic.light()
-                withAnimation(MMotion.drawer) {
-                    if zoom > 1 {
-                        zoom = 1
-                        pan = .zero
-                        lastPan = .zero
-                    } else {
-                        zoom = 2.2
-                    }
+            .allowsHitTesting(false)
+
+            // 与调色台共用同一套画布手势：单指平移、双指同时缩放 + 平移、双击放大 / 回默认。
+            MCanvasGestureLayer(
+                onTap: {
+                    MHaptic.light()
+                    toggleChrome()
+                },
+                onDoubleTap: { point in doubleTapped(at: point) },
+                onMultiTouchBegin: { point in pinchBegan(at: point) },
+                onMultiTouchChange: { scale, translation in
+                    pinchChanged(scale: scale, translation: translation)
+                },
+                onMultiTouchEnd: {},
+                onPanBegin: { panBegan() },
+                onPanChange: { translation in
+                    pan = CGSize(
+                        width: dragBasePan.width + translation.width,
+                        height: dragBasePan.height + translation.height)
+                },
+                onPanEnd: {},
+                onLongPress: { pressed in
+                    if pressed { MHaptic.light() }
+                    withAnimation(MMotion.quick) { showOriginal = pressed }
                 }
-            }
-            .gesture(
-                MagnificationGesture()
-                    .onChanged { value in
-                        zoom = min(4, max(1, value))
-                    }
-                    .onEnded { value in
-                        zoom = min(4, max(1, value))
-                        if zoom <= 1 { pan = .zero }
-                    }
             )
-            .simultaneousGesture(
-                DragGesture()
-                    .onChanged { gesture in
-                        guard zoom > 1 else { return }
-                        pan = CGSize(
-                            width: lastPan.width + gesture.translation.width,
-                            height: lastPan.height + gesture.translation.height
-                        )
-                    }
-                    .onEnded { _ in
-                        lastPan = pan
-                    }
-            )
-            .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 18, pressing: { pressing in
-                if pressing {
-                    pressToken += 1
-                    let token = pressToken
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        guard token == pressToken else { return }
-                        MHaptic.light()
-                        withAnimation(MMotion.quick) { showOriginal = true }
-                    }
-                } else {
-                    pressToken += 1
-                    withAnimation(MMotion.quick) { showOriginal = false }
-                }
-            }, perform: {})
+            .opacity(imageRevealed && !previewHidden ? 1 : 0)
+            .allowsHitTesting(imageRevealed && !previewHidden)
 
             if let failure = session.loadFailure, !session.isLoaded {
                 loadFailureCard(failure)
@@ -312,6 +741,8 @@ struct DevelopScreen: View {
                 .allowsHitTesting(false)
             }
             .allowsHitTesting(false)
+            .opacity(chromeHidden ? 0 : 1)
+            .animation(MMotion.quick, value: chromeHidden)
 
             VStack {
                 Spacer(minLength: 0)
@@ -319,6 +750,8 @@ struct DevelopScreen: View {
                     .padding(.horizontal, 14)
                     .padding(.bottom, 10)
             }
+            .opacity(chromeHidden ? 0 : 1)
+            .animation(MMotion.quick, value: chromeHidden)
         }
         .overlay(alignment: .bottom) {
             MHairline(color: MColor.hairlineFaint)
@@ -395,7 +828,7 @@ struct DevelopScreen: View {
                     .accessibilityLabel("LUT 预测帧，停手后替换为精算帧")
             }
 
-            if zoom > 1 || showOriginal {
+            if abs(zoom - 1) > 0.001 || showOriginal {
                 Text(showOriginal ? "原片" : "\(Int(zoom * 100))%")
                     .font(.mSans(8.5, .medium).monospacedDigit())
                     .foregroundStyle(showOriginal ? MColor.text2 : MColor.text4)
@@ -434,8 +867,8 @@ struct DevelopScreen: View {
         }
         .allowsHitTesting(false)
         .scaleEffect(zoom)
-        .offset(pan)
-        .opacity(zoom > 1 ? 0 : 1)
+        .offset(x: pan.width, y: pan.height + hiddenCenterOffsetY)
+        .opacity(chromeHidden || abs(zoom - 1) > 0.001 ? 0 : 1)
     }
 
     /// 与预览图 `.scaledToFit` 的落点保持一致（照片现在铺满预览区宽度），取景角只贴着照片。
@@ -497,12 +930,37 @@ struct DevelopScreen: View {
         )
     }
 
+    // MARK: - 抽屉工具行
+
+    private var drawerToolRow: some View {
+        HStack(spacing: 6) {
+            MCircleIconButton(icon: "rotate.right", size: 10, frame: 28) {
+                MHaptic.tick()
+                session.rotateClockwise()
+            }
+            .accessibilityLabel("顺时针旋转 90 度")
+
+            previewScaleMenu
+
+            Spacer(minLength: 0)
+
+            MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
+                session.undo()
+            }
+            .opacity(session.canUndo ? 1 : 0.36)
+            .allowsHitTesting(session.canUndo)
+            .accessibilityLabel("撤销")
+        }
+    }
+
     // MARK: - 抽屉
 
     private var drawer: some View {
         VStack(spacing: 0) {
-            MDrawerChevron(isExpanded: isDrawerExpanded, isVisible: !isLockedTab) {
-                toggleDrawer()
+            if !isSplit {
+                MDrawerChevron(isExpanded: isDrawerExpanded, isVisible: !isLockedTab) {
+                    toggleDrawer()
+                }
             }
 
             ZStack {
@@ -541,13 +999,13 @@ struct DevelopScreen: View {
         // 阴影分两层：近处极淡、远处大半径，让边界是渐隐而不是一圈硬黑边。
         .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
         .shadow(color: .black.opacity(0.22), radius: 30, y: 12)
-        .overlay(alignment: .topTrailing) {
-            MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
-                session.undo()
+        // 旋转 / 预览比例 / 撤销浮在 sheet 外面顶部，和原本撤销按钮同一行。
+        .overlay(alignment: .top) {
+            if !isSplit {
+                drawerToolRow
+                    .padding(.horizontal, 10)
+                    .offset(y: -36)
             }
-            .opacity(session.canUndo ? 1 : 0.38)
-            .allowsHitTesting(session.canUndo)
-            .offset(x: -10, y: -36)
         }
         .onPreferenceChange(MPanelHeightKey.self) { height in
             panelContentHeight = height
@@ -560,6 +1018,8 @@ struct DevelopScreen: View {
 
     /// 内容高度变化后：短页锁成单档（并贴合内容），长页只负责收掉多余留白。
     private func syncDrawerToContent() {
+        // 分栏下面板高度由右栏自然分配，drawerHeight 不参与布局，别再写状态引发多余重绘。
+        guard !isSplit else { return }
         guard panelViewportHeight > 0, panelContentHeight > 0 else { return }
         let fit = fitHeight(for: panelContentHeight)
         let target: CGFloat
@@ -623,14 +1083,82 @@ struct DevelopScreen: View {
     @ViewBuilder private var pageContent: some View {
         switch page {
         case 0:
-            filmPage
+            developPresetPage
         case 1:
-            tonePage
+            filmPage
         case 2:
+            tonePage
+        case 3:
             colorPage
         default:
             detailPage
         }
+    }
+
+    // MARK: - 显影预设
+
+    private var developPresetPage: some View {
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 0) {
+                MSectionHead(title: "显影预设", trailing: "\(MobileDevelopPresets.all.count) 个")
+                    .padding(.top, 10)
+
+                ForEach(MobileDevelopPresets.all) { preset in
+                    developPresetRow(preset)
+                }
+            }
+            .padding(.horizontal, MMetric.pageMargin)
+            .padding(.bottom, 16)
+            .background(MPanelHeightReporter())
+        }
+        .scrollIndicators(.never)
+    }
+
+    private func developPresetRow(_ preset: MDevelopPreset) -> some View {
+        let film = MobileCatalog.film(id: preset.filmID) ?? MobileCatalog.films[0]
+        let selected = session.matches(preset)
+        return Button {
+            MHaptic.light()
+            withAnimation(MMotion.state) {
+                session.applyDevelopPreset(preset)
+            }
+            onToast("已套用 \(preset.name)")
+        } label: {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(selected ? MColor.brassWash : MColor.surface2.opacity(0.6))
+                        .frame(width: 38, height: 38)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(selected ? MColor.brass.opacity(0.5) : MColor.hairline,
+                                              lineWidth: 1)
+                        )
+                    MFilmStockIcon(film: film, size: 28)
+                }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(preset.name)
+                        .font(.mSans(11.5, .medium))
+                        .foregroundStyle(MColor.text1)
+                    Text(preset.note)
+                        .font(.mSans(8.5, .medium))
+                        .foregroundStyle(MColor.text4)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(MColor.brass)
+                }
+            }
+            .frame(height: 50)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 胶片页
@@ -640,6 +1168,14 @@ struct DevelopScreen: View {
             VStack(spacing: 14) {
                 filmRail
                 paperRail
+
+                MToggleRow(label: "黑白模式",
+                           isOn: Binding(
+                            get: { session.isMonochrome },
+                            set: { session.setMonochrome($0) }
+                           ),
+                           compact: true)
+
                 if mode == 1 {
                     proGroupsView(2)
                         .padding(.top, 4)
@@ -648,6 +1184,11 @@ struct DevelopScreen: View {
             .padding(.horizontal, MMetric.pageMargin)
             .padding(.vertical, 6)
             .background(MPanelHeightReporter())
+            // 内容不足一屏时在 sheet 里垂直居中。面板顶部还有 22pt 把手（chrome），
+            // 只在把手以下视口居中会让内容整体偏下一个 chrome/2；
+            // 在底部补回等量 padding，让居中基准回到整块面板。
+            .padding(.bottom, drawerChrome)
+            .frame(minHeight: max(0, panelViewportHeight), alignment: .center)
         }
         .scrollIndicators(.never)
     }
@@ -714,6 +1255,7 @@ struct DevelopScreen: View {
                     quickSlider("camera_exposure")
                     quickSlider("print_brightness")
                     quickSlider("tonal_contrast")
+                    quickSlider("highlight_softening")
 
                     if scanFilmMode {
                         Text(printOnlyQuickNote)
@@ -809,7 +1351,7 @@ struct DevelopScreen: View {
                             resetQuick()
                         }
 
-                        HStack(alignment: .top, spacing: 12) {
+                        HStack(alignment: .center, spacing: 12) {
                             VStack(alignment: .leading, spacing: 0) {
                                 quickSlider("grain_amount")
                                 quickSlider("grain_size")
@@ -818,6 +1360,7 @@ struct DevelopScreen: View {
                             }
                             .frame(maxWidth: .infinity)
 
+                            // 与左侧三条滑杆整块垂直居中：颗粒预览不再顶在上沿。
                             MGrainSample(intensity: grainIntensity)
                                 .frame(width: 88, height: 88)
                                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -895,6 +1438,7 @@ struct DevelopScreen: View {
                     step: step,
                     decimals: decimals,
                     suffix: suffix,
+                    isEnabled: proRowEnabled(row.id),
                     compact: true
                 )
             case .toggle(let isOn):
@@ -904,15 +1448,17 @@ struct DevelopScreen: View {
                         get: { session.proToggles[row.id] ?? isOn },
                         set: { session.applyProToggle(row.id, $0) }
                     ),
+                    isEnabled: proRowEnabled(row.id),
                     compact: true
                 )
             case .choice(let options, let fallback):
                 let current = session.choiceValue(row.id)
                 let currentLabel = options.first(where: { $0.value == current })?.label ?? fallback
+                let enabled = proRowEnabled(row.id)
                 HStack {
                     Text(row.label)
                         .font(.rowLabel)
-                        .foregroundStyle(MColor.text2)
+                        .foregroundStyle(enabled ? MColor.text2 : MColor.text4)
                     Spacer()
                     Menu {
                         ForEach(options, id: \.value) { option in
@@ -927,16 +1473,28 @@ struct DevelopScreen: View {
                         HStack(spacing: 4) {
                             Text(currentLabel)
                                 .font(.mSans(10.5, .medium))
-                                .foregroundStyle(current == fallback ? MColor.text2 : MColor.brass)
+                                .foregroundStyle(enabled
+                                                 ? (current == fallback ? MColor.text2 : MColor.brass)
+                                                 : MColor.text4)
                             Image(systemName: "chevron.down")
                                 .font(.system(size: 7, weight: .semibold))
                                 .foregroundStyle(MColor.text4)
                         }
                     }
+                    .disabled(!enabled)
                 }
                 .frame(height: 50)
             }
         }
+    }
+
+    /// RAW 专属的解码项：非 RAW 输入（JPEG/HEIC/PNG）没有任何效果，置灰避免被当成 bug。
+    private static let rawOnlyRows: Set<String> = [
+        "white_balance", "white_balance_temperature", "white_balance_tint", "lens_correction",
+    ]
+
+    private func proRowEnabled(_ id: String) -> Bool {
+        session.isRawInput || !Self.rawOnlyRows.contains(id)
     }
 
     private func quickSectionHead(
@@ -990,55 +1548,20 @@ struct DevelopScreen: View {
 
     // MARK: - 底部页签
 
-    private var tabBar: some View {
+    private func tabBar(bottomPadding: CGFloat) -> some View {
         MGlassTabCapsule {
             ForEach(Array(pageItems.enumerated()), id: \.offset) { item in
-                if item.offset == 4 {
+                Button {
+                    MHaptic.tick()
+                    withAnimation(MMotion.state) { page = item.offset }
+                } label: {
                     tabLabel(item.element, index: item.offset)
-                        .contentShape(Rectangle())
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onChanged { _ in
-                                    if tabPressStart == nil { tabPressStart = Date() }
-                                }
-                                .onEnded { _ in
-                                    let duration = tabPressStart.map {
-                                        Date().timeIntervalSince($0)
-                                    } ?? 0
-                                    tabPressStart = nil
-                                    MHaptic.tick()
-                                    if duration >= 0.45 {
-                                        MHaptic.medium()
-                                        withAnimation(MMotion.pill) { exportOpen = true }
-                                    } else {
-                                        let rect = fittedPreviewRect(in: stageSize)
-                                        // 吸入用屏幕上的整张预览（含片边）：落点与画面比例必须一致，
-                                        // 交接给调色台的像素仍然是纯照片，片边不会进入调色台。
-                                        onOpenGrade(
-                                            session.previewImage,
-                                            CGRect(
-                                                x: rect.minX,
-                                                y: insets.top + rect.minY,
-                                                width: rect.width,
-                                                height: rect.height
-                                            )
-                                        )
-                                    }
-                                }
-                        )
-                } else {
-                    Button {
-                        MHaptic.tick()
-                        withAnimation(MMotion.state) { page = item.offset }
-                    } label: {
-                        tabLabel(item.element, index: item.offset)
-                    }
-                    .buttonStyle(.plain)
                 }
+                .buttonStyle(.plain)
             }
         }
         // iOS 26 悬浮玻璃胶囊：不再贴边铺一条实底，而是留出左右与底部的呼吸。
-        .padding(.bottom, 8 + insets.bottom)
+        .padding(.bottom, bottomPadding)
     }
 
     private var drawerShape: UnevenRoundedRectangle {
@@ -1066,7 +1589,7 @@ struct DevelopScreen: View {
         .frame(maxWidth: .infinity)
         .frame(height: 42)
         .background {
-            if page == index, index < 4 {
+            if page == index {
                 // 选中项只铺一层很薄的黄铜玻璃，不再画独立的小方块图标底。
                 Capsule()
                     .fill(MColor.brassWash)
@@ -1079,22 +1602,20 @@ struct DevelopScreen: View {
     }
 
     private func tabTone(_ index: Int) -> Color {
-        if index == 4 { return MColor.brass }
-        return page == index ? MColor.brass : (index < 4 ? MColor.text3 : MColor.text4)
+        page == index ? MColor.brass : MColor.text3
     }
 
     private func tabWeight(_ index: Int) -> Font.Weight {
-        if index == 4 { return .medium }
-        return page == index ? .semibold : .medium
+        page == index ? .semibold : .medium
     }
 
     private var pageItems: [(title: String, icon: String)] {
         [
+            ("预设", "square.stack"),
             ("胶片", "film"),
             ("光调", "sun.max"),
             ("色彩", "drop"),
             ("细节", "camera.filters"),
-            ("调色", "slider.horizontal.3"),
         ]
     }
 
@@ -1109,9 +1630,9 @@ struct DevelopScreen: View {
         session.proToggles["scan_film"] ?? false
     }
 
-    /// 与参考 `PRINT_ONLY_AXES` 对齐：印相明暗、影调反差（色盘 Y/M 单独处理）。
+    /// 与参考 `PRINT_ONLY_AXES` 对齐：印相明暗、影调反差、高光柔和（色盘 Y/M 单独处理）。
     private var printOnlyQuickAxes: Set<String> {
-        ["print_brightness", "tonal_contrast"]
+        ["print_brightness", "tonal_contrast", "highlight_softening"]
     }
 
     private let printOnlyQuickNote = "正片扫描模式：管线跳过印相阶段，本项不参与成像"
@@ -1194,14 +1715,16 @@ struct MExportSheet: View {
     let onReturnHome: () -> Void
     /// 相册写入是后台静默的，失败时用调用方的 toast 说明「文件已在 App 内」。
     var onNote: (String) -> Void = { _ in }
-    let onExport: (Int, Int, Double, @escaping (Result<URL, Error>) -> Void) -> Void
+    let onExport: (Int, Int, Double, Bool, @escaping (Result<URL, Error>) -> Void) -> Void
 
-    /// 指针指向 `formats` 的下标；默认 JPEG，和参考图一致。
-    @State private var formatIndex = 0
+    /// 指针指向 `formats` 的下标；初始值来自设置里的默认导出格式。
+    @State private var formatIndex = MobileSettings.defaultExportFormatIndex
     /// 0 最大可用尺寸、1 2048、2 4096。
-    @State private var edgeIndex = 0
+    @State private var edgeIndex = MobileSettings.defaultExportEdgeIndex
     /// 0 100%、1 95%、2 90%、3 80%。
-    @State private var qualityIndex = 1
+    @State private var qualityIndex = MobileSettings.defaultExportQualityIndex
+    /// 本次导出是否合成水印；初始值跟随设置里的水印开关。
+    @State private var addWatermark = MWatermarkStore.load().enabled
     @State private var showMore = false
     @State private var phase: MExportPhase = .idle
     /// 完成对勾的入场动画开关。
@@ -1230,7 +1753,7 @@ struct MExportSheet: View {
     ]
     private let qualityValues = [100, 95, 90, 80]
 
-    private var format: Format { formats[min(formatIndex, formats.count - 1)] }
+    private var format: Format { formats[min(max(formatIndex, 0), formats.count - 1)] }
     private var isJPEG: Bool { format.id == 3 }
 
     /// 居中浮卡：收窄成小窗，左右留白更足。
@@ -1396,6 +1919,7 @@ struct MExportSheet: View {
             field("文件类型") { formatField }
             field("尺寸") { edgeField }
             field("图像品质") { qualityField }
+            watermarkOption
 
             hairline
 
@@ -1507,6 +2031,29 @@ struct MExportSheet: View {
             .accessibilityLabel("图像品质")
             .accessibilityValue("无损")
         }
+    }
+
+    /// 单次导出的水印开关：取消勾选就不合成水印，其余参数仍走设置里的水印配置。
+    private var watermarkOption: some View {
+        Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) { addWatermark.toggle() }
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: addWatermark ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(addWatermark ? MColor.brass : MColor.text3)
+                Text("添加水印")
+                    .font(.mSans(12.5, .medium))
+                    .foregroundStyle(MColor.text1)
+                Spacer(minLength: 0)
+            }
+            .frame(height: 30)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("添加水印")
+        .accessibilityValue(addWatermark ? "开启" : "关闭")
     }
 
     private var moreOptions: some View {
@@ -1653,7 +2200,7 @@ struct MExportSheet: View {
         donePop = false
         withAnimation(MMotion.state) { phase = .exporting }
         let quality = isJPEG ? Double(qualityValues[min(qualityIndex, qualityValues.count - 1)]) / 100 : 0.95
-        onExport(format.id, edgeIndex, quality) { result in
+        onExport(format.id, edgeIndex, quality, addWatermark) { result in
             switch result {
             case .success(let url):
                 // 默认保存到相册：成功不打扰，失败/被拒时必须告诉用户文件还在 App 内。
