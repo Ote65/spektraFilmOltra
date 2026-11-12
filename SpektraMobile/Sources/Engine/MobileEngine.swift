@@ -48,6 +48,8 @@ final class MobileEngine: ObservableObject {
     private let thumbnailQueue = DispatchQueue(label: "spektra.mobile.thumb", qos: .utility)
     /// 相册刷新令牌：切换筛选或重复触发时只认最后一次结果，避免旧扫描覆盖新列表。
     private var assetRefreshToken = 0
+    /// 上次成功映射的相册快照：冷启动先出列表，再后台刷新。
+    private var snapshotURL: URL { store.root.appendingPathComponent("album-snapshot.json") }
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -97,7 +99,9 @@ final class MobileEngine: ObservableObject {
     /// 其余按用户相簿取图。不做逐张 EXIF 扫描，切筛选不额外读盘。
     /// 主页打开就调这个：不需要先「导入」，相册里的照片直接可浏览。
     func refreshAssets() async {
-        assetPhase = .scanning
+        // 冷启动先用上次的相册快照秒开，再后台刷新；扫描期间列表不会空着。
+        let restored = restoreSnapshotIfNeeded()
+        assetPhase = restored ? .ready : .scanning
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         guard status == .authorized || status == .limited else {
             assets = []
@@ -133,7 +137,69 @@ final class MobileEngine: ObservableObject {
             )
         }
         assetPhase = .ready
+        if case .all = scope {
+            saveSnapshot(scanned)
+        }
         NSLog("MAssets scope=%@ count=%d", String(describing: scope), assets.count)
+    }
+
+    // MARK: - 相册快照
+
+    private struct AlbumSnapshot: Codable {
+        let id: String
+        let filename: String
+        let isRaw: Bool
+    }
+
+    /// 冷启动恢复：读上次的资产 id 列表，一次性按 id 取回 PHAsset，列表立即可见。
+    /// 只用于「全部」，其余相簿由用户点选后现取；快照不在时退回正常加载。
+    private func restoreSnapshotIfNeeded() -> Bool {
+        guard assets.isEmpty, case .all = scope else { return false }
+        guard let data = try? Data(contentsOf: snapshotURL),
+              let list = try? JSONDecoder().decode([AlbumSnapshot].self, from: data) else {
+            return false
+        }
+        let allowNonRaw = MobileSettings.allowNonRaw
+        let usable = list.filter { allowNonRaw || $0.isRaw }
+        guard !usable.isEmpty else { return false }
+
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: usable.map(\.id), options: nil)
+        var byID: [String: PHAsset] = [:]
+        fetched.enumerateObjects { asset, _, _ in byID[asset.localIdentifier] = asset }
+
+        let byName = Dictionary(
+            store.photos.map { ($0.filename, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let restored: [MLibraryAsset] = usable.compactMap { item in
+            guard let asset = byID[item.id] else { return nil }
+            return MLibraryAsset(id: item.id, filename: item.filename,
+                                 photo: byName[item.filename].map(makePhoto), phAsset: asset)
+        }
+        guard !restored.isEmpty else { return false }
+        for item in restored {
+            if let asset = item.phAsset { phAssetByFilename[item.filename] = asset }
+        }
+        assets = restored
+        return true
+    }
+
+    /// 刷新成功后落盘，供下次冷启动秒开；只写资产 id / 文件名 / 是否 RAW。
+    private func saveSnapshot(_ scanned: [(asset: PHAsset, filename: String)]) {
+        let list = scanned.map { item in
+            AlbumSnapshot(
+                id: item.asset.localIdentifier,
+                filename: item.filename,
+                isRaw: ImageLoader.rawSuffixes.contains(
+                    (item.filename as NSString).pathExtension.lowercased()
+                )
+            )
+        }
+        let url = snapshotURL
+        DispatchQueue.global(qos: .utility).async {
+            guard let data = try? JSONEncoder().encode(list) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     /// 用户相簿列表 + 系统 RAW 智能相簿是否可用。
