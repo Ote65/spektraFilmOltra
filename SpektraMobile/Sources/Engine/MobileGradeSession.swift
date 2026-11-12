@@ -79,7 +79,6 @@ final class MobileGradeSession: ObservableObject {
     private var borderFlag: MCancelFlag?
     private var displayRecipe = MGradeRecipe()
     private var lutPath = ""
-    private var token = 0
     private var exportToken = 0
     private var activeFlag: MCancelFlag?
     private var pendingProxy: DispatchWorkItem?
@@ -269,7 +268,6 @@ final class MobileGradeSession: ObservableObject {
         let flag = MCancelFlag()
         geometryFlag = flag
 
-        token += 1
         pendingProxy?.cancel()
         pendingSettle?.cancel()
         proxyInFlight = false
@@ -332,7 +330,6 @@ final class MobileGradeSession: ObservableObject {
     }
 
     func cancel() {
-        token += 1
         exportToken += 1
         borderFlag?.cancel()
         geometryFlag?.cancel()
@@ -517,7 +514,7 @@ final class MobileGradeSession: ObservableObject {
             render(edge: fullEdge)
             return
         }
-        if proxyInFlight { token += 1; proxyInFlight = false }
+        if proxyInFlight { proxyInFlight = false }
         let proxy = DispatchWorkItem { [weak self] in
             self?.pendingProxy = nil
             self?.render(edge: self?.proxyEdge ?? 800)
@@ -536,7 +533,6 @@ final class MobileGradeSession: ObservableObject {
 
     private func render(edge: Int) {
         guard let source else { return }
-        token += 1
         activeFlag?.cancel()
         let flag = MCancelFlag()
         activeFlag = flag

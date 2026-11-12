@@ -34,6 +34,7 @@
 		56BDD01F0E81CDF015A16C5B /* Pipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = E837A5B6BCC4EF6247B82F1E /* Pipeline.swift */; };
 		5E4A3B27AE8A660896679EE6 /* MobileComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFEB333890C0D09618141435 /* MobileComponents.swift */; };
 		6067EE188061AFA44AE6E30E /* DevelopScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */; };
+		F2A1B2C3D4E5F60718293A01 /* MExportSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2A1B2C3D4E5F60718293A02 /* MExportSheet.swift */; };
 		F1B0A0013C0DE00000000001 /* FilmBorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1B0A0013C0DE00000000002 /* FilmBorder.swift */; };
 		B1B2C3D4E5F60718293A4B5C /* MPhotoGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* MPhotoGeometry.swift */; };
 		D1B2C3D4E5F60718293A4B5C /* MCropEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1B2C3D4E5F60718293A4B5C /* MCropEditor.swift */; };
@@ -139,6 +140,7 @@
 		B4A98B5FBB4BA3757AD44EA7 /* OutputGamutCompression.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutputGamutCompression.swift; sourceTree = "<group>"; };
 		B84279495D880B2B631AB477 /* ExportQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExportQueue.swift; sourceTree = "<group>"; };
 		BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DevelopScreen.swift; sourceTree = "<group>"; };
+		F2A1B2C3D4E5F60718293A02 /* MExportSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MExportSheet.swift; sourceTree = "<group>"; };
 		C0A755E3FD7A42CA434C6E5F /* GradeScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GradeScreen.swift; sourceTree = "<group>"; };
 		C1965CCCE0DCDCBCB5EE37DD /* CAM16UCS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CAM16UCS.swift; sourceTree = "<group>"; };
 		C4EBA2C45F380D5D15A5583D /* GradePresets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GradePresets.swift; sourceTree = "<group>"; };
@@ -236,6 +238,7 @@
 			children = (
 				CA5E000000000000000000A1 /* CameraScreen.swift */,
 				BB9EC39E3B7DED120B8165C2 /* DevelopScreen.swift */,
+				F2A1B2C3D4E5F60718293A02 /* MExportSheet.swift */,
 				C0A755E3FD7A42CA434C6E5F /* GradeScreen.swift */,
 				C1B2C3D4E5F60718293A4B5C /* MCropEditor.swift */,
 				2B4C8A0F0875D1B13367B022 /* HomeScreen.swift */,
@@ -505,6 +508,7 @@
 				B1F1844E5A0D0DF73D7DA492 /* Couplers.swift in Sources */,
 				479BF1DB2F0862CDED0BC5B1 /* DensityCurves.swift in Sources */,
 				6067EE188061AFA44AE6E30E /* DevelopScreen.swift in Sources */,
+				F2A1B2C3D4E5F60718293A01 /* MExportSheet.swift in Sources */,
 				75D7E3F0059FD29F1BAD0143 /* DiffusionFilter.swift in Sources */,
 				45FCEDAE5628666BC572EED9 /* EnlargerService.swift in Sources */,
 				E63D9F51151E34A940A70A22 /* ExportQueue.swift in Sources */,

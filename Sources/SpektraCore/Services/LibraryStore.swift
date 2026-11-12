@@ -103,7 +103,9 @@ struct LibraryPhoto: Codable, Identifiable, Hashable {
 }
 
 /// 照片库：索引持久化 + 原图拷贝 + 缩略图路径。
-final class LibraryStore {
+/// `stageImport` / `writeThumbnailFile` 只做文件读写，不触碰 `photos`，可在后台线程调用；
+/// `photos` 的读写仍然由拥有线程（移动端为主线程）负责。
+final class LibraryStore: @unchecked Sendable {
     private(set) var photos: [LibraryPhoto] = []
     let root: URL
     private let ioQueue = DispatchQueue(label: "spektrafilm.library.io", qos: .utility)
@@ -161,6 +163,10 @@ final class LibraryStore {
     /// 参数类更新：先快照，再异步写索引。主线程不再做 JSON 编码与磁盘 IO，
     /// 拖动滑条时每 0.7 秒一次的落盘不会再卡住手势。
     /// 异步写与 `save()` 共用 `ioQueue`，因此调用顺序就是落盘顺序。
+    func saveAsync() {
+        persistIndexAsync()
+    }
+
     private func persistIndexAsync() {
         let snapshot = photos
         let url = indexURL
@@ -205,6 +211,8 @@ final class LibraryStore {
         let height: Int
         let colorSpace: String
         let cctfDecoding: Bool
+        /// 相机内写入 RAW 的曝光补偿，入库时恢复，保证显影台与相册观感一致。
+        let exposureBias: Double
     }
 
     /// 允许入库的扩展名：默认仅 RAW；打开「支持 JPEG」后放行所有可显影的编码图
@@ -226,6 +234,7 @@ final class LibraryStore {
         }
         let detected = ImageLoader.detectColorSpace(url: source)
         let dimensions = Self.pixelSize(url: source)
+        let bias = ImageLoader.capturedExposureBias(url: source)
         let id = UUID().uuidString
         let copiedFile = originalsURL.appendingPathComponent("\(id).\(ext)")
         try FileManager.default.copyItem(at: source, to: copiedFile)
@@ -236,12 +245,14 @@ final class LibraryStore {
                             width: dimensions.width,
                             height: dimensions.height,
                             colorSpace: detected.space,
-                            cctfDecoding: detected.cctfDecoding)
+                            cctfDecoding: detected.cctfDecoding,
+                            exposureBias: bias)
     }
 
     /// 提交 `stageImport` 的产物：查重、追加到库并落盘。必须在库的拥有线程（主线程）调用。
+    /// `persist == false` 用于批量导入：由调用方在整批结束后统一 `save()` 一次。
     @discardableResult
-    func commitImport(_ staged: StagedImport) throws -> LibraryPhoto {
+    func commitImport(_ staged: StagedImport, persist: Bool = true) throws -> LibraryPhoto {
         // 同名 + 同尺寸视为同一张：重复导入不再产生副本（相册选取与验收脚本都会重复触发）。
         if let existing = photos.first(where: {
             $0.filename == staged.filename
@@ -253,6 +264,11 @@ final class LibraryStore {
         var edit = PhotoEdit()
         edit.io.inputColorSpace = staged.colorSpace
         edit.io.inputCCTFDecoding = staged.cctfDecoding
+        // 相机内调过的曝光已写进 RAW 的感光数据；显影管线的自动曝光会把它归一化掉，
+        // 这里把拍摄时的补偿读回来重新施加，让显影台与导出和相册观感一致。
+        if abs(staged.exposureBias) > 0.01 {
+            edit.camera.exposureCompensationEV = staged.exposureBias
+        }
         let photo = LibraryPhoto(
             id: staged.id,
             filename: staged.filename,
@@ -267,7 +283,7 @@ final class LibraryStore {
             initialEditData: try? JSONEncoder().encode(edit)
         )
         photos.append(photo)
-        try save()
+        if persist { try save() }
         return photo
     }
 
@@ -336,11 +352,24 @@ final class LibraryStore {
     }
 
     func writeThumbnail(id: String, image: ImageRGB) throws {
-        guard let index = photos.firstIndex(where: { $0.id == id }) else { return }
+        guard let photo = photos.first(where: { $0.id == id }) else { return }
+        let path = try writeThumbnailFile(
+            id: id, image: image, colorSpace: photo.edit.io.outputColorSpace)
+        commitThumbnail(id: id, relativePath: path)
+    }
+
+    /// 后台写缩略图文件：只做编码与磁盘写入，不读写 `photos`，可在任意线程调用。
+    /// 返回相对路径，调用方需在主线程调用 `commitThumbnail` 更新索引。
+    func writeThumbnailFile(id: String, image: ImageRGB, colorSpace: String) throws -> String {
         let url = thumbnailsURL.appendingPathComponent("\(id).png")
-        try ImageExport.save(image, to: url, bitDepth: 8,
-                             colorSpace: photos[index].edit.io.outputColorSpace)
-        photos[index].thumbnailPath = "Thumbnails/\(id).png"
+        try ImageExport.save(image, to: url, bitDepth: 8, colorSpace: colorSpace)
+        return "Thumbnails/\(id).png"
+    }
+
+    /// 在主线程把后台写好的缩略图路径写回库。
+    func commitThumbnail(id: String, relativePath: String) {
+        guard let index = photos.firstIndex(where: { $0.id == id }) else { return }
+        photos[index].thumbnailPath = relativePath
         persistIndexAsync()
     }
 

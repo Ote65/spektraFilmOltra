@@ -397,7 +397,7 @@ struct HomeScreen: View {
                     Image(systemName: "square.grid.2x2")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(MColor.text3)
-                    Text("全部 · \(visibleAssets.count)")
+                    Text("\(currentScopeTitle) · \(visibleAssets.count)")
                         .font(.mSans(10, .medium))
                         .foregroundStyle(MColor.text3)
                 }
@@ -578,12 +578,22 @@ struct HomeScreen: View {
     private func deleteSelected() {
         let assets = selectedAssets
         guard !assets.isEmpty else { return }
-        let assetIDs = assets.map(\.id)
-        let photoIDs = assets.compactMap { $0.photo?.id }
+        // 只存在于 App 库、尚未映射到系统相册的条目直接删库内记录；
+        // 其余走系统相册删除，成功后再清库内副本。
+        let libraryOnly = assets.filter { $0.phAsset == nil }
+        let albumAssets = assets.filter { $0.phAsset != nil }
         Task {
-            let count = await engine.deleteAssets(assetIDs: assetIDs, photoIDs: photoIDs)
-            if count > 0 {
-                onToast("已删除 \(count) 张")
+            for asset in libraryOnly {
+                if let photoID = asset.photo?.id {
+                    engine.remove(photoID: photoID)
+                }
+            }
+            let count = albumAssets.isEmpty ? 0 : await engine.deleteAssets(
+                assetIDs: albumAssets.map(\.id),
+                photoIDs: albumAssets.compactMap { $0.photo?.id })
+            let removed = count + libraryOnly.count
+            if removed > 0 {
+                onToast("已删除 \(removed) 张")
                 exitSelection()
             } else {
                 onToast("未删除照片")
@@ -917,32 +927,36 @@ struct HomeScreen: View {
         case .success(let urls):
             guard !urls.isEmpty else { return }
             let allowed = importableSuffixes
-            var files: [URL] = []
-            var scoped: [URL] = []
-            for url in urls {
-                if url.startAccessingSecurityScopedResource() { scoped.append(url) }
-                var isDirectory: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
-                    continue
-                }
-                if isDirectory.boolValue {
-                    files.append(contentsOf: Self.photoFiles(in: url, allowed: allowed))
-                } else if allowed.contains(url.pathExtension.lowercased()) {
-                    files.append(url)
-                }
-            }
-            defer { for url in scoped { url.stopAccessingSecurityScopedResource() } }
-            guard !files.isEmpty else {
-                onToast(MobileSettings.allowNonRaw
-                        ? "选中的位置里没有可导入的照片"
-                        : "选中的位置里没有 RAW 文件")
-                return
-            }
-            let report = engine.importPhotos(files)
             let unit = MobileSettings.allowNonRaw ? "张照片" : "张 RAW"
-            onToast(report.imported > 0
-                    ? "已导入 \(report.imported) \(unit)"
-                    : (report.reason.isEmpty ? "导入失败" : report.reason))
+            Task {
+                var files: [URL] = []
+                var scoped: [URL] = []
+                for url in urls {
+                    if url.startAccessingSecurityScopedResource() { scoped.append(url) }
+                    var isDirectory: ObjCBool = false
+                    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                        continue
+                    }
+                    if isDirectory.boolValue {
+                        files.append(contentsOf: Self.photoFiles(in: url, allowed: allowed))
+                    } else if allowed.contains(url.pathExtension.lowercased()) {
+                        files.append(url)
+                    }
+                }
+                // 安全作用域必须活到入库完成：目录里枚举出的子文件 URL 依赖父目录授权。
+                defer { for url in scoped { url.stopAccessingSecurityScopedResource() } }
+                guard !files.isEmpty else {
+                    onToast(MobileSettings.allowNonRaw
+                            ? "选中的位置里没有可导入的照片"
+                            : "选中的位置里没有 RAW 文件")
+                    return
+                }
+                // 复制与头部探测在后台执行，避免整批 RAW 阻塞主页交互。
+                let report = await engine.importPhotos(files)
+                onToast(report.imported > 0
+                        ? "已导入 \(report.imported) \(unit)"
+                        : (report.reason.isEmpty ? "导入失败" : report.reason))
+            }
         }
     }
 
@@ -1022,9 +1036,10 @@ struct HomeScreen: View {
 
     private func thumbnail(_ photo: MPhoto, width: CGFloat, height: CGFloat) -> some View {
         ZStack {
-            Rectangle().fill(MColor.surface2)
-            if let image = MPhotoImage.load(photo) {
-                image.resizable().scaledToFill()
+            if let url = photo.thumbnailURL {
+                MPhotoThumbnail(url: url)
+            } else {
+                Rectangle().fill(MColor.surface2)
             }
         }
         .frame(width: width, height: height)
@@ -1108,10 +1123,8 @@ private struct MPhotoCard: View {
             ZStack(alignment: .topLeading) {
                 Rectangle().fill(MColor.surface2)
 
-                if let photo = asset.photo, let image = MPhotoImage.load(photo) {
-                    image
-                        .resizable()
-                        .scaledToFill()
+                if let photo = asset.photo, let thumbURL = photo.thumbnailURL {
+                    MPhotoThumbnail(url: thumbURL)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
                 } else if let phAsset = asset.phAsset {
@@ -1246,6 +1259,7 @@ private struct MAssetThumb: View {
 
     @State private var image: UIImage?
     @State private var requested = false
+    @State private var requestID: PHImageRequestID?
 
     var body: some View {
         ZStack {
@@ -1257,6 +1271,14 @@ private struct MAssetThumb: View {
             }
         }
         .onAppear(perform: request)
+        .onDisappear {
+            // 格子滚出屏幕或离开主页时停止请求，iCloud 下载也不再继续。
+            if let requestID {
+                PHImageManager.default().cancelImageRequest(requestID)
+                self.requestID = nil
+            }
+            requested = false
+        }
     }
 
     private func request() {
@@ -1266,14 +1288,17 @@ private struct MAssetThumb: View {
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
-        PHImageManager.default().requestImage(
+        requestID = PHImageManager.default().requestImage(
             for: asset,
             targetSize: CGSize(width: 360, height: 360),
             contentMode: .aspectFill,
             options: options
         ) { result, _ in
             guard let result else { return }
-            DispatchQueue.main.async { image = result }
+            DispatchQueue.main.async {
+                guard requested else { return }
+                image = result
+            }
         }
     }
 }

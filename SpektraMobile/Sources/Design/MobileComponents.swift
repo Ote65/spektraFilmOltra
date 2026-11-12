@@ -2009,6 +2009,113 @@ struct MTickRuler: View {
     }
 }
 
+// MARK: - 画布状态机
+
+/// 显影台与调色台共用的画布状态：缩放、平移、纯预览与双指锚点。
+/// 只保存状态并做纯计算；触摸识别由 `MCanvasGestureLayer` 负责。
+/// 两个页面通过小的转发属性读取 `zoom/pan/chromeHidden/showOriginal`，避免各自复制一份实现。
+@MainActor
+final class MCanvasState: ObservableObject {
+    @Published var showOriginal = false
+    @Published var zoom: CGFloat = DebugLaunch.canvasZoom
+    @Published var pan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
+    @Published var chromeHidden = false
+
+    private var savedZoom: CGFloat = 1
+    private var savedPan: CGSize = .zero
+    private var canvasTouchedWhileHidden = false
+    private var pinchBaseZoom: CGFloat = 1
+    private var pinchBasePan: CGSize = .zero
+    private var pinchAnchorOffset: CGSize = .zero
+    private var dragBasePan: CGSize = .zero
+
+    /// 纯预览里动过画布：回到带 UI 时不恢复进入前的缩放 / 位移。
+    func markCanvasInteraction() {
+        guard chromeHidden else { return }
+        canvasTouchedWhileHidden = true
+    }
+
+    /// 单击切换纯预览：隐去 UI 时照片回到居中整幅，再点回来恢复原状态。
+    func toggleChrome() {
+        if chromeHidden {
+            withAnimation(MMotion.canvas) {
+                chromeHidden = false
+                if !canvasTouchedWhileHidden {
+                    zoom = savedZoom
+                    pan = savedPan
+                }
+            }
+        } else {
+            savedZoom = zoom
+            savedPan = pan
+            canvasTouchedWhileHidden = false
+            withAnimation(MMotion.canvas) {
+                chromeHidden = true
+                zoom = 1
+                pan = .zero
+            }
+        }
+    }
+
+    /// 双击切换：默认倍率下以点击点为锚放大，已放大则回到默认状态。
+    func doubleTapped(at point: CGPoint, stageCenter: CGPoint, hiddenCenterOffsetY: CGFloat) {
+        MHaptic.light()
+        markCanvasInteraction()
+        if zoom > 1.001 {
+            withAnimation(MMotion.canvas) {
+                zoom = 1
+                pan = .zero
+            }
+            return
+        }
+        let target: CGFloat = 2.2
+        let anchor = CGPoint(x: point.x - stageCenter.x,
+                             y: point.y - stageCenter.y - hiddenCenterOffsetY)
+        let scale = target / max(zoom, 0.001)
+        withAnimation(MMotion.canvas) {
+            zoom = target
+            pan = CGSize(
+                width: pan.width * scale + anchor.x * (1 - scale),
+                height: pan.height * scale + anchor.y * (1 - scale))
+        }
+    }
+
+    /// 双指按下：记录基线，之后缩放与整体位移一起生效。
+    func pinchBegan(at point: CGPoint, stageCenter: CGPoint, hiddenCenterOffsetY: CGFloat) {
+        pinchBaseZoom = zoom
+        pinchBasePan = pan
+        pinchAnchorOffset = CGSize(
+            width: point.x - stageCenter.x,
+            height: point.y - stageCenter.y - hiddenCenterOffsetY)
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
+    /// 双指更新：缩放倍率和双指整体位移是两个独立信号，必须分别接。
+    func pinchChanged(scale: CGFloat, translation: CGSize) {
+        let next = min(4, max(0.5, pinchBaseZoom * scale))
+        let ratio = pinchBaseZoom > 0 ? next / pinchBaseZoom : 1
+        zoom = next
+        pan = CGSize(
+            width: pinchBasePan.width + pinchAnchorOffset.width * (1 - ratio)
+                + translation.width,
+            height: pinchBasePan.height + pinchAnchorOffset.height * (1 - ratio)
+                + translation.height)
+    }
+
+    func panBegan() {
+        dragBasePan = pan
+        withAnimation(MMotion.quick) { showOriginal = false }
+        markCanvasInteraction()
+    }
+
+    func panChanged(translation: CGSize) {
+        pan = CGSize(
+            width: dragBasePan.width + translation.width,
+            height: dragBasePan.height + translation.height)
+    }
+}
+
 // MARK: - 画布手势层
 
 /// 用 UIKit 识别器接管预览画布：

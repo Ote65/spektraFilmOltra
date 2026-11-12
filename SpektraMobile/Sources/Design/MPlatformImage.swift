@@ -56,22 +56,57 @@ final class MThumbnailCache {
     }
 
     func image(for url: URL) -> MPlatformImage? {
-        let key = url.path as NSString
-        lock.lock()
-        let hit = cache.object(forKey: key)
-        lock.unlock()
-        if let hit { return hit }
+        if let hit = cachedImage(for: url) { return hit }
         guard let image = MImage.load(url: url) else { return nil }
         lock.lock()
-        cache.setObject(image, forKey: key, cost: 512 * 512 * 4)
+        cache.setObject(image, forKey: url.path as NSString, cost: 512 * 512 * 4)
         lock.unlock()
         return image
+    }
+
+    /// 只查缓存，不触发读盘：供视图在异步加载前判断是否已有可用图。
+    func cachedImage(for url: URL) -> MPlatformImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache.object(forKey: url.path as NSString)
     }
 
     func remove(path: String) {
         lock.lock()
         cache.removeObject(forKey: path as NSString)
         lock.unlock()
+    }
+}
+
+/// 库内缩略图：缓存命中直接显示，未命中的磁盘解码放到后台，避免在视图求值里同步读盘。
+struct MPhotoThumbnail: View {
+    let url: URL
+
+    @State private var image: MPlatformImage?
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(MColor.surface2)
+            if let image {
+                MImage.swiftUI(image)
+                    .resizable()
+                    .scaledToFill()
+            }
+        }
+        .task(id: url) { await load() }
+    }
+
+    private func load() async {
+        if let cached = MThumbnailCache.shared.cachedImage(for: url) {
+            image = cached
+            return
+        }
+        image = nil
+        let loaded = await Task.detached(priority: .utility) {
+            MThumbnailCache.shared.image(for: url)
+        }.value
+        guard !Task.isCancelled else { return }
+        image = loaded
     }
 }
 

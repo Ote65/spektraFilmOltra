@@ -234,14 +234,21 @@ struct MobileRootView: View {
     }
 
     /// 拍完 → 入库 → 直接进入这张照片的显影台；导入失败才退回主页。
+    /// 入库会把原片写进相册（与主页相册映射一致），成功后清理相机临时文件。
     private func openCaptured(_ url: URL) {
-        let report = engine.importPhotos([url])
-        guard let photoID = report.firstID else {
-            closeCamera()
-            showToast(report.reason.isEmpty ? "拍摄的照片没能入库" : report.reason)
-            return
+        Task {
+            let report = await engine.importPhotos([url])
+            guard let photoID = report.firstID else {
+                showToast(report.reason.isEmpty ? "拍摄的照片没能入库" : report.reason)
+                // 只有仍停留在拍摄页时才退回主页，避免失败回调把用户从其他页面拽走。
+                if screen == .camera { closeCamera() }
+                return
+            }
+            try? FileManager.default.removeItem(at: url)
+            // 入库期间用户可能已经关掉相机：此时只保留入库结果，不再强行跳页。
+            guard screen == .camera else { return }
+            openDevelop(photoID)
         }
-        openDevelop(photoID)
     }
 
     private func openDevelop(_ photoID: String) {
@@ -289,15 +296,27 @@ struct MobileRootView: View {
         engine.closeGrade()
         withAnimation(MMotion.push) {
             grade = engine.openGrade(photoID: photoID, entry: gradeEntry)
+            // 换图后旧的显影会话仍属于上一张，不能再作为返回目标；回主页重新进入。
+            if gradeReturn == .develop {
+                engine.closeDevelop()
+                develop = nil
+                gradeReturn = .home
+            }
         }
     }
 
     private func closeGrade() {
         engine.closeGrade()
         resetFlight()
+        let target = gradeReturn
         withAnimation(MMotion.push) {
             grade = nil
-            screen = gradeReturn
+            // 分栏换图后返回主页时，旧的显影会话也要一并关闭，避免后台继续持有。
+            if target != .develop, develop != nil {
+                engine.closeDevelop()
+                develop = nil
+            }
+            screen = target
         }
     }
 

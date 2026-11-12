@@ -2500,11 +2500,15 @@ enum MFilmBorderRenderer {
 
 enum MFilmBorderThumbnailCache {
     private static var cache: [String: MPlatformImage] = [:]
+    private static let lock = NSLock()
 
     static func image(for preset: MFilmBorderPreset,
                       size: CGSize = CGSize(width: 112, height: 82)) -> MPlatformImage? {
         let key = "\(preset.id)-\(Int(size.width))x\(Int(size.height))"
-        if let hit = cache[key] { return hit }
+        lock.lock()
+        let hit = cache[key]
+        lock.unlock()
+        if let hit { return hit }
         // 取样图按该幅面的宽高比裁，卡片上能直接看出方格 / 半格 / 宽幅的差别。
         let aspect = preset.config.gaugeValue.frameAspect
         let sampleWidth = aspect >= 1 ? 96 : max(40, Int((96 * aspect).rounded()))
@@ -2525,7 +2529,9 @@ enum MFilmBorderThumbnailCache {
         }
         guard let rendered else { return nil }
         let image = MImage.make(cgImage: rendered)
+        lock.lock()
         cache[key] = image
+        lock.unlock()
         return image
     }
 }
@@ -2537,6 +2543,8 @@ struct MFilmBorderPresetCard: View {
     let selected: Bool
     let action: () -> Void
 
+    @State private var thumbnail: MPlatformImage?
+
     var body: some View {
         Button {
             MHaptic.light()
@@ -2547,8 +2555,8 @@ struct MFilmBorderPresetCard: View {
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                         .fill(MColor.surface2)
 
-                    if let image = MFilmBorderThumbnailCache.image(for: preset) {
-                        MImage.swiftUI(image)
+                    if let thumbnail {
+                        MImage.swiftUI(thumbnail)
                             .resizable()
                             .interpolation(.high)
                             .scaledToFit()
@@ -2574,6 +2582,15 @@ struct MFilmBorderPresetCard: View {
         .buttonStyle(MPressStyle(scale: 0.95))
         .accessibilityLabel(preset.name)
         .accessibilityAddTraits(selected ? [.isSelected] : [])
+        // 片边缩略图合成较耗时，放到后台，避免首次打开边框面板时在视图求值里阻塞主线程。
+        .task(id: preset.id) {
+            guard thumbnail == nil else { return }
+            let image = await Task.detached(priority: .utility) {
+                MFilmBorderThumbnailCache.image(for: preset)
+            }.value
+            guard !Task.isCancelled else { return }
+            thumbnail = image
+        }
     }
 }
 

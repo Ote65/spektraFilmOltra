@@ -46,8 +46,15 @@ final class MobileEngine: ObservableObject {
     private var phAssetByFilename: [String: PHAsset] = [:]
 
     private let thumbnailQueue = DispatchQueue(label: "spektra.mobile.thumb", qos: .utility)
+    /// 导入准备（文件复制 + 头部探测）在后台串行执行，主线程只提交结果。
+    nonisolated private static let importQueue = DispatchQueue(
+        label: "spektra.mobile.import", qos: .userInitiated)
     /// 相册刷新令牌：切换筛选或重复触发时只认最后一次结果，避免旧扫描覆盖新列表。
     private var assetRefreshToken = 0
+    /// 缩略图连续写回时的合并刷新任务。
+    private var refreshWork: DispatchWorkItem?
+    /// 只为调色临时创建的显影会话；关闭调色台时必须一并取消。
+    private var transientDevelopSession: MobileDevelopSession?
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -60,12 +67,17 @@ final class MobileEngine: ObservableObject {
 
     /// 验收脚本用：`--import <绝对路径>` 在启动时把指定 RAW 入库，省掉手工点「导入」。
     /// 只在显式传入该参数时生效，Release 构建也保留（自动化截图需要）。
+    /// 这条路径必须同步完成，后续截图才会拿到库内照片；只在显式调试参数下执行。
     private func importDebugFileIfNeeded() {
         let args = ProcessInfo.processInfo.arguments
         guard let index = args.firstIndex(of: "--import"), args.indices.contains(index + 1) else { return }
         let path = args[index + 1]
         guard FileManager.default.fileExists(atPath: path) else { return }
-        _ = importPhotos([URL(fileURLWithPath: path)])
+        guard let photo = try? store.importPhoto(
+            from: URL(fileURLWithPath: path), allowingEncoded: MobileSettings.allowNonRaw
+        ) else { return }
+        generateThumbnail(for: photo)
+        refreshPhotos()
     }
 
     // MARK: - 照片库
@@ -131,6 +143,19 @@ final class MobileEngine: ObservableObject {
                 photo: byName[item.filename].map(makePhoto),
                 phAsset: item.asset
             )
+        }
+        // 兜底：已入库但还没出现在相册里的照片（例如导入后相册写入尚未完成）也要可见。
+        // 只在「全部」合并，避免收藏 / RAW / 相簿范围出现相册以外的条目。
+        // 用过滤后的 photos（跟随「支持 JPEG」开关），不能直接用 store.photos。
+        if case .all = scope {
+            let mapped = Set(assets.map(\.filename))
+            let extras = photos
+                .filter { !mapped.contains($0.filename) }
+                .map {
+                    MLibraryAsset(id: $0.id, filename: $0.filename,
+                                  photo: $0, phAsset: nil)
+                }
+            assets.insert(contentsOf: extras, at: 0)
         }
         assetPhase = .ready
         NSLog("MAssets scope=%@ count=%d", String(describing: scope), assets.count)
@@ -236,7 +261,8 @@ final class MobileEngine: ObservableObject {
         guard (try? FileManager.default.moveItem(at: url, to: named)) != nil else { return nil }
         defer { try? FileManager.default.removeItem(at: named) }
 
-        let report = importPhotos([named])
+        // 这张照片本来就来自系统相册，入库即可，不要再写回相册制造副本。
+        let report = await importPhotos([named], publishToAlbum: false)
         return report.firstID
     }
 
@@ -304,31 +330,116 @@ final class MobileEngine: ObservableObject {
             ?? encoded.first
     }
 
+    /// 导入照片：文件复制与头部探测在后台串行完成，主线程只提交库状态与刷新列表。
+    /// 新入库的原片随后异步写进系统相册（`publishToAlbum`），主页按相册映射才能看到它们。
     @discardableResult
-    func importPhotos(_ urls: [URL]) -> ImportReport {
+    func importPhotos(_ urls: [URL], publishToAlbum: Bool = true) async -> ImportReport {
         var report = ImportReport()
+        guard !urls.isEmpty else { return report }
         isImporting = true
-        for url in urls {
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            do {
-                let photo = try store.importPhoto(from: url,
-                                                  allowingEncoded: MobileSettings.allowNonRaw)
-                report.imported += 1
-                report.firstID = report.firstID ?? photo.id
-                generateThumbnail(for: photo)
-            } catch {
+        defer { isImporting = false }
+
+        let allowingEncoded = MobileSettings.allowNonRaw
+        let store = self.store
+        let staged = await Self.stageImports(
+            urls, allowingEncoded: allowingEncoded, store: store)
+        var imported: [LibraryPhoto] = []
+        // 只有真正新增的库内记录才写相册；重复导入同名照片不会再产生相册副本。
+        let knownIDs = Set(store.photos.map(\.id))
+        var publishedIDs = Set<String>()
+        for item in staged {
+            switch item.result {
+            case .success(let value):
+                do {
+                    let photo = try store.commitImport(value, persist: false)
+                    report.imported += 1
+                    report.firstID = report.firstID ?? photo.id
+                    if !knownIDs.contains(photo.id), publishedIDs.insert(photo.id).inserted {
+                        imported.append(photo)
+                    }
+                    generateThumbnail(for: photo)
+                } catch {
+                    report.rejected += 1
+                    if report.reason.isEmpty {
+                        report.reason = "\(item.url.lastPathComponent)：\(error.localizedDescription)"
+                    }
+                }
+            case .failure(let error):
                 report.rejected += 1
                 if report.reason.isEmpty {
-                    report.reason = "\(url.lastPathComponent)：\((error as NSError).localizedDescription)"
+                    report.reason = "\(item.url.lastPathComponent)：\((error as NSError).localizedDescription)"
                 }
-                NSLog("MImport rejected %@ — %@", url.lastPathComponent,
+                NSLog("MImport rejected %@ — %@", item.url.lastPathComponent,
                       (error as NSError).localizedDescription)
             }
         }
-        isImporting = false
+        if report.imported > 0 {
+            // 整批只落盘一次；索引用异步快照，主线程不做 JSON 编码与磁盘 IO。
+            store.saveAsync()
+        }
         refreshPhotos()
+        if publishToAlbum {
+            publishImportsToAlbum(imported)
+        }
         return report
+    }
+
+    /// 后台准备导入：只做复制与探测，不触碰库状态。
+    private nonisolated static func stageImports(
+        _ urls: [URL], allowingEncoded: Bool, store: LibraryStore
+    ) async -> [(url: URL, result: Result<LibraryStore.StagedImport, Error>)] {
+        await withCheckedContinuation { continuation in
+            importQueue.async {
+                var results: [(URL, Result<LibraryStore.StagedImport, Error>)] = []
+                for url in urls {
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    let result = Result {
+                        try store.stageImport(from: url, allowingEncoded: allowingEncoded)
+                    }
+                    if scoped { url.stopAccessingSecurityScopedResource() }
+                    results.append((url, result))
+                }
+                continuation.resume(returning: results)
+            }
+        }
+    }
+
+    /// 把新导入的原片写进系统相册。主页只映射相册，不写相册就等于「导入后看不见」。
+    /// 相册权限被拒时静默跳过，库内记录与缩略图仍然保留。
+    private func publishImportsToAlbum(_ imported: [LibraryPhoto]) {
+        guard !imported.isEmpty else { return }
+        let store = self.store
+        Task { [weak self] in
+            guard let self else { return }
+            for photo in imported {
+                let source = store.originalURL(for: photo)
+                let filename = photo.filename
+                guard let temp = await Task.detached(priority: .utility, operation: {
+                    Self.prepareAlbumFile(source: source, filename: filename)
+                }).value else { continue }
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    PhotoLibraryExport.save(temp) { _ in
+                        try? FileManager.default.removeItem(at: temp.deletingLastPathComponent())
+                        continuation.resume()
+                    }
+                }
+            }
+            await self.refreshAssets()
+        }
+    }
+
+    /// 相册写入要求文件名保持原样，主页按 originalFilename 把资产映射回库内记录。
+    /// 每个文件放在独立临时目录里，避免并发导入同名文件时互相覆盖。
+    private nonisolated static func prepareAlbumFile(source: URL, filename: String) -> URL? {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let temp = folder.appendingPathComponent(filename)
+        guard (try? FileManager.default.copyItem(at: source, to: temp)) != nil else {
+            try? FileManager.default.removeItem(at: folder)
+            return nil
+        }
+        return temp
     }
 
     func remove(photoID: String) {
@@ -482,11 +593,11 @@ final class MobileEngine: ObservableObject {
     private func generateThumbnail(for photo: LibraryPhoto) {
         guard photo.thumbnailPath == nil else { return }
         let id = photo.id
+        let store = self.store
         let url = store.originalURL(for: photo)
         let edit = photo.edit
         let options = edit.rawDecoderOptions()
-        thumbnailQueue.async { [weak self] in
-            guard let self else { return }
+        thumbnailQueue.async { [weak self, store] in
             guard let loaded = try? ImageLoader.load(url: url, maxSize: 320, rawOptions: options,
                                                      rotationTurns: edit.rotationTurns,
                                                      allowEncoded: true),
@@ -502,11 +613,26 @@ final class MobileEngine: ObservableObject {
                     return Vec3(value, value, value)
                 }
             }
+            // PNG 编码与写盘留在后台队列；主线程只写回路径并做一次合并刷新。
+            let path = try? store.writeThumbnailFile(
+                id: id, image: output, colorSpace: edit.io.outputColorSpace)
             Task { @MainActor in
-                try? self.store.writeThumbnail(id: id, image: output)
-                self.refreshPhotos()
+                guard let self, let path else { return }
+                self.store.commitThumbnail(id: id, relativePath: path)
+                self.refreshPhotosSoon()
             }
         }
+    }
+
+    /// 批量补缩略图时避免每张都全量重建主页列表。
+    private func refreshPhotosSoon() {
+        refreshWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.refreshWork = nil
+            self?.refreshPhotos()
+        }
+        refreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
     // MARK: - 显影会话
@@ -514,6 +640,8 @@ final class MobileEngine: ObservableObject {
     @discardableResult
     func openDevelop(photoID: String) -> MobileDevelopSession? {
         guard let photo = store.photos.first(where: { $0.id == photoID }) else { return nil }
+        transientDevelopSession?.cancel()
+        transientDevelopSession = nil
         developSession?.cancel()
         let session = MobileDevelopSession(photo: photo, store: store)
         session.onPersist = { [weak self] _ in self?.refreshPhotos() }
@@ -556,13 +684,18 @@ final class MobileEngine: ObservableObject {
         guard let photo = store.photos.first(where: { $0.id == photoID }) else { return nil }
         let develop: MobileDevelopSession
         if let current = developSession, current.photoID == photoID {
+            transientDevelopSession?.cancel()
+            transientDevelopSession = nil
             develop = current
             current.finish()
         } else {
-            develop = MobileDevelopSession(photo: photo, store: store)
+            let temp = MobileDevelopSession(photo: photo, store: store)
             if entry != .direct {
-                develop.start()
+                temp.start()
             }
+            transientDevelopSession?.cancel()
+            transientDevelopSession = temp
+            develop = temp
         }
         let grade = MobileGradeSession(
             photo: photo, store: store, develop: develop,
@@ -579,5 +712,8 @@ final class MobileEngine: ObservableObject {
     func closeGrade() {
         gradeSession?.cancel()
         gradeSession = nil
+        // 分栏胶片条换图产生的临时显影会话不归 developSession 管，必须在这里收尾。
+        transientDevelopSession?.cancel()
+        transientDevelopSession = nil
     }
 }

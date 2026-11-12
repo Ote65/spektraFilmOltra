@@ -405,10 +405,3 @@ enum MHaptic {
 }
 
 // MARK: - 图片
-
-enum MPhotoImage {
-    static func load(_ photo: MPhoto) -> Image? {
-        guard let url = photo.thumbnailURL, let image = MImage.thumbnail(url: url) else { return nil }
-        return MImage.swiftUI(image)
-    }
-}

@@ -490,15 +490,11 @@ struct CameraScreen: View {
         camera.capture()
     }
 
-    /// 拍完直接入库并跳到显影台；相册写入在后台继续，成功后删临时文件。
+    /// 拍完交给根视图异步入库；入库完成后由根视图删除临时文件，
+    /// 相册写入也由引擎在入库后统一处理，避免两边争抢同一个临时文件。
     private func handleShot() {
         guard let shot = camera.lastShot else { return }
         onCaptured(shot.url)
-        PhotoLibraryExport.save(shot.url) { outcome in
-            if case .saved = outcome {
-                try? FileManager.default.removeItem(at: shot.url)
-            }
-        }
     }
 
     private func mark(at point: CGPoint) {

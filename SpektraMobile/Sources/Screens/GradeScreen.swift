@@ -39,21 +39,26 @@ struct GradeScreen: View {
     @State private var cardRadius: CGFloat = 2
     @State private var imageRevealed = false
 
-    @State private var showOriginal = false
-    @State private var zoom: CGFloat = DebugLaunch.canvasZoom
+    /// 画布状态（缩放 / 平移 / 纯预览）与显影台共用同一套实现。
+    @StateObject private var canvas = MCanvasState()
+    private var showOriginal: Bool {
+        get { canvas.showOriginal }
+        nonmutating set { canvas.showOriginal = newValue }
+    }
+    private var zoom: CGFloat {
+        get { canvas.zoom }
+        nonmutating set { canvas.zoom = newValue }
+    }
     /// 点击照片进入纯预览：顶栏、抽屉、底栏全部隐去，照片移到整屏中心。
-    @State private var chromeHidden = false
+    private var chromeHidden: Bool {
+        get { canvas.chromeHidden }
+        nonmutating set { canvas.chromeHidden = newValue }
+    }
     /// 自由画布：平移不再受倍率限制。
-    @State private var pan: CGSize = CGSize(width: 0, height: DebugLaunch.canvasPanY)
-    /// 进入纯预览前的画布状态；回来时恢复（纯预览里动过画布就不恢复）。
-    @State private var savedZoom: CGFloat = 1
-    @State private var savedPan: CGSize = .zero
-    @State private var canvasTouchedWhileHidden = false
-    /// 捏合缩放：锚在双指中心，双指的整体位移同时转成平移。
-    @State private var pinchBaseZoom: CGFloat = 1
-    @State private var pinchBasePan: CGSize = .zero
-    @State private var pinchAnchorOffset: CGSize = .zero
-    @State private var dragBasePan: CGSize = .zero
+    private var pan: CGSize {
+        get { canvas.pan }
+        nonmutating set { canvas.pan = newValue }
+    }
 
     /// 曲线默认没有任何控制点，恒等曲线；用户点击曲线才新增点。
     @State private var curvePoints: [CGPoint] = []
@@ -394,9 +399,10 @@ struct GradeScreen: View {
                             onSwitchPhoto(photo.id)
                         } label: {
                             ZStack {
-                                Rectangle().fill(MColor.surface2)
-                                if let image = MPhotoImage.load(photo) {
-                                    image.resizable().scaledToFill()
+                                if let url = photo.thumbnailURL {
+                                    MPhotoThumbnail(url: url)
+                                } else {
+                                    Rectangle().fill(MColor.surface2)
                                 }
                             }
                             .frame(width: 64, height: 44)
@@ -493,92 +499,6 @@ struct GradeScreen: View {
         return insets.size.height / 2 - stageCenterY
     }
 
-    /// 纯预览里动过画布：回到带 UI 时不恢复进入前的缩放 / 位移。
-    private func markCanvasInteraction() {
-        guard chromeHidden else { return }
-        canvasTouchedWhileHidden = true
-    }
-
-    /// 单击切换纯预览：隐去 UI 时照片回到居中整幅，再点回来恢复原状态。
-    private func toggleChrome() {
-        if chromeHidden {
-            withAnimation(MMotion.canvas) {
-                chromeHidden = false
-                if !canvasTouchedWhileHidden {
-                    zoom = savedZoom
-                    pan = savedPan
-                }
-            }
-        } else {
-            savedZoom = zoom
-            savedPan = pan
-            canvasTouchedWhileHidden = false
-            withAnimation(MMotion.canvas) {
-                chromeHidden = true
-                zoom = 1
-                pan = .zero
-            }
-        }
-    }
-
-    /// 双击切换：默认倍率下以点击点为锚放大，已放大则回到默认状态。
-    private func doubleTapped(at point: CGPoint) {
-        MHaptic.light()
-        markCanvasInteraction()
-        if zoom > 1.001 {
-            withAnimation(MMotion.canvas) {
-                zoom = 1
-                pan = .zero
-            }
-            return
-        }
-        let target: CGFloat = 2.2
-        let anchor = CGPoint(x: point.x - stageCenter.x,
-                             y: point.y - stageCenter.y - hiddenCenterOffsetY)
-        let scale = target / max(zoom, 0.001)
-        withAnimation(MMotion.canvas) {
-            zoom = target
-            pan = CGSize(
-                width: pan.width * scale + anchor.x * (1 - scale),
-                height: pan.height * scale + anchor.y * (1 - scale))
-        }
-    }
-
-    /// 双指按下：记录基线，之后缩放与整体位移一起生效。
-    private func pinchBegan(at point: CGPoint) {
-        pinchBaseZoom = zoom
-        pinchBasePan = pan
-        pinchAnchorOffset = CGSize(
-            width: point.x - stageCenter.x,
-            height: point.y - stageCenter.y - hiddenCenterOffsetY)
-        withAnimation(MMotion.quick) { showOriginal = false }
-        markCanvasInteraction()
-    }
-
-    /// 双指更新：缩放倍率和双指整体位移是两个独立信号，必须分别接。
-    /// 之前从捏合手势的 location 推平移，手指整体移动时 location 不动，
-    /// 结果就是只能缩放、不能平移。
-    private func pinchChanged(scale: CGFloat, translation: CGSize) {
-        let next = min(4, max(0.5, pinchBaseZoom * scale))
-        let ratio = pinchBaseZoom > 0 ? next / pinchBaseZoom : 1
-        zoom = next
-        pan = CGSize(
-            width: pinchBasePan.width + pinchAnchorOffset.width * (1 - ratio)
-                + translation.width,
-            height: pinchBasePan.height + pinchAnchorOffset.height * (1 - ratio)
-                + translation.height)
-    }
-
-    private func pinchEnded() {
-        // 松手不再改动画布：位置和倍率由用户决定，双击才回默认。
-    }
-
-    private func panBegan() {
-        dragBasePan = pan
-        withAnimation(MMotion.quick) { showOriginal = false }
-        markCanvasInteraction()
-    }
-
     // MARK: - 顶栏
 
     private var navigationBar: some View {
@@ -662,19 +582,25 @@ struct GradeScreen: View {
             MCanvasGestureLayer(
                 onTap: {
                     MHaptic.light()
-                    toggleChrome()
+                    canvas.toggleChrome()
                 },
-                onDoubleTap: { point in doubleTapped(at: point) },
-                onMultiTouchBegin: { point in pinchBegan(at: point) },
+                onDoubleTap: { point in
+                    canvas.doubleTapped(
+                        at: point, stageCenter: stageCenter,
+                        hiddenCenterOffsetY: hiddenCenterOffsetY)
+                },
+                onMultiTouchBegin: { point in
+                    canvas.pinchBegan(
+                        at: point, stageCenter: stageCenter,
+                        hiddenCenterOffsetY: hiddenCenterOffsetY)
+                },
                 onMultiTouchChange: { scale, translation in
-                    pinchChanged(scale: scale, translation: translation)
+                    canvas.pinchChanged(scale: scale, translation: translation)
                 },
-                onMultiTouchEnd: { pinchEnded() },
-                onPanBegin: { panBegan() },
+                onMultiTouchEnd: {},
+                onPanBegin: { canvas.panBegan() },
                 onPanChange: { translation in
-                    pan = CGSize(
-                        width: dragBasePan.width + translation.width,
-                        height: dragBasePan.height + translation.height)
+                    canvas.panChanged(translation: translation)
                 },
                 onPanEnd: {},
                 onLongPress: { pressed in
@@ -713,7 +639,7 @@ struct GradeScreen: View {
 
                     Button {
                         MHaptic.tick()
-                        markCanvasInteraction()
+                        canvas.markCanvasInteraction()
                         withAnimation(MMotion.canvas) {
                             if abs(zoom - 1) > 0.001 {
                                 zoom = 1
