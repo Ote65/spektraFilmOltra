@@ -652,17 +652,26 @@ struct MFilmBorderConfig: Codable, Hashable {
 // MARK: - 片边记忆
 
 /// 片边参数的跨照片 / 跨启动记忆：
-/// 只记样式参数；片边开关启动时一律关闭，做旧效果也不参与记忆。
+/// 只记样式参数与片边开关；做旧效果不参与记忆。
 enum MFilmBorderMemory {
     private static let key = "mobile.border.memory"
+    /// 进程内是否已经做过「启动默认关闭」：只对冷启动的第一张照片生效，
+    /// 之后换照片按上一次的开关状态恢复，否则每次换图都像恢复默认。
+    private static var appliedLaunchDefault = false
 
-    /// 记忆快照：强制关闭片边与做旧，其余参数原样保留。
+    /// 记忆快照：保留片边开关，做旧一律归零。
     static func remembered(_ config: MFilmBorderConfig) -> MFilmBorderConfig {
         var value = config.normalized()
-        value.enabled = false
         value.scratches = 0
         value.dust = 0
         value.fog = 0
+        return value
+    }
+
+    /// 冷启动默认：片边关闭，其余参数保留，供用户再次打开片边时恢复。
+    static func launchDefault(_ config: MFilmBorderConfig) -> MFilmBorderConfig {
+        var value = remembered(config)
+        value.enabled = false
         return value
     }
 
@@ -670,7 +679,16 @@ enum MFilmBorderMemory {
         guard let data = UserDefaults.standard.data(forKey: key),
               let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data)
         else { return nil }
-        return remembered(decoded)
+        let value = remembered(decoded)
+        guard appliedLaunchDefault else {
+            appliedLaunchDefault = true
+            // 冷启动首张照片强制关闭片边，并写回记忆：
+            // 同一次运行里再打开第二张照片时不会又继承到上一轮的开关状态。
+            let coldStart = launchDefault(value)
+            save(coldStart)
+            return coldStart
+        }
+        return value
     }
 
     static func save(_ config: MFilmBorderConfig) {

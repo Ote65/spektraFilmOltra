@@ -114,8 +114,8 @@ final class MobileGradeSession: ObservableObject {
             self.border = remembered
         } else if let data = photo.borderData,
                   let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
-            // 旧版本按照片保存：迁移成记忆参数，但片边开关与做旧归零。
-            self.border = MFilmBorderMemory.remembered(decoded)
+            // 旧版本按照片保存：迁移成记忆参数，片边开关按启动默认关闭。
+            self.border = MFilmBorderMemory.launchDefault(decoded)
         }
         if let data = photo.cropData,
            let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
@@ -331,6 +331,11 @@ final class MobileGradeSession: ObservableObject {
 
     func cancel() {
         exportToken += 1
+        // 关掉页面或换照片时把还在防抖里的片边参数立刻落盘，
+        // 否则刚调完就切图会丢掉最后一次改动。
+        borderPersistWork?.cancel()
+        borderPersistWork = nil
+        persistBorderNow()
         borderFlag?.cancel()
         geometryFlag?.cancel()
         pendingProxy?.cancel()
