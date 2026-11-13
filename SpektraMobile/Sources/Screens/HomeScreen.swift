@@ -96,7 +96,9 @@ struct HomeScreen: View {
             Task { await engine.refreshAssets(force: true) }
         }
         .onChange(of: allowNonRaw) { _, _ in
-            // 设置里切换「支持 JPEG」后按新范围重新映射，当前选中的相簿保持不变。
+            // 设置里切换「支持 JPEG」后按新范围重新映射；关闭时「拍摄/保存」
+            // 筛选已没有入口，先把当前范围回落到全部。
+            engine.resetOriginScopeIfNeeded()
             engine.refreshPhotos()
             Task { await engine.refreshAssets(force: true) }
         }
@@ -604,11 +606,8 @@ struct HomeScreen: View {
         let libraryOnly = assets.filter { $0.phAsset == nil }
         let albumAssets = assets.filter { $0.phAsset != nil }
         Task {
-            for asset in libraryOnly {
-                if let photoID = asset.photo?.id {
-                    engine.remove(photoID: photoID)
-                }
-            }
+            // 仅库内的条目一次批量删除：只落盘一次，不逐张整库编码。
+            engine.remove(photoIDs: libraryOnly.compactMap { $0.photo?.id })
             let count = albumAssets.isEmpty ? 0 : await engine.deleteAssets(
                 assetIDs: albumAssets.map(\.id),
                 photoIDs: albumAssets.compactMap { $0.photo?.id })

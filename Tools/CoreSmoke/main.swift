@@ -45,6 +45,39 @@ struct CoreSmoke {
         log("scalar interp max diff \(interpReport)")
         let libraryReport = try runLibraryIndexOrderingSmoke()
         log("library index ordering \(libraryReport)")
+        let rawSize = try runRawDimensionSmoke()
+        log("raw dimension \(rawSize)")
+    }
+
+    /// 回归：iOS ImageIO 会把部分 ARW 的 index 0 报成内嵌预览（1616×1080）。
+    /// pixelSize 必须扫描 TIFF SubIFD，取真实的全尺寸（构造 6000×4000 的最小 TIFF）。
+    private static func runRawDimensionSmoke() throws -> String {
+        var data = Data()
+        data.append(contentsOf: [0x49, 0x49, 0x2A, 0x00])
+        data.append(contentsOf: [0x08, 0x00, 0x00, 0x00])
+        // IFD0：一个 SubIFDs 指针，SubIFD 从 26 开始。
+        data.append(contentsOf: [0x01, 0x00])
+        data.append(contentsOf: [0x4A, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00,
+                                 0x1A, 0x00, 0x00, 0x00])
+        data.append(contentsOf: [0x00, 0x00, 0x00, 0x00])
+        // SubIFD：ImageWidth 6000、ImageLength 4000。
+        data.append(contentsOf: [0x02, 0x00])
+        data.append(contentsOf: [0x00, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00,
+                                 0x70, 0x17, 0x00, 0x00])
+        data.append(contentsOf: [0x01, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00,
+                                 0xA0, 0x0F, 0x00, 0x00])
+        data.append(contentsOf: [0x00, 0x00, 0x00, 0x00])
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("spektra-raw-size-\(UUID().uuidString).dng")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try data.write(to: url)
+        let size = LibraryStore.pixelSize(url: url)
+        guard size.width == 6000, size.height == 4000 else {
+            throw NSError(domain: "smoke", code: 8, userInfo: [
+                NSLocalizedDescriptionKey: "RAW TIFF dimension probe returned \(size)"
+            ])
+        }
+        return "\(size.width)x\(size.height)"
     }
 
     /// 回归：标量轴 interp1D 的倒数缓冲只有 count-1 项，lerp 不能按 3 通道步长取下标。
@@ -139,6 +172,25 @@ struct CoreSmoke {
         guard afterRemove.count == 1, !afterRemove.contains(where: { $0.id == first.id }) else {
             throw NSError(domain: "smoke", code: 5, userInfo: [
                 NSLocalizedDescriptionKey: "remove kept stale entry"
+            ])
+        }
+
+        // 批量删除：一次落盘移除多条，索引与磁盘原图都不应残留。
+        let thirdURL = URL(fileURLWithPath: "/tmp/spektra_core_smoke_source3.dng")
+        let fourthURL = URL(fileURLWithPath: "/tmp/spektra_core_smoke_source4.dng")
+        try bytes.write(to: thirdURL)
+        try bytes.write(to: fourthURL)
+        let third = try store.importPhoto(from: thirdURL)
+        let fourth = try store.importPhoto(from: fourthURL)
+        try store.remove(ids: [third.id, fourth.id])
+        let afterBatch = try JSONDecoder().decode(
+            [LibraryPhoto].self, from: try Data(contentsOf: indexURL))
+        guard afterBatch.count == 1,
+              !afterBatch.contains(where: { $0.id == third.id || $0.id == fourth.id }),
+              !FileManager.default.fileExists(atPath: store.originalURL(for: third).path),
+              !FileManager.default.fileExists(atPath: store.originalURL(for: fourth).path) else {
+            throw NSError(domain: "smoke", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "batch remove left stale entry or file"
             ])
         }
         return decoded.count

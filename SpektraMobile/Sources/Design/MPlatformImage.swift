@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import CoreGraphics
 
@@ -49,6 +50,8 @@ final class MThumbnailCache {
 
     private let cache = NSCache<NSString, MPlatformImage>()
     private let lock = NSLock()
+    /// 同一 URL 的并发加载合并：后到的调用等前一个解码完成，直接取缓存。
+    private var inFlight: [String: DispatchGroup] = [:]
 
     init() {
         cache.countLimit = 240
@@ -56,12 +59,48 @@ final class MThumbnailCache {
     }
 
     func image(for url: URL) -> MPlatformImage? {
-        if let hit = cachedImage(for: url) { return hit }
-        guard let image = MImage.load(url: url) else { return nil }
+        let key = url.path
         lock.lock()
-        cache.setObject(image, forKey: url.path as NSString, cost: 512 * 512 * 4)
+        if let hit = cache.object(forKey: key as NSString) {
+            lock.unlock()
+            return hit
+        }
+        if let group = inFlight[key] {
+            // 已有相同 URL 在解码：释放锁后等待，避免在锁内阻塞。
+            lock.unlock()
+            group.wait()
+            lock.lock()
+            defer { lock.unlock() }
+            return cache.object(forKey: key as NSString)
+        }
+        let group = DispatchGroup()
+        group.enter()
+        inFlight[key] = group
         lock.unlock()
+
+        let image = MImage.load(url: url)
+
+        lock.lock()
+        if let image {
+            cache.setObject(image, forKey: key as NSString, cost: Self.cost(of: image))
+        }
+        inFlight.removeValue(forKey: key)
+        lock.unlock()
+        group.leave()
         return image
+    }
+
+    /// 按图像实际像素尺寸记账：缩略图实际约 320 px，固定按 512² 记账会
+    /// 提前挤爆 64 MB 上限，滚动回来又要重新解码。
+    private static func cost(of image: MPlatformImage) -> Int {
+        #if os(macOS)
+        let width = Int(image.size.width.rounded())
+        let height = Int(image.size.height.rounded())
+        #else
+        let width = image.cgImage?.width ?? Int(image.size.width * image.scale)
+        let height = image.cgImage?.height ?? Int(image.size.height * image.scale)
+        #endif
+        return max(1, width * height * 4)
     }
 
     /// 只查缓存，不触发读盘：供视图在异步加载前判断是否已有可用图。

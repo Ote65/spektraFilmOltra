@@ -127,7 +127,11 @@ final class MobileDevelopSession: ObservableObject {
             (photo.filename as NSString).pathExtension.lowercased()
         )
         self.store = store
-        self.originalLongEdge = max(photo.width, photo.height)
+        // 旧版本的库记录可能把 ARW 的内嵌预览尺寸当成原图尺寸（如 1616×1080）。
+        // 这里直接读 RAW 头，取库记录与真实尺寸的较大值，已有照片也能恢复全分辨率导出。
+        let storedEdge = max(photo.width, photo.height)
+        let probed = LibraryStore.pixelSize(url: store.originalURL(for: photo))
+        self.originalLongEdge = max(storedEdge, max(probed.width, probed.height))
         let saved = UserDefaults.standard.double(forKey: Self.previewScaleKey)
         self.previewScale = saved >= 0.125 && saved <= 1.0 ? saved : 0.25
         self.edit = photo.edit
@@ -623,7 +627,8 @@ final class MobileDevelopSession: ObservableObject {
             return
         }
         // “原始”必须用库里记录的原图像素尺寸，而不是预览缓冲的 1600 长边。
-        // 原始档不做静默降采样；只有 2048/4096 这类显式档位才按内存余量钳位。
+        // 但原始档同样可能超过前台内存预算（48 MP ProRAW 峰值可达数 GB），
+        // 因此所有档位都按可用内存钳位，实际尺寸通过 exportLabel 明确告诉用户。
         let originalEdge = originalLongEdge > 0 ? originalLongEdge : max(image.width, image.height)
         let requested = ExportEdge.resolve(index: longEdgeIndex, originalLongEdge: originalEdge)
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
@@ -793,26 +798,31 @@ final class MobileDevelopSession: ObservableObject {
         let options = rawOptions()
         let rotation = edit.rotationTurns
         loadQueue.async {
-            guard let loaded = try? ImageLoader.load(
+            guard var loaded = try? ImageLoader.load(
                 url: url, maxSize: maxEdge, rawOptions: options,
                 rotationTurns: rotation, allowEncoded: true) else {
                 completion(nil)
                 return
             }
-            // RAW 解码结果已经是线性 ProPhoto；JPEG / HEIC 等编码图要按 ICC 与 CCTF 转过去。
+            // 先取走像素再清空 loaded 的引用：mapInPlace 写回时才是独占缓冲，
+            // 不会因为 COW 再分配第二份全尺寸图像（48 MP 下省掉约 0.6 GB）。
             var output = loaded.image
+            loaded.image = ImageRGB(width: 0, height: 0)
+            // RAW 解码结果已经是线性 ProPhoto；JPEG / HEIC 等编码图要按 ICC 与 CCTF 转过去。
             if loaded.colorSpace != "ProPhoto RGB" || loaded.cctfDecoding {
                 let kind = ColorMath.cctfKind(for: loaded.colorSpace)
-                output = loaded.image.map { rgb in
+                let needsDecode = loaded.cctfDecoding
+                let sourceSpace = loaded.colorSpace
+                output.mapInPlace { rgb in
                     var linear = rgb
-                    if loaded.cctfDecoding {
+                    if needsDecode {
                         linear = Vec3(
                             ColorMath.cctfDecode(rgb.x, kind: kind),
                             ColorMath.cctfDecode(rgb.y, kind: kind),
                             ColorMath.cctfDecode(rgb.z, kind: kind)
                         )
                     }
-                    return ColorMath.rgbToRGB(linear, from: loaded.colorSpace, to: "ProPhoto RGB")
+                    return ColorMath.rgbToRGB(linear, from: sourceSpace, to: "ProPhoto RGB")
                 }
             }
             completion(output)
@@ -841,11 +851,15 @@ final class MobileDevelopSession: ObservableObject {
         guard var params = try? edit.runtimeParams(), !params.io.scanFilm else { return }
         params.io.inputColorSpace = inputColorSpace
         params.io.inputCCTFDecoding = inputCCTF
-        let key = PreviewLUTService.cacheKey(
-            edit: edit, inputColorSpace: inputColorSpace, inputCCTF: inputCCTF)
+        // 缓存键要编码整份 PhotoEdit，必须放到 lutQueue 计算，不能占主线程。
+        let editSnapshot = edit
+        let inputSpace = inputColorSpace
+        let inputCCTF = inputCCTF
         let service = lutService
         let resolution = fastResolution
         lutQueue.asyncAfter(deadline: .now() + 0.3) {
+            let key = PreviewLUTService.cacheKey(
+                edit: editSnapshot, inputColorSpace: inputSpace, inputCCTF: inputCCTF)
             _ = service.bundle(for: params, key: key, resolution: resolution)
         }
     }
@@ -970,8 +984,10 @@ final class MobileDevelopSession: ObservableObject {
         guard let image, var params = try? edit.runtimeParams(), !params.io.scanFilm else { return }
         params.io.inputColorSpace = inputColorSpace
         params.io.inputCCTFDecoding = inputCCTF
-        let key = PreviewLUTService.cacheKey(
-            edit: edit, inputColorSpace: inputColorSpace, inputCCTF: inputCCTF)
+        // 缓存键会编码整份 PhotoEdit；拖动时每秒可触发数十次，必须在 lutQueue 上算。
+        let editSnapshot = edit
+        let inputSpace = inputColorSpace
+        let inputCCTF = inputCCTF
         let source = PreviewRenderer.prepared(image, maxSize: fastPreviewEdge)
         let service = lutService
         let token = fastToken
@@ -982,6 +998,8 @@ final class MobileDevelopSession: ObservableObject {
         fastInFlight = true
         fastDirty = false
         lutQueue.async { [weak self] in
+            let key = PreviewLUTService.cacheKey(
+                edit: editSnapshot, inputColorSpace: inputSpace, inputCCTF: inputCCTF)
             guard let bundle = service.bundle(
                 for: params, key: key, resolution: resolution
             ) else {
@@ -1491,8 +1509,9 @@ enum ExportEdge {
 
     static func resolve(index: Int, originalLongEdge: Int) -> Int {
         let edge = requested(index: index, originalLongEdge: originalLongEdge)
-        // 「原始」是用户的明确选择：只按真实原图尺寸导出，不允许静默缩小。
-        return index == 0 ? edge : clampToMemoryBudget(edge)
+        // 原始档也必须钳位：48 MP 级原片按 119 B/px 的全流程峰值会超过前台预算，
+        // 直接按原尺寸导出会被系统 jetsam。调用方负责把实际尺寸展示给用户。
+        return clampToMemoryBudget(edge)
     }
 
     /// 用户选定的档位换算成长边，不做内存钳位。
@@ -1513,6 +1532,8 @@ enum ExportEdge {
         let maxEdge = Int(sqrt(budget / (0.75 * bytesPerPixelFootprint)))
         guard maxEdge > 0 else { return edge }
         // 不要钳到 1/2 以下：宁可让系统去回收，也不要导出到几乎不可用的尺寸。
-        return max(1024, min(edge, maxEdge))
+        // 但也不能把小于 1024 的原图反向放大，所以下限取 min(edge, 1024)。
+        let floorEdge = min(edge, 1024)
+        return max(floorEdge, min(edge, maxEdge))
     }
 }
