@@ -51,6 +51,10 @@ struct MLibraryAsset: Identifiable, Hashable {
     let photo: MPhoto?
     /// 相册资产本体：未入库时靠它取相册缩略图，入库时取原片。
     let phAsset: PHAsset?
+    /// 相机拍摄（RAW/Live/人像/全景/相机 EXIF）；false 表示保存、截图或下载。
+    var isCaptured: Bool = true
+    /// 仅靠文件名/子类型无法确定来源，等待 EXIF 精修。
+    var captureNeedsProbe: Bool = false
 
     var isImported: Bool { photo != nil }
     var isGraded: Bool { photo?.isGraded ?? false }
@@ -82,6 +86,10 @@ struct MLibraryAsset: Identifiable, Hashable {
 /// 主页顶部的类型筛选：全部 / 收藏 / RAW / 已调色 / 某个系统相簿。
 enum MAssetScope: Hashable {
     case all
+    /// 相机拍摄：RAW / Live / 人像 / 全景 / 相机 EXIF。
+    case captured
+    /// 保存：截图、网页下载、聊天保存、AirDrop 等非拍摄来源。
+    case saved
     case favorites
     case raw
     case graded
@@ -90,11 +98,18 @@ enum MAssetScope: Hashable {
     var title: String {
         switch self {
         case .all: return "全部"
+        case .captured: return "拍摄"
+        case .saved: return "保存"
         case .favorites: return "收藏"
         case .raw: return "RAW"
         case .graded: return "已调色"
         case .album: return "相簿"
         }
+    }
+
+    /// 拍摄/保存是「全部」之上的来源过滤，需要先拿到完整相册列表。
+    var isOriginFilter: Bool {
+        self == .captured || self == .saved
     }
 }
 
@@ -102,6 +117,110 @@ enum MAssetScope: Hashable {
 struct MAlbum: Identifiable, Hashable {
     let id: String
     let title: String
+}
+
+/// 主页允许出现的格式：RAW / JPEG / HEIC(HEIF)。PNG、GIF、WebP、TIFF 一律不进筛选。
+enum MAssetFormat {
+    static func isAllowed(filename: String, isRaw: Bool) -> Bool {
+        if isRaw { return true }
+        switch (filename as NSString).pathExtension.lowercased() {
+        case "jpg", "jpeg", "heic", "heif": return true
+        default: return false
+        }
+    }
+
+    static func isAllowed(originalPath: String) -> Bool {
+        let ext = (originalPath as NSString).pathExtension.lowercased()
+        if ImageLoader.rawSuffixes.contains(ext) { return true }
+        switch ext {
+        case "jpg", "jpeg", "heic", "heif": return true
+        default: return false
+        }
+    }
+}
+
+/// 相册来源分类：先用零额外 IO 的信号给出结论，模糊项标记出来交给 EXIF 精修。
+enum MCaptureClassifier {
+    struct Verdict {
+        let isCaptured: Bool
+        let confident: Bool
+    }
+
+    private static let cameraSizes: Set<String> = [
+        "4032x3024", "3024x4032", "4032x2268", "2268x4032",
+        "5712x4284", "4284x5712", "8064x6048", "6048x8064",
+    ]
+
+    /// 基于 PHAsset 的零 IO 判定：子类型与 RAW 直接给结论，其余交给文件名规则。
+    static func classify(asset: PHAsset, filename: String, isRaw: Bool) -> Verdict {
+        if isRaw { return Verdict(isCaptured: true, confident: true) }
+        let subtypes = asset.mediaSubtypes
+        if subtypes.contains(.photoScreenshot) {
+            return Verdict(isCaptured: false, confident: true)
+        }
+        if subtypes.contains(.photoLive)
+            || subtypes.contains(.photoPanorama)
+            || subtypes.contains(.photoDepthEffect) {
+            return Verdict(isCaptured: true, confident: true)
+        }
+        return classify(filename: filename, isRaw: false,
+                        pixelWidth: asset.pixelWidth, pixelHeight: asset.pixelHeight,
+                        preferSavedWhenUnknown: true)
+    }
+
+    static func classify(filename: String, isRaw: Bool) -> Verdict {
+        classify(filename: filename, isRaw: isRaw, pixelWidth: 0, pixelHeight: 0)
+    }
+
+    /// 文件名 + 扩展名 + 尺寸的规则；`confident == false` 时由上层按需读 EXIF。
+    /// `preferSavedWhenUnknown`：未知命名且非标准相机尺寸时先归到「保存」，避免网络图混进「拍摄」。
+    static func classify(filename: String, isRaw: Bool,
+                         pixelWidth: Int, pixelHeight: Int,
+                         preferSavedWhenUnknown: Bool = false) -> Verdict {
+        if isRaw { return Verdict(isCaptured: true, confident: true) }
+        let name = filename.lowercased()
+        let ext = (name as NSString).pathExtension
+        if ext == "gif" || ext == "webp" || ext == "bmp" {
+            return Verdict(isCaptured: false, confident: true)
+        }
+        if name.contains("screenshot") || name.contains("screen shot") || name.contains("截图") {
+            return Verdict(isCaptured: false, confident: true)
+        }
+        if name.contains("wx_camera") { return Verdict(isCaptured: true, confident: false) }
+        if name.contains("mmexport") || name.contains("wechat") || name.contains("download")
+            || name.contains("saved") || name.contains("img_copy") {
+            return Verdict(isCaptured: false, confident: true)
+        }
+        // iPhone 相机不产 PNG；相册里的 PNG 基本是截图或保存图。
+        if ext == "png" { return Verdict(isCaptured: false, confident: true) }
+        let base = (name as NSString).deletingPathExtension
+        if base.range(of: #"^[0-9a-f]{16,}"#, options: .regularExpression) != nil {
+            return Verdict(isCaptured: false, confident: true)
+        }
+        if base.range(of: #"^img_\d{4,5}$"#, options: .regularExpression) != nil {
+            if ext == "heic" || ext == "dng" || isStandardCameraSize(pixelWidth, pixelHeight) {
+                return Verdict(isCaptured: true, confident: true)
+            }
+            return Verdict(isCaptured: true, confident: false)
+        }
+        if base.range(
+            of: #"^(dsc|dscf|dscn|pxl|mvimg|gopr|dji|_mg|l100|p\d{7})[_-]?\d*$"#,
+            options: .regularExpression
+        ) != nil {
+            return Verdict(isCaptured: true, confident: true)
+        }
+        // 未知命名先看尺寸：标准相机尺寸更像拍摄，其余先归保存；两者都交给 EXIF 精修。
+        if preferSavedWhenUnknown {
+            return Verdict(isCaptured: isStandardCameraSize(pixelWidth, pixelHeight),
+                           confident: false)
+        }
+        // 本地库（已导入）未知命名按拍摄保留，避免把真照片藏起来。
+        return Verdict(isCaptured: true, confident: false)
+    }
+
+    private static func isStandardCameraSize(_ width: Int, _ height: Int) -> Bool {
+        width > 0 && height > 0 && cameraSizes.contains("\(width)x\(height)")
+    }
 }
 
 struct MFilm: Identifiable, Hashable {

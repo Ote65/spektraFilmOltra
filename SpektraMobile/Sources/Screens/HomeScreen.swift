@@ -46,8 +46,8 @@ struct HomeScreen: View {
                     .padding(.bottom, 106)
                 }
                 .scrollIndicators(.never)
-                // 下拉刷新＝重新扫描相册里的 RAW。
-                .refreshable { await engine.refreshAssets() }
+                // 下拉刷新＝强制重新扫描相册。
+                .refreshable { await engine.refreshAssets(force: true) }
             }
 
             if selecting {
@@ -90,14 +90,15 @@ struct HomeScreen: View {
             await engine.refreshAssets()
         }
         .onChange(of: scenePhase) { _, phase in
-            // 从后台回来（相册里可能刚多了照片）自动重新映射，不必手动下拉。
+            // 从后台回来必须强制重扫：应用挂起期间 PhotoKit 的变化回调可能不会送达，
+            // 只靠变更计数会命中缓存，导致相册里新加的照片一直不出现。
             guard phase == .active else { return }
-            Task { await engine.refreshAssets() }
+            Task { await engine.refreshAssets(force: true) }
         }
         .onChange(of: allowNonRaw) { _, _ in
             // 设置里切换「支持 JPEG」后按新范围重新映射，当前选中的相簿保持不变。
             engine.refreshPhotos()
-            Task { await engine.refreshAssets() }
+            Task { await engine.refreshAssets(force: true) }
         }
         .task {
             guard !didDebugOpen else { return }
@@ -302,8 +303,13 @@ struct HomeScreen: View {
     private var scopeChips: [ScopeChip] {
         var chips = [
             ScopeChip(id: "all", title: "全部", scope: .all),
-            ScopeChip(id: "favorites", title: "收藏", scope: .favorites),
         ]
+        // 拍摄/保存只在打开「支持 JPEG」后有意义；关闭时整库只有 RAW。
+        if allowNonRaw {
+            chips.append(ScopeChip(id: "captured", title: "拍摄", scope: .captured))
+            chips.append(ScopeChip(id: "saved", title: "保存", scope: .saved))
+        }
+        chips.append(ScopeChip(id: "favorites", title: "收藏", scope: .favorites))
         if engine.hasRawAlbum {
             chips.append(ScopeChip(id: "raw", title: "RAW", scope: .raw))
         }
@@ -321,6 +327,21 @@ struct HomeScreen: View {
     private var countUnit: String {
         if case .raw = engine.scope { return "RAW" }
         return allowNonRaw ? "照片" : "RAW"
+    }
+
+    private var emptyReadyTitle: String {
+        switch engine.scope {
+        case .captured: return "没有拍摄照片"
+        case .saved: return "没有保存的照片"
+        default: return allowNonRaw ? "相册里没有可显影的照片" : "相册里没有 RAW 照片"
+        }
+    }
+
+    private var emptyReadyHint: String {
+        switch engine.scope {
+        case .captured, .saved: return "可以切回「全部」查看整库"
+        default: return allowNonRaw ? "可以用「导入」从文件夹里挑照片" : "可以用「导入」从文件夹里挑 RAW"
+        }
     }
 
     private var sectionHead: some View {
@@ -897,10 +918,10 @@ struct HomeScreen: View {
                     Image(systemName: "photo.on.rectangle.angled")
                         .font(.system(size: 22, weight: .regular))
                         .foregroundStyle(MColor.text4)
-                    Text(allowNonRaw ? "相册里没有可显影的照片" : "相册里没有 RAW 照片")
+                    Text(emptyReadyTitle)
                         .font(.mSans(11.5, .medium))
                         .foregroundStyle(MColor.text2)
-                    Text(allowNonRaw ? "可以用「导入」从文件夹里挑照片" : "可以用「导入」从文件夹里挑 RAW")
+                    Text(emptyReadyHint)
                         .mMeta(10, color: MColor.text4)
                 }
             }
@@ -912,10 +933,12 @@ struct HomeScreen: View {
 
     // MARK: - 从文件夹导入
 
-    /// 可导入的扩展名：关闭「支持 JPEG」时仅 RAW，打开后放行所有可显影的编码图。
+    /// 可导入的扩展名：关闭「支持 JPEG」时仅 RAW；打开后只放行 JPEG / HEIC(HEIF)。
+    private static let allowedEncodedSuffixes: Set<String> = ["jpg", "jpeg", "heic", "heif"]
+
     private var importableSuffixes: Set<String> {
         MobileSettings.allowNonRaw
-            ? ImageLoader.rawSuffixes.union(ImageLoader.encodedSuffixes)
+            ? ImageLoader.rawSuffixes.union(Self.allowedEncodedSuffixes)
             : ImageLoader.rawSuffixes
     }
 
@@ -1253,6 +1276,16 @@ private struct MPhotoCard: View {
     }
 }
 
+/// 相册缩略图内存缓存：滚动回来或重进主页时不重复向 PhotoKit 取图。
+private enum MAssetThumbCache {
+    static let shared: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 400
+        cache.totalCostLimit = 64 * 1024 * 1024
+        return cache
+    }()
+}
+
 /// 相册缩略图（未入库的 RAW）。
 private struct MAssetThumb: View {
     let asset: PHAsset
@@ -1284,6 +1317,11 @@ private struct MAssetThumb: View {
     private func request() {
         guard !requested else { return }
         requested = true
+        let key = asset.localIdentifier as NSString
+        if let hit = MAssetThumbCache.shared.object(forKey: key) {
+            image = hit
+            return
+        }
         let options = PHImageRequestOptions()
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .fast
@@ -1293,11 +1331,16 @@ private struct MAssetThumb: View {
             targetSize: CGSize(width: 360, height: 360),
             contentMode: .aspectFill,
             options: options
-        ) { result, _ in
+        ) { result, info in
             guard let result else { return }
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
             DispatchQueue.main.async {
                 guard requested else { return }
                 image = result
+                if !degraded {
+                    MAssetThumbCache.shared.setObject(
+                        result, forKey: key, cost: 360 * 360 * 4)
+                }
             }
         }
     }
