@@ -8,6 +8,8 @@ struct LoadedImage {
     var colorSpace: String
     var cctfDecoding: Bool
     var isRaw: Bool
+    /// RAW 解码超时/失败后退回 ImageIO 预览。调用方可据此提示用户。
+    var usedFallback: Bool = false
 }
 
 /// 输入图像识别与解码。对齐 Python `spektrafilm_gui/input_color.py`：
@@ -63,12 +65,18 @@ enum ImageLoader {
     ///   常驻 290MB 的双精度缓冲；导出传 nil 才是全分辨率。
     /// - Parameter rawOptions: RAW 解码参数（白平衡/色温/色调/镜头校正）；非 RAW 忽略。
     /// - Parameter rotationTurns: 用户手动旋转，0–3 表示顺时针 90° 的倍数。
+    /// - Parameter rawTimeout: RAW 解码（含首次 MobileAsset 查询）超时秒数。
+    /// - Parameter allowPreviewFallback: RAW 超时/失败后是否允许退回 ImageIO 内嵌预览。
+    ///   预览可以降级，导出必须为 false，否则会把低分辨率预览当成成品写出去。
     static func load(url: URL, maxSize: Int? = nil,
                      rawOptions: RawDecoder.Options = RawDecoder.Options(),
                      rotationTurns: Int = 0,
-                     allowEncoded: Bool = false) throws -> LoadedImage {
+                     allowEncoded: Bool = false,
+                     rawTimeout: TimeInterval = 12,
+                     allowPreviewFallback: Bool = true) throws -> LoadedImage {
         var loaded = try decode(url: url, maxSize: maxSize, rawOptions: rawOptions,
-                                allowEncoded: allowEncoded)
+                                allowEncoded: allowEncoded, rawTimeout: rawTimeout,
+                                allowPreviewFallback: allowPreviewFallback)
         let turns = ((rotationTurns % 4) + 4) % 4
         if turns != 0 {
             loaded.image = loaded.image.rotatedClockwise(turns)
@@ -98,7 +106,9 @@ enum ImageLoader {
 
     private static func decode(url: URL, maxSize: Int?,
                                rawOptions: RawDecoder.Options,
-                               allowEncoded: Bool) throws -> LoadedImage {
+                               allowEncoded: Bool,
+                               rawTimeout: TimeInterval,
+                               allowPreviewFallback: Bool) throws -> LoadedImage {
         let detected = detectColorSpace(url: url)
         let suffix = url.pathExtension.lowercased()
         if !allowEncoded, rejectedSuffixes.contains(suffix) {
@@ -119,17 +129,33 @@ enum ImageLoader {
                 var options = rawOptions
                 options.outputColorSpace = detected.space
                 options.maxSize = maxSize
-                let image = try RawDecoder.decode(url: url, options: options)
+                let image = try RawDecoder.decodeWithTimeout(
+                    url: url, options: options, timeout: rawTimeout)
                 return LoadedImage(image: image, colorSpace: detected.space,
                                    cctfDecoding: false, isRaw: true)
             } catch {
-                // CIRAWFilter 打不开这张 RAW（不同机型的 ProRAW 容器差异、系统 RAW 支持缺失等）。
-                // 不让用户卡在「不支持」：退回 ImageIO 的解码结果，只降级不做拒绝，并把原因写日志。
-                NSLog("MRaw fallback %@ — %@", url.lastPathComponent,
-                      (error as NSError).localizedDescription)
+                // 导出等需要全质量的路径不能悄悄退回内嵌预览。
+                if !allowPreviewFallback { throw error }
+                // CIRAWFilter 打不开这张 RAW（不同机型的 ProRAW 容器差异、系统 RAW 支持缺失等），
+                // 或首次 MobileAsset 查询超时。不让用户卡在「读取 RAW」：退回 ImageIO 预览，
+                // 只降级不拒绝，并把原因写日志。
+                let timedOut: Bool
+                if case .some(.timeout) = error as? RawDecoder.DecodeError {
+                    timedOut = true
+                } else {
+                    timedOut = false
+                }
+                if timedOut {
+                    NSLog("MRaw timeout %@ — %@", url.lastPathComponent,
+                          (error as NSError).localizedDescription)
+                } else {
+                    NSLog("MRaw fallback %@ — %@", url.lastPathComponent,
+                          (error as NSError).localizedDescription)
+                }
                 let image = try RawDecoder.decodeThumbnail(url: url, maxSize: maxSize ?? 4096)
                 return LoadedImage(image: image, colorSpace: "sRGB",
-                                   cctfDecoding: false, isRaw: true)
+                                   cctfDecoding: false, isRaw: true,
+                                   usedFallback: true)
             }
             #endif
         }

@@ -47,6 +47,42 @@ struct CoreSmoke {
         log("library index ordering \(libraryReport)")
         let rawSize = try runRawDimensionSmoke()
         log("raw dimension \(rawSize)")
+        let rawTimeout = try runRawTimeoutSmoke()
+        log("raw timeout \(rawTimeout)")
+    }
+
+    /// 回归：CIRAWFilter 首次查询可能长时间不返回。超时必须在限定时间内抛出，
+    /// 让 ImageLoader 走预览兜底，而不是把显影台卡在「读取 RAW」。
+    private static func runRawTimeoutSmoke() throws -> String {
+        let url = URL(fileURLWithPath: "/tmp/spektra-raw-timeout.dng")
+        let start = Date()
+        do {
+            _ = try RawDecoder.decodeWithTimeout(url: url, options: .init(), timeout: 0.2) { _, _ in
+                Thread.sleep(forTimeInterval: 1.0)
+                return ImageRGB(width: 2, height: 2,
+                                data: [Double](repeating: 0, count: 12))
+            }
+            throw NSError(domain: "smoke", code: 9, userInfo: [
+                NSLocalizedDescriptionKey: "expected RAW timeout"
+            ])
+        } catch {
+            let elapsed = Date().timeIntervalSince(start)
+            guard elapsed < 0.8 else {
+                throw NSError(domain: "smoke", code: 10, userInfo: [
+                    NSLocalizedDescriptionKey: "timeout waited \(elapsed)s"
+                ])
+            }
+        }
+        let image = try RawDecoder.decodeWithTimeout(url: url, options: .init(), timeout: 1.0) { _, _ in
+            ImageRGB(width: 3, height: 2,
+                     data: [Double](repeating: 0, count: 18))
+        }
+        guard image.width == 3, image.height == 2 else {
+            throw NSError(domain: "smoke", code: 11, userInfo: [
+                NSLocalizedDescriptionKey: "timeout wrapper returned wrong image"
+            ])
+        }
+        return "pass"
     }
 
     /// 回归：iOS ImageIO 会把部分 ARW 的 index 0 报成内嵌预览（1616×1080）。

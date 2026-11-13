@@ -25,13 +25,72 @@ enum RawDecoder {
     enum DecodeError: Error, CustomStringConvertible {
         case unsupported(String)
         case renderFailed(String)
+        case timeout(String)
 
         var description: String {
             switch self {
             case .unsupported(let message): return "RAW decode unsupported: \(message)"
             case .renderFailed(let message): return "RAW render failed: \(message)"
+            case .timeout(let message): return "RAW decode timeout: \(message)"
             }
         }
+    }
+
+    /// CIRAWFilter 首次初始化会查询系统 RAW 支持（MobileAsset）。系统或 App
+    /// 刚更新、网络不可用时，这个查询可能长时间不返回；解码必须放在独立并发
+    /// 队列并加超时，不能占住显影台的串行 loadQueue。
+    private final class ResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var result: Result<ImageRGB, Error>?
+
+        func set(_ value: Result<ImageRGB, Error>) {
+            lock.lock()
+            result = value
+            lock.unlock()
+        }
+
+        func get() -> Result<ImageRGB, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            return result
+        }
+    }
+
+    private static let decodeQueue = DispatchQueue(
+        label: "spektrafilm.raw.decode", qos: .userInitiated, attributes: .concurrent)
+    /// 最多允许两个解码卡在 MobileAsset 查询上；再多就直接走预览兜底。
+    private static let decodeSlots = DispatchSemaphore(value: 2)
+
+    static func decodeWithTimeout(url: URL, options: Options = Options(),
+                                  timeout: TimeInterval = 12) throws -> ImageRGB {
+        try decodeWithTimeout(url: url, options: options, timeout: timeout) { url, options in
+            try decode(url: url, options: options)
+        }
+    }
+
+    static func decodeWithTimeout(url: URL, options: Options, timeout: TimeInterval,
+                                  decoder: @escaping (URL, Options) throws -> ImageRGB) throws -> ImageRGB {
+        guard decodeSlots.wait(timeout: .now()) == .success else {
+            throw DecodeError.timeout("decoder busy")
+        }
+        let box = ResultBox()
+        let done = DispatchSemaphore(value: 0)
+        decodeQueue.async {
+            defer { decodeSlots.signal() }
+            do {
+                box.set(.success(try decoder(url, options)))
+            } catch {
+                box.set(.failure(error))
+            }
+            done.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            throw DecodeError.timeout("exceeded \(timeout)s")
+        }
+        guard let result = box.get() else {
+            throw DecodeError.renderFailed("no decode result")
+        }
+        return try result.get()
     }
 
     static func decode(url: URL, options: Options = Options()) throws -> ImageRGB {

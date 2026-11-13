@@ -259,6 +259,15 @@ struct DevelopScreen: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
 
+                if let note = session.loadNote {
+                    Text(note)
+                        .font(.mSans(9, .medium))
+                        .foregroundStyle(MColor.brassHigh.opacity(0.92))
+                        .padding(.horizontal, 12)
+                        .padding(.top, 2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 // 直方图：macOS 编辑页同款卡片，显影参数调整时观察影调分布。
                 splitHistogramCard
                     .padding(.horizontal, 12)
@@ -577,7 +586,14 @@ struct DevelopScreen: View {
 
     @ViewBuilder private var capsuleProgressText: some View {
         // 有开孔时文字归 MHousingAura 画在开孔下方；无开孔机型没有让位空间，才落在胶囊下方。
-        if session.isRendering, housing == .none {
+        if let note = session.loadNote, !session.isRendering {
+            Text(note)
+                .font(.mSans(9, .medium))
+                .foregroundStyle(MColor.brassHigh.opacity(0.92))
+                .shadow(color: .black.opacity(0.6), radius: 2)
+                .offset(y: 24)
+                .allowsHitTesting(false)
+        } else if session.isRendering, housing == .none {
             Text(session.phaseLabel.isEmpty ? "显影中" : session.phaseLabel)
                 .font(.mSans(9, .medium))
                 .foregroundStyle(MColor.brassHigh.opacity(0.92))

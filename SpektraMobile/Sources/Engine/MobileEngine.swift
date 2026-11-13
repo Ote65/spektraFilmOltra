@@ -4,6 +4,23 @@ import Photos
 import ImageIO
 import UniformTypeIdentifiers
 
+/// 保证 continuation 只 resume 一次：请求完成与超时可能同时到达。
+private final class MOnceResume: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    func run(_ body: () -> Void) {
+        lock.lock()
+        if done {
+            lock.unlock()
+            return
+        }
+        done = true
+        lock.unlock()
+        body()
+    }
+}
+
 /// 移动端状态中枢：照片库、导入、缩略图、显影/调色会话。
 /// 照片库放在 `Spektrafilm/MobileLibrary`，与桌面版库互不干扰。
 @MainActor
@@ -663,15 +680,35 @@ final class MobileEngine: ObservableObject {
         options.isNetworkAccessAllowed = true
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let once = MOnceResume()
+                var timeoutWork: DispatchWorkItem?
                 PHAssetResourceManager.default().writeData(
                     for: resource, toFile: url, options: options
                 ) { error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
+                    timeoutWork?.cancel()
+                    once.run {
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
                     }
                 }
+                // iCloud 原片下载没有进度回调；网络慢/离线时不能无限等待。
+                // writeData 不返回可取消的 requestID，超时后先让 UI 退出等待，
+                // 迟到的完成回调会被 once 忽略。
+                let timeout = DispatchWorkItem {
+                    once.run {
+                        continuation.resume(throwing: NSError(
+                            domain: "Spektrafilm.Import", code: 408, userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "从 iCloud 取回原片超时，请检查网络后重试"
+                            ]))
+                    }
+                }
+                timeoutWork = timeout
+                DispatchQueue.global(qos: .utility).asyncAfter(
+                    deadline: .now() + 30, execute: timeout)
             }
         } catch {
             NSLog("MAssets fetch failed %@ — %@", assetID, error.localizedDescription)

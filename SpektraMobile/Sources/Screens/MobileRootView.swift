@@ -180,6 +180,10 @@ struct MobileRootView: View {
             guard screen == .develop || screen == .grade else { return }
             await engine.refreshAssets()
             var first = engine.assets.first?.photo ?? engine.photos.first
+            if let name = DebugLaunch.developFile,
+               let photo = engine.photos.first(where: { $0.filename == name }) {
+                first = photo
+            }
             if first == nil, let asset = engine.assets.first,
                let photoID = await engine.importAsset(assetID: asset.id) {
                 first = engine.photos.first(where: { $0.id == photoID })

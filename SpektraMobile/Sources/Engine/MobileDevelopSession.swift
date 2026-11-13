@@ -19,6 +19,8 @@ final class MobileDevelopSession: ObservableObject {
     @Published private(set) var isPredicted = false
     @Published private(set) var isRendering = false
     @Published private(set) var phaseLabel = ""
+    /// RAW 解码超时/失败时的提示：已显示预览，导出仍会重新读取原片。
+    @Published private(set) var loadNote: String?
     @Published private(set) var phaseProgress: Double = 0
     /// 导出有独立的进度文案：预览渲染和导出共用一套 phaseLabel 会互相覆盖，
     /// 导出面板上就会显示「胶片显影」这种预览阶段的字。
@@ -197,6 +199,7 @@ final class MobileDevelopSession: ObservableObject {
         self.originalURL = originalURL
         loadFailure = nil
         errorMessage = nil
+        loadNote = nil
         loadToken += 1
         let token = loadToken
         // 比例切换时丢弃仍在途的旧尺寸精算帧，避免旧图覆盖新解码缓冲。
@@ -226,6 +229,9 @@ final class MobileDevelopSession: ObservableObject {
                     self.errorMessage = nil
                     self.image = loaded.image
                     self.loadedEdge = max(loaded.image.width, loaded.image.height)
+                    self.loadNote = loaded.usedFallback
+                        ? "RAW 解码较慢 · 已显示预览"
+                        : nil
                     // 库里的宽高缺失时才退回解码缓冲的长边（此时至少能保证导出不被预览尺寸误缩）。
                     if self.originalLongEdge <= 0 { self.originalLongEdge = self.loadedEdge }
                     self.inputColorSpace = loaded.colorSpace
@@ -259,6 +265,12 @@ final class MobileDevelopSession: ObservableObject {
     /// 读取失败后的手动重试。保留当前预览比例；旧的在途解码会因 loadToken 变化被丢弃。
     func retryLoad() {
         guard !isLoaded else { return }
+        loadOriginal(maxSize: max(1600, previewEdge))
+    }
+
+    /// 预览兜底后重试全质量解码：保留当前预览，不把界面切回空白。
+    func retryFullResolution() {
+        loadNote = nil
         loadOriginal(maxSize: max(1600, previewEdge))
     }
 
@@ -678,7 +690,8 @@ final class MobileDevelopSession: ObservableObject {
             // 导出按目标长边重新解码原图：预览缓存是缩小版，不能拿它放大。
             guard let loaded = try? ImageLoader.load(
                 url: sourceURL, maxSize: requested, rawOptions: options,
-                rotationTurns: rotation, allowEncoded: true) else {
+                rotationTurns: rotation, allowEncoded: true, rawTimeout: 60,
+                allowPreviewFallback: false) else {
                 Task { @MainActor [weak self] in
                     self?.isExporting = false
                     self?.exportLabel = ""
@@ -765,9 +778,16 @@ final class MobileDevelopSession: ObservableObject {
         loadQueue.async {
             var params = baseParams
             var source = previewImage
-            if maxEdge > previewEdge,
-               let loaded = try? ImageLoader.load(url: url, maxSize: maxEdge, rawOptions: options,
-                                                  rotationTurns: rotation, allowEncoded: true) {
+            if maxEdge > previewEdge {
+                // 导出/交接要求原图尺寸：全质量解码失败时宁可失败，也不能把
+                // 1600 预览放大后当成原片交出去。
+                guard let loaded = try? ImageLoader.load(
+                    url: url, maxSize: maxEdge, rawOptions: options,
+                    rotationTurns: rotation, allowEncoded: true,
+                    rawTimeout: 60, allowPreviewFallback: false) else {
+                    completion(nil)
+                    return
+                }
                 source = loaded.image
                 params.io.inputColorSpace = loaded.colorSpace
                 params.io.inputCCTFDecoding = loaded.cctfDecoding
@@ -800,7 +820,8 @@ final class MobileDevelopSession: ObservableObject {
         loadQueue.async {
             guard var loaded = try? ImageLoader.load(
                 url: url, maxSize: maxEdge, rawOptions: options,
-                rotationTurns: rotation, allowEncoded: true) else {
+                rotationTurns: rotation, allowEncoded: true, rawTimeout: 60,
+                allowPreviewFallback: false) else {
                 completion(nil)
                 return
             }
