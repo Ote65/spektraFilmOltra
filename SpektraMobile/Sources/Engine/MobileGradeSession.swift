@@ -611,10 +611,10 @@ final class MobileGradeSession: ObservableObject {
         let watermarkEnabled = includeWatermark
         let watermark = MWatermarkStore.load()
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
-        // 片边会把成品放大一圈：开启片边时「原始」也按内存余量钳位，避免大图导出被 jetsam。
-        let edge = (longEdgeIndex == 0 && !borderConfig.enabled)
-            ? rawEdge
-            : ExportEdge.clampToMemoryBudget(rawEdge)
+        // 原始档和带片边的大图都可能超过前台内存预算：所有档位统一按可用内存钳位，
+        // 实际尺寸写进导出文案，避免 48 MP 级原片导出时被 jetsam。
+        let edge = ExportEdge.clampToMemoryBudget(rawEdge)
+        let exportNote = edge < rawEdge ? "导出调色 · 内存上限 \(edge)" : "导出调色"
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
         let geometry = geometry
         let targetSpace: String
@@ -636,7 +636,7 @@ final class MobileGradeSession: ObservableObject {
         exportToken += 1
         let current = exportToken
         phaseLabel = "导出调色"
-        exportLabel = "导出调色"
+        exportLabel = exportNote
         phaseProgress = 0
         handoff(maxEdge: edge) { [weak self] image in
             guard let self else { return }

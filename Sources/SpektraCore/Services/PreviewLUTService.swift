@@ -102,33 +102,39 @@ final class PreviewLUTService: @unchecked Sendable {
             let span1 = max(wire1.hi - wire1.lo, 1e-9)
             let span3 = max(wire3.hi - wire3.lo, 1e-9)
 
+            // 整条预测链只持有一份 Double 缓冲：查表与偏移都在原缓冲上完成，
+            // 拖动时不再为每一段分配全幅中间数组。
             var stage: [Double]
-            var logOffset: Double
             if encodedInput {
                 let scale = pow(2.0, autoEV) / PreviewLUTService.encodedMax
-                let scaled = source.data.map { Double($0) * scale }
-                stage = PreviewLUTService.lookup(t1, values: scaled, width: width, height: height, shaped: false)
-                logOffset = exposureEV * log10(2.0)
+                stage = source.data.map { Double($0) * scale }
+                PreviewLUTService.lookupInPlace(
+                    t1, values: &stage, width: width, height: height, shaped: false)
+                PreviewLUTService.applyOffset(
+                    &stage, offset: exposureEV * log10(2.0) / span1)
             } else {
                 // 自动曝光在真管线的 preprocess 阶段施加，早于 rgbToFilmRaw；
                 // 因此必须挪到 t1 的 shaper 坐标上，不能放到 t1 之后。
-                stage = PreviewLUTService.lookup(
-                    t1, values: source.data.map(Double.init), width: width, height: height,
+                stage = source.data.map(Double.init)
+                PreviewLUTService.lookupInPlace(
+                    t1, values: &stage, width: width, height: height,
                     shaped: true, shapedEVOffset: autoEV)
-                logOffset = exposureEV * log10(2.0)
+                PreviewLUTService.applyOffset(
+                    &stage, offset: exposureEV * log10(2.0) / span1)
             }
-            let norm1 = PreviewLUTService.offsetNormalized(stage, offset: logOffset / span1)
 
-            stage = PreviewLUTService.lookup(t2, values: norm1, width: width, height: height, shaped: false)
-            stage = PreviewLUTService.lookup(t3, values: stage, width: width, height: height, shaped: false)
+            PreviewLUTService.lookupInPlace(
+                t2, values: &stage, width: width, height: height, shaped: false)
+            PreviewLUTService.lookupInPlace(
+                t3, values: &stage, width: width, height: height, shaped: false)
 
             let printOffset = log10(max(printExposure, 1e-10))
             let comp = compRatio(exposureEV: exposureEV, compensate: compensate)
             let totalOffset = printOffset + (compensate ? log10(max(comp, 1e-10)) : 0)
-            let norm3 = PreviewLUTService.offsetNormalized(stage, offset: totalOffset / span3)
-
-            let linear = PreviewLUTService.lookup(t4, values: norm3, width: width, height: height, shaped: false)
-            return ImageRGB(width: width, height: height, data: linear)
+            PreviewLUTService.applyOffset(&stage, offset: totalOffset / span3)
+            PreviewLUTService.lookupInPlace(
+                t4, values: &stage, width: width, height: height, shaped: false)
+            return ImageRGB(width: width, height: height, data: stage)
         }
     }
 
@@ -389,18 +395,20 @@ final class PreviewLUTService: @unchecked Sendable {
 
     // MARK: - 查表
 
-    /// 三线性插值；shaped 为 true 时先做 log2 shaper。
-    static func lookup(_ lut: FloatLUT3D, values: [Double],
-                                   width: Int, height: Int,
-                                   shaped: Bool, shapedEVOffset: Double = 0) -> [Double] {
+    /// 三线性插值（原地）：shaped 为 true 时先做 log2 shaper。
+    /// 每个像素只依赖自身的三个输入通道，因此可以安全地读同一缓冲再写回；
+    /// 拖动期预测不再为每次查表分配一份全幅 [Double]。
+    static func lookupInPlace(_ lut: FloatLUT3D, values: inout [Double],
+                              width: Int, height: Int,
+                              shaped: Bool, shapedEVOffset: Double = 0) {
+        guard width > 0, height > 0, values.count >= width * height * 3 else { return }
         let n = lut.size
         let scale = Double(n - 1)
         let last = n - 2
         let lo = shaperLowEV
         let span = shaperHighEV - shaperLowEV
-        var output = [Double](repeating: 0, count: width * height * 3)
 
-        output.withUnsafeMutableBufferPointer { buffer in
+        values.withUnsafeMutableBufferPointer { buffer in
         guard let base = buffer.baseAddress else { return }
 
         func row(_ y: Int) {
@@ -410,7 +418,7 @@ final class PreviewLUTService: @unchecked Sendable {
                 var i0 = 0, j0 = 0, k0 = 0
                 var fr = 0.0, fg = 0.0, fb = 0.0
                 for c in 0..<3 {
-                    var value = values[p + c]
+                    var value = base[p + c]
                     if !value.isFinite { value = 0 }
                     let index: Double
                     if shaped {
@@ -488,12 +496,18 @@ final class PreviewLUTService: @unchecked Sendable {
             for y in 0..<height { row(y) }
         }
         }
-        return output
     }
 
-    private static func offsetNormalized(_ values: [Double],
-                                         offset: Double) -> [Double] {
-        values.map { min(max($0 + offset, 0), 1) }
+    /// 原地施加对数域偏移并夹到 [0, 1]；等价于原来的 offsetNormalized。
+    static func applyOffset(_ values: inout [Double], offset: Double) {
+        values.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var index = 0
+            while index < buffer.count {
+                base[index] = min(max(base[index] + offset, 0), 1)
+                index += 1
+            }
+        }
     }
 
     // MARK: - 显示

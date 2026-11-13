@@ -139,7 +139,15 @@ enum RawDecoder {
         ) else {
             throw DecodeError.renderFailed("thumbnail failed")
         }
-        return try renderLinear(thumbnail)
+        let image = try renderLinear(thumbnail)
+        // ImageIO 在没有对应 RAW 解码器时会退回内嵌预览且不报错；
+        // 这里留下尺寸差异日志，方便定位「选最大尺寸仍只有预览尺寸」的机型。
+        let actual = max(image.width, image.height)
+        if actual < target {
+            NSLog("MRaw preview fallback %@ requested %ld got %ld",
+                  url.lastPathComponent, target, actual)
+        }
+        return image
     }
 
     /// CGImage → 线性 sRGB `ImageRGB`。

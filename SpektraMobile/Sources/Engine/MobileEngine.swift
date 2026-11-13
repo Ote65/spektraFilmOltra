@@ -62,10 +62,10 @@ final class MobileEngine: ObservableObject {
         let filename: String
         let isRaw: Bool
     }
-    /// 按范围缓存的扫描结果；token 与 `libraryChangeToken` 一致时无需重扫。
-    private struct ScopeCache {
-        let assets: [MLibraryAsset]
-        let token: Int
+    /// 按范围缓存的扫描结果：所有写入都必须带上写入时的 generation。
+    private struct AssetCacheKey: Hashable {
+        let scope: MAssetScope
+        let allowNonRaw: Bool
     }
     /// 一次扫描产出的资产信息：包含来源分类与是否需要 EXIF 精修。
     private struct ScannedAsset {
@@ -76,28 +76,79 @@ final class MobileEngine: ObservableObject {
         let isCaptured: Bool
         let needsProbe: Bool
     }
-    /// 缓存键必须带上「支持 JPEG」开关，否则切换后会把旧过滤结果当成新范围。
-    private struct AssetCacheKey: Hashable {
-        let scope: MAssetScope
-        let allowNonRaw: Bool
+
+    /// 相册映射的内存索引：范围缓存、快照复用表、EXIF 来源覆盖与变更代数收在一起。
+    /// 缓存写入只走 `store`，并显式携带 generation，避免不同路径用不同 token
+    /// 把旧列表当成新数据（此前来源精修写回就出现过这个问题）。
+    private struct AlbumIndex {
+        struct ScopeEntry {
+            var assets: [MLibraryAsset]
+            let generation: Int
+        }
+
+        private(set) var generation = 0
+        private(set) var scopes: [AssetCacheKey: ScopeEntry] = [:]
+        private(set) var snapshotLookup: [String: AlbumSnapshot] = [:]
+        private(set) var captureOverrides: [String: Bool] = [:]
+
+        mutating func markLibraryChanged() { generation &+= 1 }
+        mutating func resetScopes() { scopes.removeAll() }
+
+        func entry(_ scope: MAssetScope, allowNonRaw: Bool) -> ScopeEntry? {
+            scopes[AssetCacheKey(scope: scope, allowNonRaw: allowNonRaw)]
+        }
+
+        mutating func store(_ assets: [MLibraryAsset], for scope: MAssetScope,
+                            allowNonRaw: Bool, generation: Int) {
+            scopes[AssetCacheKey(scope: scope, allowNonRaw: allowNonRaw)] =
+                ScopeEntry(assets: assets, generation: generation)
+        }
+
+        mutating func setSnapshot(_ list: [AlbumSnapshot]) {
+            snapshotLookup = Dictionary(
+                list.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+
+        mutating func setOverrides(_ values: [String: Bool]) {
+            captureOverrides = values
+        }
+
+        mutating func mergeOverrides(_ results: [String: Bool]) {
+            captureOverrides.merge(results) { _, new in new }
+        }
+
+        /// 丢掉已不存在照片的精修结果；返回是否发生变化。
+        mutating func pruneOverrides(keeping ids: Set<String>) -> Bool {
+            let pruned = captureOverrides.filter { ids.contains($0.key) }
+            guard pruned.count != captureOverrides.count else { return false }
+            captureOverrides = pruned
+            return true
+        }
+
+        /// 把精修结果同步到所有已缓存范围，保持列表中的来源标记一致。
+        mutating func applyCaptureFlags(_ results: [String: Bool]) {
+            for key in Array(scopes.keys) {
+                guard var entry = scopes[key] else { continue }
+                var changed = false
+                for index in entry.assets.indices {
+                    guard let captured = results[entry.assets[index].id] else { continue }
+                    entry.assets[index].isCaptured = captured
+                    entry.assets[index].captureNeedsProbe = false
+                    changed = true
+                }
+                if changed { scopes[key] = entry }
+            }
+        }
     }
-    private var scopeCache: [AssetCacheKey: ScopeCache] = [:]
-    private func cacheKey(_ scope: MAssetScope) -> AssetCacheKey {
-        AssetCacheKey(scope: scope, allowNonRaw: MobileSettings.allowNonRaw)
-    }
-    /// EXIF 精修结果：localIdentifier → 是否拍摄。落盘缓存，避免每次重扫都读图。
-    private var captureOverrides: [String: Bool] = [:]
+
+    private var index = AlbumIndex()
     private var captureOverrideURL: URL {
         store.root.appendingPathComponent("capture-origins.json")
     }
     /// 本次会话最多精修多少张模糊照片，避免首次进入筛选时读太多原图。
     private var captureRefineBudget = 240
-    /// localIdentifier → 快照条目；重扫时复用文件名与 RAW 判定，跳过逐张 assetResources。
-    private var snapshotLookup: [String: AlbumSnapshot] = [:]
     /// 快照只在本次会话恢复一次，避免并发刷新重复读盘。
     private var didRestoreSnapshot = false
-    /// 相册内容变化计数：由 PhotoKit 变更回调递增，让缓存自动失效。
-    private var libraryChangeToken = 0
     /// 正在执行的刷新数量：有强制刷新在飞时，不允许另一次缓存命中把它顶掉。
     private var refreshInFlight = 0
     private let photoObserver = MPhotoLibraryObserver()
@@ -160,12 +211,20 @@ final class MobileEngine: ObservableObject {
     func selectScope(_ newScope: MAssetScope) {
         guard scope != newScope else { return }
         scope = newScope
-        if let cached = scopeCache[cacheKey(newScope)] {
+        let allowNonRaw = MobileSettings.allowNonRaw
+        if let cached = index.entry(newScope, allowNonRaw: allowNonRaw) {
             apply(cached.assets)
             assetPhase = .ready
-            if cached.token == libraryChangeToken { return }
+            if cached.generation == index.generation { return }
         }
         Task { await refreshAssets() }
+    }
+
+    /// 关闭「支持 JPEG」后拍摄/保存筛选不再有入口：把当前范围回落到全部，
+    /// 避免按钮消失但列表仍按隐藏范围过滤。
+    func resetOriginScopeIfNeeded() {
+        guard !MobileSettings.allowNonRaw, scope.isOriginFilter else { return }
+        scope = .all
     }
 
     /// 直接映射系统相册：RAW 用系统 RAW 智能相簿，收藏用系统收藏相簿，
@@ -180,7 +239,7 @@ final class MobileEngine: ObservableObject {
         guard status == .authorized || status == .limited else {
             assets = []
             assetPhase = .denied
-            scopeCache.removeAll()
+            index.resetScopes()
             return
         }
         ensurePhotoObserver()
@@ -189,8 +248,6 @@ final class MobileEngine: ObservableObject {
         let scope = self.scope
         let fetchScope: MAssetScope = scope.isOriginFilter ? .all : scope
         let allowNonRaw = MobileSettings.allowNonRaw
-        let key = cacheKey(scope)
-        let allKey = cacheKey(.all)
         NSLog("MAssets refresh force=%d scope=%@", force ? 1 : 0, String(describing: scope))
 
         // 冷启动：先用上次的快照出列表，扫描在后台继续。
@@ -202,17 +259,20 @@ final class MobileEngine: ObservableObject {
         // 相册没有变化时直接复用上一次的扫描结果，不再全量重扫。
         // 只在本次是唯一刷新时允许命中，避免把正在进行的强制刷新顶掉。
         if !force, refreshInFlight == 1 {
-            if scope.isOriginFilter, let cachedAll = scopeCache[allKey],
-               cachedAll.token == libraryChangeToken {
+            if scope.isOriginFilter,
+               let cachedAll = index.entry(.all, allowNonRaw: allowNonRaw),
+               cachedAll.generation == index.generation {
                 assets = filterOrigin(cachedAll.assets, for: scope)
-                scopeCache[key] = ScopeCache(assets: assets, token: cachedAll.token)
+                index.store(assets, for: scope, allowNonRaw: allowNonRaw,
+                            generation: cachedAll.generation)
                 assetPhase = .ready
                 NSLog("MAssets cache hit scope=%@ count=%d",
                       String(describing: scope), assets.count)
                 refineCaptureOrigins(cachedAll.assets)
                 return
             }
-            if let cached = scopeCache[key], cached.token == libraryChangeToken {
+            if let cached = index.entry(scope, allowNonRaw: allowNonRaw),
+               cached.generation == index.generation {
                 apply(cached.assets)
                 assetPhase = .ready
                 NSLog("MAssets cache hit scope=%@ count=%d",
@@ -223,7 +283,7 @@ final class MobileEngine: ObservableObject {
         loadAlbums()
 
         // 有旧结果就先展示，避免刷新期间列表闪空。
-        if assets.isEmpty, let cached = scopeCache[key] {
+        if assets.isEmpty, let cached = index.entry(scope, allowNonRaw: allowNonRaw) {
             apply(cached.assets)
         }
         assetPhase = assets.isEmpty ? .scanning : .ready
@@ -234,11 +294,11 @@ final class MobileEngine: ObservableObject {
             return
         }
 
-        let scanToken = libraryChangeToken
+        let scanToken = index.generation
         let scanned = await Self.fetchAssets(scope: fetchScope,
                                              allowNonRaw: allowNonRaw,
-                                             known: snapshotLookup,
-                                             overrides: captureOverrides)
+                                             known: index.snapshotLookup,
+                                             overrides: index.captureOverrides)
         // 旧扫描晚回来时丢弃，避免列表被过期结果覆盖。
         guard token == assetRefreshToken else { return }
         let byName = Dictionary(
@@ -260,7 +320,7 @@ final class MobileEngine: ObservableObject {
             )
         }
         if fetchScope == .all {
-            scopeCache[allKey] = ScopeCache(assets: built, token: scanToken)
+            index.store(built, for: .all, allowNonRaw: allowNonRaw, generation: scanToken)
             saveSnapshot(scanned)
             pruneCaptureOverrides(keeping: Set(scanned.map { $0.asset.localIdentifier }))
             NSLog("MAssets origin captured=%d saved=%d needsProbe=%d",
@@ -269,7 +329,7 @@ final class MobileEngine: ObservableObject {
                   built.filter(\.captureNeedsProbe).count)
         }
         assets = filterOrigin(built, for: scope)
-        scopeCache[key] = ScopeCache(assets: assets, token: scanToken)
+        index.store(assets, for: scope, allowNonRaw: allowNonRaw, generation: scanToken)
         assetPhase = .ready
         NSLog("MAssets scope=%@ count=%d", String(describing: scope), assets.count)
         if scope.isOriginFilter {
@@ -314,34 +374,39 @@ final class MobileEngine: ObservableObject {
         }.value
         // 读盘期间用户可能已切到别的范围：只在仍需要全量列表时应用快照。
         guard !list.isEmpty, scope == .all || scope.isOriginFilter else { return false }
-        snapshotLookup = Dictionary(
-            list.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        index.setSnapshot(list)
 
         let allowNonRaw = MobileSettings.allowNonRaw
-        let usable = list.filter {
-            (allowNonRaw || $0.isRaw)
-                && MAssetFormat.isAllowed(filename: $0.filename, isRaw: $0.isRaw)
-        }
-        guard !usable.isEmpty else { return false }
-        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: usable.map(\.id), options: nil)
-        var byID: [String: PHAsset] = [:]
-        fetched.enumerateObjects { asset, _, _ in byID[asset.localIdentifier] = asset }
-        let byName = Dictionary(
-            store.photos.map { ($0.filename, $0) },
+        let overrides = index.captureOverrides
+        // makePhoto 只读库内记录，提前在主线程生成；后台只做 PhotoKit 抓取与分类。
+        let photosByName = Dictionary(
+            store.photos.map { ($0.filename, makePhoto($0)) },
             uniquingKeysWith: { first, _ in first }
         )
-        let restored: [MLibraryAsset] = usable.compactMap { item in
-            guard let asset = byID[item.id] else { return nil }
-            let verdict = MCaptureClassifier.classify(
-                asset: asset, filename: item.filename, isRaw: item.isRaw)
-            let captured = captureOverrides[item.id] ?? verdict.isCaptured
-            return MLibraryAsset(
-                id: item.id, filename: item.filename,
-                photo: byName[item.filename].map(makePhoto), phAsset: asset,
-                isCaptured: captured,
-                captureNeedsProbe: captureOverrides[item.id] == nil && !verdict.confident
-            )
-        }
+        // 抓取、枚举与逐张分类都移到后台：快照条数等于整库条数，
+        // 放在主线程会直接拖慢冷启动首帧。
+        let restored: [MLibraryAsset] = await Task.detached(priority: .userInitiated) {
+            let usable = list.filter {
+                (allowNonRaw || $0.isRaw)
+                    && MAssetFormat.isAllowed(filename: $0.filename, isRaw: $0.isRaw)
+            }
+            guard !usable.isEmpty else { return [] }
+            let fetched = PHAsset.fetchAssets(withLocalIdentifiers: usable.map(\.id), options: nil)
+            var byID: [String: PHAsset] = [:]
+            fetched.enumerateObjects { asset, _, _ in byID[asset.localIdentifier] = asset }
+            return usable.compactMap { item -> MLibraryAsset? in
+                guard let asset = byID[item.id] else { return nil }
+                let verdict = MCaptureClassifier.classify(
+                    asset: asset, filename: item.filename, isRaw: item.isRaw)
+                let override = overrides[item.id]
+                return MLibraryAsset(
+                    id: item.id, filename: item.filename,
+                    photo: photosByName[item.filename], phAsset: asset,
+                    isCaptured: override ?? verdict.isCaptured,
+                    captureNeedsProbe: override == nil && !verdict.confident
+                )
+            }
+        }.value
         guard !restored.isEmpty else { return false }
         assets = restored
         for item in restored {
@@ -359,8 +424,7 @@ final class MobileEngine: ObservableObject {
             AlbumSnapshot(id: $0.asset.localIdentifier,
                           filename: $0.filename, isRaw: $0.isRaw)
         }
-        snapshotLookup = Dictionary(
-            list.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        index.setSnapshot(list)
         let url = snapshotURL
         Task.detached(priority: .utility) {
             guard let data = try? JSONEncoder().encode(list) else { return }
@@ -368,10 +432,10 @@ final class MobileEngine: ObservableObject {
         }
     }
 
-    /// 相册内容变化时只递增计数、让范围缓存失效；下一次前台/切筛选再后台重扫。
+    /// 相册内容变化时只递增变更代数、让范围缓存失效；下一次前台/切筛选再后台重扫。
     fileprivate func handlePhotoLibraryChange() {
-        libraryChangeToken &+= 1
-        NSLog("MAssets library changed token=%d", libraryChangeToken)
+        index.markLibraryChanged()
+        NSLog("MAssets library changed token=%d", index.generation)
     }
 
     // MARK: - 来源分类缓存与 EXIF 精修
@@ -381,11 +445,11 @@ final class MobileEngine: ObservableObject {
               let decoded = try? JSONDecoder().decode([String: Bool].self, from: data) else {
             return
         }
-        captureOverrides = decoded
+        index.setOverrides(decoded)
     }
 
     private func persistCaptureOverrides() {
-        let snapshot = captureOverrides
+        let snapshot = index.captureOverrides
         let url = captureOverrideURL
         Task.detached(priority: .utility) {
             guard let data = try? JSONEncoder().encode(snapshot) else { return }
@@ -395,9 +459,7 @@ final class MobileEngine: ObservableObject {
 
     /// 全量扫描后丢掉已不存在照片的精修结果。
     private func pruneCaptureOverrides(keeping ids: Set<String>) {
-        let pruned = captureOverrides.filter { ids.contains($0.key) }
-        guard pruned.count != captureOverrides.count else { return }
-        captureOverrides = pruned
+        guard index.pruneOverrides(keeping: ids) else { return }
         persistCaptureOverrides()
     }
 
@@ -476,35 +538,25 @@ final class MobileEngine: ObservableObject {
 
     private func applyCaptureOverrides(_ results: [String: Bool]) {
         guard !results.isEmpty else { return }
-        captureOverrides.merge(results) { _, new in new }
+        index.mergeOverrides(results)
         persistCaptureOverrides()
 
         var updated = assets
-        for index in updated.indices {
-            guard let captured = results[updated[index].id] else { continue }
-            updated[index].isCaptured = captured
-            updated[index].captureNeedsProbe = false
+        for i in updated.indices {
+            guard let captured = results[updated[i].id] else { continue }
+            updated[i].isCaptured = captured
+            updated[i].captureNeedsProbe = false
         }
         assets = updated
+        index.applyCaptureFlags(results)
 
-        for key in Array(scopeCache.keys) {
-            guard let cache = scopeCache[key] else { continue }
-            var list = cache.assets
-            var changed = false
-            for index in list.indices {
-                guard let captured = results[list[index].id] else { continue }
-                list[index].isCaptured = captured
-                list[index].captureNeedsProbe = false
-                changed = true
-            }
-            if changed {
-                scopeCache[key] = ScopeCache(assets: list, token: cache.token)
-            }
-        }
-
-        if scope.isOriginFilter, let all = scopeCache[cacheKey(.all)]?.assets {
-            assets = filterOrigin(all, for: scope)
-            scopeCache[cacheKey(scope)] = ScopeCache(assets: assets, token: libraryChangeToken)
+        let allowNonRaw = MobileSettings.allowNonRaw
+        if scope.isOriginFilter, let all = index.entry(.all, allowNonRaw: allowNonRaw) {
+            assets = filterOrigin(all.assets, for: scope)
+            // 复用来源列表的 generation，不能用当前代数：精修在飞时相册可能已经变化，
+            // 否则旧列表会被标记成新数据，之后普通刷新会命中它而漏掉新照片。
+            index.store(assets, for: scope, allowNonRaw: allowNonRaw,
+                        generation: all.generation)
         }
     }
 
@@ -857,15 +909,21 @@ final class MobileEngine: ObservableObject {
         let store = self.store
         Task { [weak self] in
             guard let self else { return }
+            // 整批共用一个临时根目录，结束后一次清理；每张仍放在独立子目录里，
+            // 既保证同名文件不互相覆盖，也让中断时最多遗留一个 album-* 目录。
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("album-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
             for photo in imported {
                 let source = store.originalURL(for: photo)
                 let filename = photo.filename
                 guard let temp = await Task.detached(priority: .utility, operation: {
-                    Self.prepareAlbumFile(source: source, filename: filename)
+                    Self.prepareAlbumFile(source: source, filename: filename, root: root)
                 }).value else { continue }
                 await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                     PhotoLibraryExport.save(temp) { _ in
-                        try? FileManager.default.removeItem(at: temp.deletingLastPathComponent())
                         continuation.resume()
                     }
                 }
@@ -875,10 +933,11 @@ final class MobileEngine: ObservableObject {
     }
 
     /// 相册写入要求文件名保持原样，主页按 originalFilename 把资产映射回库内记录。
-    /// 每个文件放在独立临时目录里，避免并发导入同名文件时互相覆盖。
-    private nonisolated static func prepareAlbumFile(source: URL, filename: String) -> URL? {
-        let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("album-\(UUID().uuidString)", isDirectory: true)
+    /// 每张文件放在批次根目录下的独立子目录里，避免同名文件互相覆盖。
+    private nonisolated static func prepareAlbumFile(
+        source: URL, filename: String, root: URL
+    ) -> URL? {
+        let folder = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let temp = folder.appendingPathComponent(filename)
         guard (try? FileManager.default.copyItem(at: source, to: temp)) != nil else {
@@ -889,11 +948,20 @@ final class MobileEngine: ObservableObject {
     }
 
     func remove(photoID: String) {
-        if let photo = store.photos.first(where: { $0.id == photoID }),
-           let thumbnail = photo.thumbnailPath {
-            MThumbnailCache.shared.remove(path: thumbnail)
+        remove(photoIDs: [photoID])
+    }
+
+    /// 批量删除库内记录：一次移除、只同步落盘一次，再清缩略图缓存。
+    func remove(photoIDs: [String]) {
+        guard !photoIDs.isEmpty else { return }
+        for photoID in photoIDs {
+            if let photo = store.photos.first(where: { $0.id == photoID }),
+               let thumbnail = store.thumbnailURL(for: photo) {
+                // 缓存键是缩略图的绝对路径，不能传索引里的相对路径。
+                MThumbnailCache.shared.remove(path: thumbnail.path)
+            }
         }
-        try? store.remove(id: photoID)
+        try? store.remove(ids: photoIDs)
         refreshPhotos()
     }
 
@@ -911,9 +979,8 @@ final class MobileEngine: ObservableObject {
             NSLog("MDelete failed %@", error.localizedDescription)
             return 0
         }
-        for id in photoIDs {
-            remove(photoID: id)
-        }
+        // 同一次删除只落盘一次；逐张 remove 会让每条记录都做一次整库编码。
+        remove(photoIDs: photoIDs)
         await refreshAssets(force: true)
         return fetched.count
     }
@@ -1070,15 +1137,16 @@ final class MobileEngine: ObservableObject {
         }
     }
 
-    /// 批量补缩略图时避免每张都全量重建主页列表。
+    /// 批量补缩略图时避免每张都全量重建主页列表：固定 0.12 秒合并一帧。
+    /// 不能每次完成都取消重排，否则连续完成会把刷新无限顺延。
     private func refreshPhotosSoon() {
-        refreshWork?.cancel()
+        guard refreshWork == nil else { return }
         let work = DispatchWorkItem { [weak self] in
             self?.refreshWork = nil
             self?.refreshPhotos()
         }
         refreshWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
 
     // MARK: - 显影会话

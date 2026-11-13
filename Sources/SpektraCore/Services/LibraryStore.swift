@@ -109,6 +109,9 @@ final class LibraryStore: @unchecked Sendable {
     private(set) var photos: [LibraryPhoto] = []
     let root: URL
     private let ioQueue = DispatchQueue(label: "spektrafilm.library.io", qos: .utility)
+    /// 缩略图批量写回时合并落盘：连续完成只编码一次整库索引。
+    private let persistLock = NSLock()
+    private var pendingThumbnailPersist: DispatchWorkItem?
     /// 移动端打开「支持 JPEG」后需要保留编码图记录，桌面端仍只保留 RAW。
     private let keepsEncodedRecords: Bool
     private var indexURL: URL { root.appendingPathComponent("index.json") }
@@ -340,14 +343,31 @@ final class LibraryStore: @unchecked Sendable {
     }
 
     func remove(id: String) throws {
-        guard let index = photos.firstIndex(where: { $0.id == id }) else { return }
-        let photo = photos[index]
-        photos.remove(at: index)
-        // 先把索引落盘，再删文件：索引写失败时不会留下指向已删原图的条目。
-        try save()
-        try? FileManager.default.removeItem(at: originalURL(for: photo))
-        if let thumbnail = photo.thumbnailPath {
-            try? FileManager.default.removeItem(at: Self.resolve(thumbnail, root: root, folder: "Thumbnails"))
+        try remove(ids: [id])
+    }
+
+    /// 批量删除：一次移除全部记录、只落盘一次，再逐个清理原图与缩略图。
+    /// 多选删除时避免每张都做一次整库 JSON 编码与同步写盘。
+    func remove(ids: [String]) throws {
+        let idSet = Set(ids)
+        guard !idSet.isEmpty else { return }
+        let removed = photos.filter { idSet.contains($0.id) }
+        guard !removed.isEmpty else { return }
+        let previous = photos
+        photos.removeAll { idSet.contains($0.id) }
+        // 先把索引落盘，再删文件：索引写失败时回滚内存记录，避免 UI 与磁盘分叉。
+        do {
+            try save()
+        } catch {
+            photos = previous
+            throw error
+        }
+        for photo in removed {
+            try? FileManager.default.removeItem(at: originalURL(for: photo))
+            if let thumbnail = photo.thumbnailPath {
+                try? FileManager.default.removeItem(
+                    at: Self.resolve(thumbnail, root: root, folder: "Thumbnails"))
+            }
         }
     }
 
@@ -355,7 +375,7 @@ final class LibraryStore: @unchecked Sendable {
         guard let photo = photos.first(where: { $0.id == id }) else { return }
         let path = try writeThumbnailFile(
             id: id, image: image, colorSpace: photo.edit.io.outputColorSpace)
-        commitThumbnail(id: id, relativePath: path)
+        commitThumbnail(id: id, relativePath: path, coalesce: false)
     }
 
     /// 后台写缩略图文件：只做编码与磁盘写入，不读写 `photos`，可在任意线程调用。
@@ -367,18 +387,157 @@ final class LibraryStore: @unchecked Sendable {
     }
 
     /// 在主线程把后台写好的缩略图路径写回库。
-    func commitThumbnail(id: String, relativePath: String) {
+    /// `coalesce` 为 true 时把索引写入合并到一次延迟任务，避免批量补缩略图时
+    /// 每张都重新编码整个 photos 数组。
+    func commitThumbnail(id: String, relativePath: String, coalesce: Bool = true) {
         guard let index = photos.firstIndex(where: { $0.id == id }) else { return }
         photos[index].thumbnailPath = relativePath
-        persistIndexAsync()
+        if coalesce {
+            scheduleIndexPersist()
+        } else {
+            persistIndexAsync()
+        }
+    }
+
+    private func scheduleIndexPersist() {
+        persistLock.lock()
+        pendingThumbnailPersist?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.persistLock.lock()
+            self.pendingThumbnailPersist = nil
+            self.persistLock.unlock()
+            self.persistIndexAsync()
+        }
+        pendingThumbnailPersist = work
+        persistLock.unlock()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
     }
 
     static func pixelSize(url: URL) -> (width: Int, height: Int) {
+        // iOS 的 ImageIO 对部分索尼 ARW 会把 index 0 报告成内嵌预览（如 1616×1080），
+        // 直接用它会让「原图长边」变成预览长边，导出选最大尺寸也只有 1080。
+        // TIFF 系 RAW 先扫描 IFD/SubIFD，取真实的最大图像尺寸。
+        if ImageLoader.rawSuffixes.contains(url.pathExtension.lowercased()),
+           let raw = RawTIFFDimensions.pixelSize(url: url) {
+            return raw
+        }
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
                 as? [String: Any] else { return (0, 0) }
         let width = properties[kCGImagePropertyPixelWidth as String] as? Int ?? 0
         let height = properties[kCGImagePropertyPixelHeight as String] as? Int ?? 0
         return (width, height)
+    }
+
+    /// 直接扫描 TIFF IFD / SubIFD 的 RAW 尺寸。
+    ///
+    /// 不依赖 CIRAWFilter（模拟器上查询 RAW 描述会长时间不返回），也不依赖
+    /// ImageIO 的 index 0 属性；ARW / NEF / CR2 / DNG 等 TIFF 系 RAW 都适用。
+    private enum RawTIFFDimensions {
+        static func pixelSize(url: URL) -> (width: Int, height: Int)? {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            guard let header = try? handle.read(upToCount: 8), header.count == 8 else { return nil }
+
+            let little: Bool
+            if header[0] == 0x49, header[1] == 0x49 {
+                little = true
+            } else if header[0] == 0x4D, header[1] == 0x4D {
+                little = false
+            } else {
+                return nil
+            }
+            guard u16(header, 2, little) == 42 else { return nil }
+            let first = Int(u32(header, 4, little))
+            guard first > 0 else { return nil }
+
+            var best = (width: 0, height: 0)
+            var visited = Set<Int>()
+
+            func read(_ offset: Int, depth: Int) {
+                guard depth <= 8, offset > 0, offset < 1 << 30,
+                      !visited.contains(offset) else { return }
+                visited.insert(offset)
+                guard let countData = Self.read(handle, at: offset, length: 2) else { return }
+                let entryCount = u16(countData, 0, little)
+                guard entryCount > 0, entryCount < 512 else { return }
+                let n = Int(entryCount)
+                guard let data = Self.read(handle, at: offset + 2, length: n * 12 + 4) else { return }
+
+                var width = 0
+                var height = 0
+                var children: [Int] = []
+
+                for index in 0..<n {
+                    let p = index * 12
+                    let tag = u16(data, p, little)
+                    let type = u16(data, p + 2, little)
+                    let count = Int(u32(data, p + 4, little))
+                    let value = Int(u32(data, p + 8, little))
+
+                    if type == 3, count == 1 {
+                        let short = Int(u16(data, p + 8, little))
+                        if tag == 0x0100 { width = short }
+                        if tag == 0x0101 { height = short }
+                    } else if type == 4, count == 1 {
+                        if tag == 0x0100 { width = value }
+                        if tag == 0x0101 { height = value }
+                    }
+
+                    if tag == 0x014A || tag == 0x8769 {
+                        if count <= 1 {
+                            children.append(value)
+                        } else if let list = Self.read(handle, at: value, length: count * 4) {
+                            for child in 0..<count {
+                                children.append(Int(u32(list, child * 4, little)))
+                            }
+                        }
+                    }
+                }
+
+                if width > 0, height > 0,
+                   width * height > best.width * best.height {
+                    best = (width, height)
+                }
+
+                let next = Int(u32(data, n * 12, little))
+                if next > 0 { read(next, depth: depth) }
+                for child in children where child > 0 {
+                    read(child, depth: depth + 1)
+                }
+            }
+
+            read(first, depth: 0)
+            return best.width > 0 && best.height > 0 ? best : nil
+        }
+
+        private static func read(_ handle: FileHandle, at offset: Int, length: Int) -> Data? {
+            guard offset >= 0, length > 0, length <= 1 << 20 else { return nil }
+            do {
+                try handle.seek(toOffset: UInt64(offset))
+                return try handle.read(upToCount: length)
+            } catch {
+                return nil
+            }
+        }
+
+        private static func u16(_ data: Data, _ offset: Int, _ little: Bool) -> UInt16 {
+            guard offset >= 0, offset + 2 <= data.count else { return 0 }
+            let b0 = UInt16(data[offset])
+            let b1 = UInt16(data[offset + 1])
+            return little ? (b0 | (b1 << 8)) : ((b0 << 8) | b1)
+        }
+
+        private static func u32(_ data: Data, _ offset: Int, _ little: Bool) -> UInt32 {
+            guard offset >= 0, offset + 4 <= data.count else { return 0 }
+            let b0 = UInt32(data[offset])
+            let b1 = UInt32(data[offset + 1])
+            let b2 = UInt32(data[offset + 2])
+            let b3 = UInt32(data[offset + 3])
+            return little
+                ? (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+                : ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+        }
     }
 }
