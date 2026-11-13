@@ -1531,9 +1531,12 @@ struct GradeScreen: View {
                     }
 
                     MSectionHead(title: "做旧", trailing: "默认关闭 · 作用于画面", compact: true)
-                    MParamSlider(label: "划痕", value: borderDouble(\.scratches),
+                    MParamSlider(label: "瑕疵", value: borderDouble(\.scratches),
                                  base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)
+                    MParamSlider(label: "细度", value: borderDouble(\.defectFineness),
+                                 base: 1, range: 0.5...3.0, step: 0.01, decimals: 2,
+                                 suffix: "×", compact: true)
                     MParamSlider(label: "灰尘", value: borderDouble(\.dust),
                                  base: 0, range: 0...1, step: 0.01, decimals: 2,
                                  suffix: "", compact: true)

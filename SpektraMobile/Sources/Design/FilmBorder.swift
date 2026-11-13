@@ -497,6 +497,8 @@ struct MFilmBorderConfig: Codable, Hashable {
     var dateText: String = ""
     // 做旧默认全关：干净扫描件才是参考图的方向。
     var scratches: Double = 0.0
+    /// 瑕疵细度：数值越高，瑕疵越小越密；越低则更粗更疏。
+    var defectFineness: Double = 1.0
     var dust: Double = 0.0
     var fog: Double = 0.0
 
@@ -512,6 +514,7 @@ struct MFilmBorderConfig: Codable, Hashable {
         case edgeText, edgeTextMode, customText, textTone, textScale, frameNumbers, dxCode, notch
         case dateStamp, datePosition, dateStyle, dateMode, dateFont, dateScale, dateOrientation, dateText
         case scratches, dust, fog
+        case defectFineness
     }
 
     init(from decoder: Decoder) throws {
@@ -556,6 +559,7 @@ struct MFilmBorderConfig: Codable, Hashable {
             ?? MFilmBorderDateOrientation.horizontal.rawValue
         dateText = try c.decodeIfPresent(String.self, forKey: .dateText) ?? ""
         scratches = try c.decodeIfPresent(Double.self, forKey: .scratches) ?? 0
+        defectFineness = try c.decodeIfPresent(Double.self, forKey: .defectFineness) ?? 1
         dust = try c.decodeIfPresent(Double.self, forKey: .dust) ?? 0
         fog = try c.decodeIfPresent(Double.self, forKey: .fog) ?? 0
     }
@@ -634,6 +638,7 @@ struct MFilmBorderConfig: Codable, Hashable {
         value.textScale = min(max(value.textScale, 0.5), 2.5)
         value.dateScale = min(max(value.dateScale, 0.4), 2.5)
         value.scratches = min(max(value.scratches, 0.0), 1.0)
+        value.defectFineness = min(max(value.defectFineness, 0.5), 3.0)
         value.dust = min(max(value.dust, 0.0), 1.0)
         value.fog = min(max(value.fog, 0.0), 1.0)
         value.customText = String(value.customText.prefix(28))
@@ -1801,7 +1806,7 @@ enum MFilmBorderRenderer {
 
     // MARK: 做旧
 
-    /// 划痕、灰尘、雾化统一画在整张成品上（片基 + 画面）。
+    /// 瑕疵（发丝痕、擦花、麻点、擦拭弧痕）、灰尘、雾化统一画在整张成品上（片基 + 画面）。
     /// 位置由 photoID 决定：预览、缩略图与导出拿到的是同一批纹理。
     private static func drawAging(_ context: CGContext, layout: MFilmBorderLayout,
                                   config: MFilmBorderConfig, photoID: String) {
@@ -1817,133 +1822,257 @@ enum MFilmBorderRenderer {
         drawFog(context, layout: layout, config: config, photoID: photoID)
     }
 
-    /// 划痕：真实片基划痕是极细、极淡、走向随机且断续的瑕疵，
-    /// 不是贯穿画面的直线。这里按「微痕 / 中等 / 长丝」三档生成，
-    /// 每条都带随机游走抖动、断点和沿程明暗变化。
+    /// 表面瑕疵：玻璃 / 片基上的磨损不只有划痕，还有成片擦花、细麻点、
+    /// 擦拭弧痕和长短不一的发丝痕。所有元素都由 photoID 驱动，
+    /// 预览、缩略图与导出拿到的是同一批纹理。
     private static func drawScratches(_ context: CGContext, layout: MFilmBorderLayout,
                                       config: MFilmBorderConfig, photoID: String,
                                       areaScale: CGFloat) {
         guard config.scratches > 0.001 else { return }
+        let level = min(1, max(0, config.scratches))
+        // 细度：>1 每条瑕疵更小、数量更多；<1 更粗、更疏。
+        let fineness = CGFloat(min(3.0, max(0.5, config.defectFineness)))
+        let sizeScale = 1 / fineness
+        let widthScale = 1 / pow(fineness, 0.7)
+        let alphaScale = 1 / pow(fineness, 0.35)
         let width = layout.canvas.width
         let height = layout.canvas.height
         let diagonal = sqrt(width * width + height * height)
-        var random = MFilmBorderRandom(seed: "aging-scratch-\(photoID)-\(config.gauge)")
-        let level = min(1, max(0, config.scratches))
-        let count = max(3, Int((level * 90 * areaScale).rounded()))
         let baseAngle = layout.alongX ? 0 : CGFloat.pi / 2
-        let minWidth = max(0.42, layout.pxPerMM * 0.006)
+        let minWidth = max(0.26, max(0.42, layout.pxPerMM * 0.006) * widthScale)
+        let count = max(8, Int((level * 260 * areaScale * pow(Double(fineness), 1.2)).rounded()))
+        var random = MFilmBorderRandom(seed: "aging-defect-\(photoID)-\(config.gauge)")
 
         context.saveGState()
         context.setLineCap(.round)
         context.setLineJoin(.round)
 
         for _ in 0..<count {
-            // 长度分布：七成是几乎看不清的微痕，少量中等，偶尔一条长丝。
-            let roll = random.unit()
-            let span: CGFloat
-            let samples: Int
-            if roll < 0.70 {
-                span = diagonal * random.range(0.004, 0.030)
-                samples = 3
-            } else if roll < 0.94 {
-                span = diagonal * random.range(0.030, 0.120)
-                samples = 7
+            let kind = random.unit()
+            if kind < 0.20 {
+                drawHairline(context, random: &random, width: width, height: height,
+                             diagonal: diagonal, baseAngle: baseAngle,
+                             minWidth: minWidth, level: level,
+                             sizeScale: sizeScale, alphaScale: alphaScale)
+            } else if kind < 0.58 {
+                drawMicroScratch(context, random: &random, width: width, height: height,
+                                 diagonal: diagonal, minWidth: minWidth, level: level,
+                                 sizeScale: sizeScale, alphaScale: alphaScale)
+            } else if kind < 0.80 {
+                drawScuffPatch(context, random: &random, width: width, height: height,
+                               diagonal: diagonal, minWidth: minWidth, level: level,
+                               sizeScale: sizeScale, alphaScale: alphaScale,
+                               fineness: fineness)
+            } else if kind < 0.93 {
+                drawPit(context, random: &random, width: width, height: height,
+                        minWidth: minWidth, level: level,
+                        sizeScale: sizeScale, alphaScale: alphaScale)
             } else {
-                span = diagonal * random.range(0.120, 0.360)
-                samples = 16
+                drawWipeArc(context, random: &random, width: width, height: height,
+                            diagonal: diagonal, minWidth: minWidth, level: level,
+                            sizeScale: sizeScale, alphaScale: alphaScale)
             }
+        }
+        context.restoreGState()
+    }
 
-            // 走向：多数顺着片长但明显偏摆，另有约四分之一是斜向擦痕，
-            // 用来打散「一排竖条」的刻板感。
-            let angle = baseAngle + (random.unit() < 0.26
-                ? random.range(-1.15, 1.15)
-                : random.range(-0.38, 0.38))
-            let dir = CGPoint(x: cos(angle), y: sin(angle))
-            let normal = CGPoint(x: -dir.y, y: dir.x)
-            let start = CGPoint(x: random.range(-0.02 * width, 1.02 * width),
-                                y: random.range(-0.02 * height, 1.02 * height))
+    /// 发丝痕：较长、略弯、断续，亮痕带一圈很淡的光晕。
+    private static func drawHairline(_ context: CGContext, random: inout MFilmBorderRandom,
+                                     width: CGFloat, height: CGFloat, diagonal: CGFloat,
+                                     baseAngle: CGFloat, minWidth: CGFloat, level: CGFloat,
+                                     sizeScale: CGFloat, alphaScale: CGFloat) {
+        let span = diagonal * random.range(0.04, 0.16) * sizeScale
+        let samples = 12
+        let angle = baseAngle + (random.unit() < 0.32
+            ? random.range(-1.2, 1.2)
+            : random.range(-0.42, 0.42))
+        let dir = CGPoint(x: cos(angle), y: sin(angle))
+        let normal = CGPoint(x: -dir.y, y: dir.x)
+        let start = CGPoint(x: random.range(-0.05 * width, 1.05 * width),
+                            y: random.range(-0.05 * height, 1.05 * height))
+        let jitter = diagonal * random.range(0.0004, 0.0016) * sizeScale
+        let bright = random.unit() > 0.62
+        let tone: (CGFloat, CGFloat, CGFloat) = bright
+            ? (1.0, 0.99, 0.95)
+            : (0.10, 0.095, 0.085)
+        let peak = random.range(0.10, 0.26) * (0.45 + level * 0.55) * alphaScale
+        let lineWidth = minWidth * random.range(0.9, 2.0)
 
-            // 弯曲：低幅随机游走，长划痕抖动更明显。
-            let jitter = layout.pxPerMM * random.range(0.015, 0.075) * (roll > 0.94 ? 2.0 : 1)
-            let bright = random.unit() > 0.70
-            let tone: (CGFloat, CGFloat, CGFloat) = bright
-                ? (1.0, 0.99, 0.95)
-                : (0.09, 0.085, 0.075)
-            let peak = random.range(0.020, 0.090) * (0.55 + level * 0.45)
-            let lineWidth = minWidth * random.range(1.0, 2.4)
+        var breaks: [(CGFloat, CGFloat)] = []
+        for _ in 0..<Int(random.range(0, 2.99)) {
+            let from = random.range(0.05, 0.85)
+            breaks.append((from, from + random.range(0.03, 0.16)))
+        }
 
-            // 断点：真实划痕沿线会突然消失一小段。
-            var breaks: [(CGFloat, CGFloat)] = []
-            for _ in 0..<Int(random.range(0, 2.99)) {
-                let from = random.range(0.05, 0.85)
-                breaks.append((from, from + random.range(0.03, 0.16)))
+        var points: [CGPoint] = []
+        var lateral: CGFloat = 0
+        for index in 0...samples {
+            let t = CGFloat(index) / CGFloat(samples)
+            if index > 0 {
+                lateral += random.range(-1, 1) * jitter
             }
+            let along = span * t
+            points.append(CGPoint(
+                x: start.x + dir.x * along + normal.x * lateral,
+                y: start.y + dir.y * along + normal.y * lateral))
+        }
 
-            var points: [CGPoint] = []
-            var lateral: CGFloat = 0
-            for index in 0...samples {
-                let t = CGFloat(index) / CGFloat(samples)
-                if index > 0 {
-                    lateral += random.range(-1, 1) * jitter
-                }
-                let along = span * t
-                points.append(CGPoint(
-                    x: start.x + dir.x * along + normal.x * lateral,
-                    y: start.y + dir.y * along + normal.y * lateral))
-            }
-
-            for index in 1...samples {
-                let t0 = CGFloat(index - 1) / CGFloat(samples)
-                let t1 = CGFloat(index) / CGFloat(samples)
-                let mid = (t0 + t1) * 0.5
-                if breaks.contains(where: { mid >= $0.0 && mid <= $0.1 }) { continue }
-                let taper = pow(sin(mid * .pi), 0.7)
-                guard taper > 0.02 else { continue }
-                let alpha = peak * taper * random.range(0.55, 1.0)
-                if bright {
-                    // 反光划痕只有一圈极淡的暖白光晕。
-                    context.setStrokeColor(red: 1.0, green: 0.98, blue: 0.93,
-                                           alpha: alpha * 0.20)
-                    context.setLineWidth(lineWidth * 2.6)
-                    context.move(to: points[index - 1])
-                    context.addLine(to: points[index])
-                    context.strokePath()
-                }
-                context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
-                                       alpha: alpha)
-                context.setLineWidth(max(0.34, lineWidth * (0.60 + 0.40 * taper)))
+        for index in 1...samples {
+            let mid = (CGFloat(index) - 0.5) / CGFloat(samples)
+            if breaks.contains(where: { mid >= $0.0 && mid <= $0.1 }) { continue }
+            let taper = pow(sin(mid * .pi), 0.7)
+            guard taper > 0.02 else { continue }
+            let alpha = peak * taper * random.range(0.6, 1.0)
+            if bright {
+                context.setStrokeColor(red: 1.0, green: 0.98, blue: 0.93,
+                                       alpha: alpha * 0.35)
+                context.setLineWidth(lineWidth * 2.4)
                 context.move(to: points[index - 1])
                 context.addLine(to: points[index])
                 context.strokePath()
             }
-
-            // 成组出现的伴生划痕：更短、更淡、紧贴主线。
-            if roll >= 0.70, random.unit() > 0.72 {
-                let shift = minWidth * random.range(0.8, 2.4) * (random.unit() > 0.5 ? 1 : -1)
-                let fromT = random.range(0.15, 0.45)
-                let toT = random.range(0.55, 0.90)
-                var previous: CGPoint?
-                for step in 0...6 {
-                    let t = fromT + (toT - fromT) * CGFloat(step) / 6
-                    let wobble = sin(t * .pi) * jitter * 0.6
-                    let base = CGPoint(x: start.x + dir.x * span * t,
-                                       y: start.y + dir.y * span * t)
-                    let point = CGPoint(x: base.x + normal.x * (shift + wobble),
-                                        y: base.y + normal.y * (shift + wobble))
-                    if let previous {
-                        let taper = sin((t - fromT) / max(0.01, toT - fromT) * .pi)
-                        context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
-                                               alpha: peak * 0.45 * (0.25 + 0.75 * taper))
-                        context.setLineWidth(max(0.30, lineWidth * 0.55))
-                        context.move(to: previous)
-                        context.addLine(to: point)
-                        context.strokePath()
-                    }
-                    previous = point
-                }
-            }
+            context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2, alpha: alpha)
+            context.setLineWidth(max(0.26, lineWidth * (0.60 + 0.40 * taper)))
+            context.move(to: points[index - 1])
+            context.addLine(to: points[index])
+            context.strokePath()
         }
-        context.restoreGState()
+    }
+
+    /// 短微痕：几个像素到一小段，方向随机，是画面里最多的「细小瑕疵」。
+    private static func drawMicroScratch(_ context: CGContext, random: inout MFilmBorderRandom,
+                                         width: CGFloat, height: CGFloat, diagonal: CGFloat,
+                                         minWidth: CGFloat, level: CGFloat,
+                                         sizeScale: CGFloat, alphaScale: CGFloat) {
+        let span = diagonal * random.range(0.004, 0.035) * sizeScale
+        let angle = random.range(0, .pi)
+        let dir = CGPoint(x: cos(angle), y: sin(angle))
+        let normal = CGPoint(x: -dir.y, y: dir.x)
+        let start = CGPoint(x: random.range(0, width), y: random.range(0, height))
+        let jitter = span * random.range(0.02, 0.10)
+        let bright = random.unit() > 0.45
+        let tone: (CGFloat, CGFloat, CGFloat) = bright
+            ? (1.0, 0.99, 0.95)
+            : (0.10, 0.095, 0.085)
+        let alpha = random.range(0.10, 0.28) * (0.45 + level * 0.55) * alphaScale
+        let lineWidth = max(0.26, minWidth * random.range(0.8, 1.6))
+        let samples = 3
+
+        context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
+                               alpha: alpha * 0.9)
+        context.setLineWidth(lineWidth)
+        var previous = CGPoint.zero
+        for index in 0...samples {
+            let t = CGFloat(index) / CGFloat(samples)
+            let lateral = sin(t * .pi * 2) * jitter
+            let point = CGPoint(x: start.x + dir.x * span * t + normal.x * lateral,
+                                y: start.y + dir.y * span * t + normal.y * lateral)
+            if index > 0 {
+                context.move(to: previous)
+                context.addLine(to: point)
+                context.strokePath()
+            }
+            previous = point
+        }
+    }
+
+    /// 擦花：一小片平行的短痕，模拟镜片 / 片基被擦拭或摩擦后的成片磨损。
+    private static func drawScuffPatch(_ context: CGContext, random: inout MFilmBorderRandom,
+                                       width: CGFloat, height: CGFloat, diagonal: CGFloat,
+                                       minWidth: CGFloat, level: CGFloat,
+                                       sizeScale: CGFloat, alphaScale: CGFloat,
+                                       fineness: CGFloat) {
+        let center = CGPoint(x: random.range(0, width), y: random.range(0, height))
+        let angle = random.range(0, .pi)
+        let dir = CGPoint(x: cos(angle), y: sin(angle))
+        let normal = CGPoint(x: -dir.y, y: dir.x)
+        let lines = max(2, Int((random.range(3, 8.99) * sqrt(fineness)).rounded()))
+        let span = diagonal * random.range(0.015, 0.055) * sizeScale
+        let bright = random.unit() > 0.30
+        let tone: (CGFloat, CGFloat, CGFloat) = bright
+            ? (1.0, 0.99, 0.95)
+            : (0.10, 0.095, 0.085)
+
+        for index in 0..<lines {
+            let offset = (CGFloat(index) - CGFloat(lines) / 2)
+                * minWidth * random.range(1.2, 3.0)
+            let start = CGPoint(x: center.x + normal.x * offset,
+                                y: center.y + normal.y * offset)
+            let length = span * random.range(0.55, 1.0)
+            let alpha = random.range(0.05, 0.16) * (0.45 + level * 0.55) * alphaScale
+            let lineWidth = max(0.26, minWidth * random.range(0.7, 1.3))
+            let drift = random.range(-1, 1) * minWidth * 0.8
+            context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
+                                   alpha: alpha)
+            context.setLineWidth(lineWidth)
+            context.move(to: start)
+            context.addLine(to: CGPoint(x: start.x + dir.x * length + normal.x * drift,
+                                        y: start.y + dir.y * length + normal.y * drift))
+            context.strokePath()
+        }
+    }
+
+    /// 麻点：玻璃面上的细小磕碰，亮坑带一点拖尾。
+    private static func drawPit(_ context: CGContext, random: inout MFilmBorderRandom,
+                                width: CGFloat, height: CGFloat,
+                                minWidth: CGFloat, level: CGFloat,
+                                sizeScale: CGFloat, alphaScale: CGFloat) {
+        let center = CGPoint(x: random.range(0, width), y: random.range(0, height))
+        let radius = max(0.4, minWidth * random.range(0.7, 2.2) * sizeScale)
+        let bright = random.unit() > 0.40
+        let alpha = random.range(0.15, 0.38) * (0.45 + level * 0.55) * alphaScale
+        let tone: (CGFloat, CGFloat, CGFloat) = bright
+            ? (1.0, 0.985, 0.94)
+            : (0.07, 0.065, 0.058)
+        context.setFillColor(red: tone.0, green: tone.1, blue: tone.2, alpha: alpha)
+        let rx = radius * random.range(0.7, 1.5)
+        let ry = radius * random.range(0.6, 1.2)
+        context.fillEllipse(in: CGRect(x: center.x - rx, y: center.y - ry,
+                                       width: rx * 2, height: ry * 2))
+        if bright, random.unit() > 0.55 {
+            let tail = radius * random.range(2.0, 6.0)
+            let angle = random.range(0, .pi)
+            context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
+                                   alpha: alpha * 0.45)
+            context.setLineWidth(max(0.24, radius * 0.5))
+            context.move(to: center)
+            context.addLine(to: CGPoint(x: center.x + cos(angle) * tail,
+                                        y: center.y + sin(angle) * tail))
+            context.strokePath()
+        }
+    }
+
+    /// 擦拭弧痕：大半径的细弧，像是擦镜布绕圈留下的痕迹。
+    private static func drawWipeArc(_ context: CGContext, random: inout MFilmBorderRandom,
+                                    width: CGFloat, height: CGFloat, diagonal: CGFloat,
+                                    minWidth: CGFloat, level: CGFloat,
+                                    sizeScale: CGFloat, alphaScale: CGFloat) {
+        let radius = diagonal * random.range(0.25, 0.80) * sizeScale
+        let center = CGPoint(x: random.range(-radius * 0.4, width + radius * 0.4),
+                             y: random.range(-radius * 0.4, height + radius * 0.4))
+        let startAngle = random.range(0, .pi * 2)
+        let sweep = random.range(0.10, 0.42) * (random.unit() > 0.5 ? 1 : -1)
+        let bright = random.unit() > 0.55
+        let tone: (CGFloat, CGFloat, CGFloat) = bright
+            ? (1.0, 0.99, 0.95)
+            : (0.10, 0.095, 0.085)
+        let peak = random.range(0.05, 0.16) * (0.45 + level * 0.55) * alphaScale
+        let lineWidth = max(0.26, minWidth * random.range(0.8, 1.6))
+        let segments = 10
+
+        for index in 0..<segments {
+            let t0 = CGFloat(index) / CGFloat(segments)
+            let t1 = CGFloat(index + 1) / CGFloat(segments)
+            let taper = sin((t0 + t1) * 0.5 * .pi)
+            context.setStrokeColor(red: tone.0, green: tone.1, blue: tone.2,
+                                   alpha: peak * (0.25 + 0.75 * taper))
+            context.setLineWidth(lineWidth)
+            context.addArc(center: center, radius: radius,
+                           startAngle: startAngle + sweep * t0,
+                           endAngle: startAngle + sweep * t1,
+                           clockwise: sweep < 0)
+            context.strokePath()
+        }
     }
 
     /// 灰尘：小颗粒为主、少量大尘粒与绒毛；亮尘带柔边，暗尘是片基上的细小黑点。
