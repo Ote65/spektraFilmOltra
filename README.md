@@ -1,12 +1,44 @@
-# SpektraFilm Oltra
+<div align="center">
+  <img src="https://raw.githubusercontent.com/Ote65/spektraFilmOltra/iOS/img/readme/appicon.png" width="120" alt="SpektraFilm Oltra 应用图标">
+  <h1>SpektraFilm Oltra · 欧胶片</h1>
+  <p>光谱胶片模拟 · 原生 iOS 暗房<br>Spectral film simulation, natively on iPhone</p>
+  <p>
+    <img src="https://img.shields.io/badge/iOS-17%2B-0a84ff?style=flat-square" alt="iOS 17+">
+    <img src="https://img.shields.io/badge/SwiftUI-native-1d9bf0?style=flat-square" alt="SwiftUI">
+    <img src="https://img.shields.io/badge/100%25-offline-2ea44f?style=flat-square" alt="Offline">
+    <img src="https://img.shields.io/badge/license-GPLv3-555555?style=flat-square" alt="GPLv3">
+  </p>
+  <p>
+    <a href="https://spektra.ote.asia">官网 / Website</a> ·
+    <a href="https://github.com/Ote65/spektraFilmOltra/releases">下载 / Releases</a> ·
+    <a href="#ios">iOS 安装</a>
+  </p>
+</div>
 
-SpektraFilm Oltra 是 [spektrafilm](https://github.com/andreavolpato/spektrafilm)（GPLv3）的衍生版本：保留上游的光谱胶片模拟内核，重做前端交互，并补齐 iOS 与 Windows 两条原生/桌面产品线。
+## 中文介绍
 
-- **iOS 原生版**：SwiftUI，iPhone（iOS 17+），支持 RAW/DNG 导入、显影台、调色台与相册导出。
+**SpektraFilm Oltra（欧胶片）** 是 [spektrafilm](https://github.com/andreavolpato/spektrafilm)（GPLv3）的衍生版本：保留上游的光谱胶片模拟内核，重做前端交互，并补齐 iOS 与 Windows 两条产品线。
+
+- **iOS 原生版**：SwiftUI，iPhone（iOS 17+）。导入 RAW / DNG / JPEG / HEIC，按胶片 stock 做光谱显影，在暗房里调光色与曲线，加片边、日期戳与做旧瑕疵，最后直接导出到相册。全程本地离线运行，照片不出手机。
 - **Windows / Electron 版**：Electron + React 界面，Python 引擎以本地 sidecar 运行，提供 NSIS 安装包。
 - **Python / Qt 参考版**：上游参考实现与 Oltra 皮肤，用于算法对拍和桌面开发。
 
-> 显影、色彩、胶片/相纸模型等核心算法来自上游 spektrafilm。Oltra 的改动集中在界面、交互、参数映射与平台移植。
+## English
+
+**SpektraFilm Oltra** is a derivative of [spektrafilm](https://github.com/andreavolpato/spektrafilm) (GPLv3). It keeps the upstream spectral film-simulation engine and rebuilds the front end, adding native product lines on top of the original Python/Qt reference:
+
+- **Native iOS app** — SwiftUI, iPhone (iOS 17+). Import RAW / DNG / JPEG / HEIC, develop with spectral film stocks, grade light and color in a darkroom-style bench, add film borders, date stamps and aged surface defects, then export straight to Photos. Everything runs on-device and offline; photos never leave the phone.
+- **Windows / Electron** — React interface with a local Python engine sidecar, distributed as an NSIS installer.
+- **Python / Qt reference** — the upstream-based reference build used for parity checks and desktop development.
+
+> The development, color, film and paper models come from upstream spektrafilm. Oltra's changes focus on the interface, interaction, parameter mapping and platform ports.
+
+## 界面 / Screens
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Ote65/spektraFilmOltra/iOS/img/readme/ios-app.webp" width="300" alt="iPhone 上的暗房调色台">
+  <img src="https://raw.githubusercontent.com/Ote65/spektraFilmOltra/iOS/img/readme/mac-app.webp" width="640" alt="macOS 上的显影工作台">
+</p>
 
 ## 分支
 
@@ -16,12 +48,12 @@ SpektraFilm Oltra 是 [spektrafilm](https://github.com/andreavolpato/spektrafilm
 | `skin` | Python + Qt | Oltra 视觉皮肤 |
 | `OltraFilm` | Python + Qt | Oltra 桌面主线 |
 | `electron` | Windows / macOS | Electron 前端 + Python 引擎 |
-| `ios` | iPhone | SwiftUI 原生 App |
+| `iOS` | iPhone | SwiftUI 原生 App |
 
 ```bash
 git clone https://github.com/Ote65/spektraFilmOltra.git
 cd spektraFilmOltra
-git checkout electron   # 或 ios / python
+git checkout electron   # 或 iOS / python
 ```
 
 ## 下载与安装
@@ -41,18 +73,18 @@ git checkout electron   # 或 ios / python
 
 系统要求：iPhone（iOS 17 或更高）；构建需要 macOS 与 Xcode。
 
-仓库不提供带签名的 IPA：签名证书与具体设备绑定，无法通用分发。请按下面任一方式安装。
+[Releases](https://github.com/Ote65/spektraFilmOltra/releases) 里有开发签名的内测 IPA（当前 `v0.4.1-ios`）：只有已登记在开发者设备列表里的 iPhone 能直接安装，其他手机请用下面的方式重签。
 
 **方式 A：Xcode 直接安装（推荐）**
 
-1. 检出 `ios` 分支，打开 `SpektraMobileApp/SpektraMobile.xcodeproj`。
+1. 检出 `iOS` 分支，打开 `SpektraMobileApp/SpektraMobile.xcodeproj`。
 2. 在 **Signing & Capabilities** 选择自己的 Apple ID Team，并把 Bundle Identifier 改为唯一值（例如 `com.example.spektrafilm`）。
 3. 连接 iPhone，选中设备后 Run。
 4. 免费 Apple ID 的证书 7 天有效，到期后重新 Run 即可。
 
 **方式 B：IPA + 自签名工具**
 
-1. 按“iOS 开发构建”生成未签名 IPA。
+1. 从 Releases 下载内测 IPA，或按“iOS 开发构建”生成未签名 IPA。
 2. 用 [Sideloadly](https://sideloadly.io/) 或 AltStore 使用自己的 Apple ID 签名并安装。
 3. 若提示签名身份失效（`0xe8008018`），清除工具里的旧证书后重新签名；安装时保持设备解锁亮屏。
 
