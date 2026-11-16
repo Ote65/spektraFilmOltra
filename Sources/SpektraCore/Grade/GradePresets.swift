@@ -1,18 +1,37 @@
 import Foundation
 
+/// 调色预设可保存的参数组。裁切 / 边框不在配方内，天然不参与预设。
+enum MGradeGroupKey: String, CaseIterable, Codable, Hashable {
+    case light, color, optics, quality, lut
+
+    var title: String {
+        switch self {
+        case .light: return "光影"
+        case .color: return "色调"
+        case .optics: return "质感"
+        case .quality: return "细节"
+        case .lut: return "LUT"
+        }
+    }
+}
+
 struct GradePreset: Identifiable, Equatable, Codable {
     var id: String
     var name: String
     var recipe: GradeRecipe
     var builtin: Bool = false
+    /// nil = 旧数据 / 内置预设，应用时视为全部组。
+    var groups: Set<MGradeGroupKey>? = nil
 
-    enum CodingKeys: String, CodingKey { case id, name, recipe, builtin }
+    enum CodingKeys: String, CodingKey { case id, name, recipe, builtin, groups }
 
-    init(id: String, name: String, recipe: GradeRecipe, builtin: Bool = false) {
+    init(id: String, name: String, recipe: GradeRecipe, builtin: Bool = false,
+         groups: Set<MGradeGroupKey>? = nil) {
         self.id = id
         self.name = name
         self.recipe = recipe
         self.builtin = builtin
+        self.groups = groups
     }
 
     init(from decoder: Decoder) throws {
@@ -21,6 +40,12 @@ struct GradePreset: Identifiable, Equatable, Codable {
         name = (try? c.decode(String.self, forKey: .name)) ?? "未命名"
         recipe = (try? c.decode(GradeRecipe.self, forKey: .recipe)) ?? GradeRecipe()
         builtin = (try? c.decode(Bool.self, forKey: .builtin)) ?? false
+        groups = try? c.decode(Set<MGradeGroupKey>.self, forKey: .groups)
+    }
+
+    /// 实际应用 / 展示的组；旧数据回退为全部组。
+    var appliedGroups: Set<MGradeGroupKey> {
+        groups ?? Set(MGradeGroupKey.allCases)
     }
 }
 
@@ -118,12 +143,14 @@ final class GradePresetStore {
     ]
 
     @discardableResult
-    func save(name: String, recipe: GradeRecipe) -> GradePreset {
+    func save(name: String, recipe: GradeRecipe,
+              groups: Set<MGradeGroupKey> = Set(MGradeGroupKey.allCases)) -> GradePreset {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolved = trimmed.isEmpty ? "未命名预设" : trimmed
         let preset = GradePreset(
             id: "user-\(UUID().uuidString)",
-            name: resolved, recipe: recipe, builtin: false
+            name: resolved, recipe: recipe, builtin: false,
+            groups: groups
         )
         userPresets.append(preset)
         persist()
@@ -136,6 +163,16 @@ final class GradePresetStore {
         userPresets.remove(at: index)
         persist()
         return true
+    }
+
+    func restore(_ preset: GradePreset, at index: Int? = nil) {
+        guard !userPresets.contains(where: { $0.id == preset.id }) else { return }
+        if let index, index >= 0, index <= userPresets.count {
+            userPresets.insert(preset, at: index)
+        } else {
+            userPresets.append(preset)
+        }
+        persist()
     }
 
     func preset(id: String) -> GradePreset? {

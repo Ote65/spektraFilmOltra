@@ -161,6 +161,206 @@ struct MBrassPill: View {
     }
 }
 
+// MARK: - 黄铜圆形按钮（无文字）
+
+/// 顶栏保存预设用：与 MBrassPill 同色同高，但不带文字，只有矢量图标。
+struct MBrassCircleButton: View {
+    let icon: String
+    var size: CGFloat = 34
+    var disabled: Bool = false
+    var loading: Bool = false
+    var action: () -> Void
+
+    var body: some View {
+        Button {
+            MHaptic.light()
+            action()
+        } label: {
+            Group {
+                if loading {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                        .tint(MColor.brassInk)
+                        .scaleEffect(0.75)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 12, weight: .semibold))
+                }
+            }
+            .foregroundStyle(disabled ? MColor.text4 : MColor.brassInk)
+            .frame(width: size, height: size)
+            .background(Circle().fill(disabled ? MColor.surface3 : MColor.brass))
+            .frame(width: max(44, size), height: max(44, size))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(MPressStyle(scale: 0.92))
+        .disabled(disabled || loading)
+        .accessibilityLabel("保存预设")
+    }
+}
+
+// MARK: - 勾选行
+
+struct MCheckRow: View {
+    let label: String
+    var detail: String? = nil
+    @Binding var isOn: Bool
+    var isEnabled: Bool = true
+
+    var body: some View {
+        Button {
+            guard isEnabled else { return }
+            MHaptic.tick()
+            withAnimation(MMotion.quick) { isOn.toggle() }
+        } label: {
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(isOn && isEnabled ? MColor.brass : Color.clear)
+                    .frame(width: 19, height: 19)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .strokeBorder(isOn && isEnabled
+                                          ? MColor.brass
+                                          : MColor.hairlineStrong,
+                                          lineWidth: 1)
+                    )
+                    .overlay {
+                        if isOn && isEnabled {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(MColor.brassInk)
+                        }
+                    }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(label)
+                        .font(.mSans(11.5, .medium))
+                        .foregroundStyle(isEnabled ? MColor.text1 : MColor.text4)
+                        .lineLimit(1)
+                    if let detail {
+                        Text(detail)
+                            .mMeta(8, color: MColor.text4)
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 8)
+            }
+            .frame(height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(isOn ? "已勾选" : "未勾选")
+        .accessibilityAddTraits(isOn ? .isSelected : [])
+    }
+}
+
+// MARK: - 左滑删除行
+
+/// 抽屉里的自定义左滑删除：不把 List 嵌进 ScrollView，避免纵向滚动被抢。
+/// 只有水平位移明显大于垂直位移时才接管手势。
+struct MSwipeDeleteRow<Content: View>: View {
+    let rowID: String
+    @Binding var openedID: String?
+    var actionWidth: CGFloat = 72
+    /// 行背景必须与所在容器一致；默认匹配抽屉 fallback，避免用户预设行比内置行更黑。
+    var rowBackground: Color = MColor.surface2.opacity(0.96)
+    let onDelete: () -> Void
+    @ViewBuilder var content: () -> Content
+
+    @State private var dragTranslation: CGFloat = 0
+    @State private var horizontal = false
+
+    private var isOpen: Bool { openedID == rowID }
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Button {
+                MHaptic.medium()
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    openedID = nil
+                    onDelete()
+                }
+            } label: {
+                Text("删除")
+                    .font(.mSans(11, .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: actionWidth)
+                    .frame(maxHeight: .infinity)
+                    .background(Color.red.opacity(0.82))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .opacity(isOpen || dragTranslation < -2 ? 1 : 0)
+            .allowsHitTesting(isOpen)
+
+            content()
+                // 收起时保持透明，和普通预设行一致；只有拖动/展开时才铺不透明底遮住红色删除区。
+                .background(isOpen || dragTranslation < -1 ? rowBackground : Color.clear)
+                .overlay {
+                    // 行展开时，点内容只负责收起，不再触发下面的“套用预设”按钮。
+                    if isOpen {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(MMotion.quick) { openedID = nil }
+                            }
+                    }
+                }
+                .offset(x: offset)
+                .contentShape(Rectangle())
+                .simultaneousGesture(swipeGesture)
+        }
+        .clipped()
+        .accessibilityAction(named: "删除") { onDelete() }
+    }
+
+    private var offset: CGFloat {
+        let base = isOpen ? -actionWidth : 0
+        return min(0, max(-actionWidth - 24, base + dragTranslation))
+    }
+
+    private var swipeGesture: some Gesture {
+        DragGesture(minimumDistance: 12)
+            .onChanged { value in
+                if dragTranslation == 0 && !horizontal {
+                    horizontal = abs(value.translation.width) > abs(value.translation.height) * 1.25
+                }
+                guard horizontal else { return }
+                dragTranslation = value.translation.width
+            }
+            .onEnded { value in
+                guard horizontal else {
+                    dragTranslation = 0
+                    horizontal = false
+                    return
+                }
+                // 全滑删除：接近原生 Mail 的“一滑到底直接删”。
+                if value.translation.width < -actionWidth * 1.8 {
+                    MHaptic.medium()
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        openedID = nil
+                        onDelete()
+                    }
+                    dragTranslation = 0
+                    horizontal = false
+                    return
+                }
+                let projected = (isOpen ? -actionWidth : 0) + value.predictedEndTranslation.width
+                let shouldOpen = projected < -actionWidth * 0.55
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+                    openedID = shouldOpen ? rowID : nil
+                    dragTranslation = 0
+                }
+                horizontal = false
+            }
+    }
+}
+
 // MARK: - 筛选片
 
 struct MFilterChip: View {
@@ -510,6 +710,8 @@ struct MParamSlider: View {
     var decimals: Int = 0
     var suffix: String = ""
     var isEnabled: Bool = true
+    /// 专业模式接管后的快速滑条：显示锁，禁止拖动。
+    var isFrozen: Bool = false
     var compact: Bool = false
     /// 吸附点：拖到附近自动回到该值（0 = 默认状态），并给出一次吸附触感。
     var snapTarget: Double? = nil
@@ -535,9 +737,14 @@ struct MParamSlider: View {
                     .foregroundStyle(isEnabled ? MColor.text2 : MColor.text4)
                     .lineLimit(1)
                 Spacer(minLength: 8)
+                if isFrozen {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(MColor.text4)
+                }
                 Text(text(for: value))
                     .font(.mSans(compact ? 9.5 : 10.5, .medium).monospacedDigit())
-                    .foregroundStyle(isDirty ? MColor.brass : MColor.text3)
+                    .foregroundStyle(isDirty && !isFrozen ? MColor.brass : MColor.text3)
                     .contentTransition(.numericText())
                     .lineLimit(1)
             }
@@ -551,12 +758,15 @@ struct MParamSlider: View {
                 .opacity(isEnabled ? 1 : 0.4)
         }
         .frame(height: unitH)
+        .opacity(isFrozen ? 0.45 : 1)
+        .allowsHitTesting(!isFrozen)
         .animation(MMotion.quick, value: dragging)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
-        .accessibilityValue(text(for: value))
+        .accessibilityValue(isFrozen ? "已冻结" : text(for: value))
+        .accessibilityHint(isFrozen ? "专业模式有调整，重置显影后恢复" : "")
         .accessibilityAdjustableAction { direction in
-            guard isEnabled else { return }
+            guard isEnabled, !isFrozen else { return }
             let delta = max(step, (range.upperBound - range.lowerBound) / 100)
             switch direction {
             case .increment:
@@ -692,17 +902,28 @@ struct MToggleRow: View {
     @Binding var isOn: Bool
     var isEnabled: Bool = true
     var compact: Bool = false
+    /// 可选副标题：用于“仅前置 RAW 机型生效”这类限制说明。
+    var detail: String? = nil
 
     var body: some View {
-        HStack {
-            Text(label)
-                .font(.mSans(compact ? 11 : 12.5))
-                .foregroundStyle(isEnabled ? MColor.text2 : MColor.text4)
-            Spacer()
-            Button {
-                MHaptic.tick()
-                withAnimation(MMotion.state) { isOn.toggle() }
-            } label: {
+        Button {
+            guard isEnabled else { return }
+            MHaptic.tick()
+            withAnimation(MMotion.state) { isOn.toggle() }
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(label)
+                        .font(.mSans(compact ? 11 : 12.5))
+                        .foregroundStyle(isEnabled ? MColor.text2 : MColor.text4)
+                    if let detail {
+                        Text(detail)
+                            .font(.mSans(10, .regular))
+                            .foregroundStyle(MColor.text4)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer()
                 Capsule()
                     .fill(isOn ? MColor.brass.opacity(0.88) : MColor.surface3)
                     .frame(width: compact ? 38 : 42, height: compact ? 22 : 24)
@@ -716,12 +937,16 @@ struct MToggleRow: View {
                             .padding(.horizontal, 3)
                     }
                     .opacity(isEnabled ? 1 : 0.4)
-                    .contentShape(Capsule())
             }
-            .buttonStyle(.plain)
-            .disabled(!isEnabled)
+            .contentShape(Rectangle())
         }
-        .frame(height: compact ? 42 : 48)
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .frame(minHeight: compact ? 46 : 50)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(isOn ? "开" : "关")
+        .accessibilityAddTraits(isOn ? .isSelected : [])
     }
 }
 

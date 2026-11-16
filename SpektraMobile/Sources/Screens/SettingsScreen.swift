@@ -14,6 +14,12 @@ enum MobileSettings {
     static let launchScreenKey = "mobile.launch.screen"
     /// 冷启动时主页默认选中的筛选类型；相簿 ID 不稳定，不参与默认值。
     static let launchScopeKey = "mobile.launch.scope"
+    // 相机
+    static let cameraLevelKey = "mobile.camera.level"
+    static let cameraMirrorFrontKey = "mobile.camera.mirrorFront"
+    static let cameraEnterDevelopKey = "mobile.camera.enterDevelop"
+    static let cameraVolumeShutterKey = "mobile.camera.volumeShutter"
+    static let cameraDirectSaveOriginalKey = "mobile.camera.directSaveOriginal"
 
     /// 与导出面板的 formats 顺序一致：JPEG / TIFF sRGB / TIFF ProPhoto / EXR。
     static let exportFormatTitles = [
@@ -94,6 +100,26 @@ enum MobileSettings {
         return value.scope
     }
 
+    static var cameraLevelEnabled: Bool {
+        UserDefaults.standard.object(forKey: cameraLevelKey) as? Bool ?? true
+    }
+
+    static var cameraEnterDevelop: Bool {
+        UserDefaults.standard.object(forKey: cameraEnterDevelopKey) as? Bool ?? true
+    }
+
+    static var cameraVolumeShutter: Bool {
+        UserDefaults.standard.object(forKey: cameraVolumeShutterKey) as? Bool ?? true
+    }
+
+    static var cameraDirectSaveOriginal: Bool {
+        UserDefaults.standard.object(forKey: cameraDirectSaveOriginalKey) as? Bool ?? false
+    }
+
+    static var cameraMirrorFront: Bool {
+        UserDefaults.standard.object(forKey: cameraMirrorFrontKey) as? Bool ?? false
+    }
+
     private static func index(forKey key: String, count: Int, fallback: Int) -> Int {
         guard let number = UserDefaults.standard.object(forKey: key) as? Int else {
             return fallback
@@ -109,6 +135,8 @@ struct SettingsScreen: View {
     let onBack: () -> Void
     let onToast: (String) -> Void
     var previewURL: URL? = nil
+    /// 库根目录：用于统计 / 清理显影交接图缓存。
+    var cacheRoot: URL? = nil
 
     @AppStorage(MobileSettings.predictivePreviewKey) private var predictivePreview = true
     @AppStorage(MobileSettings.allowNonRawKey) private var allowNonRaw = false
@@ -117,12 +145,20 @@ struct SettingsScreen: View {
     @AppStorage(MobileSettings.defaultExportQualityKey) private var exportQuality = 1
     @AppStorage(MobileSettings.launchScreenKey) private var launchScreen = MobileSettings.MLaunchScreen.home.rawValue
     @AppStorage(MobileSettings.launchScopeKey) private var launchScope = MobileSettings.MLaunchScope.all.rawValue
+    @AppStorage(MobileSettings.cameraLevelKey) private var cameraLevel = true
+    @AppStorage(MobileSettings.cameraMirrorFrontKey) private var cameraMirrorFront = false
+    @AppStorage(MobileSettings.cameraEnterDevelopKey) private var cameraEnterDevelop = true
+    @AppStorage(MobileSettings.cameraVolumeShutterKey) private var cameraVolumeShutter = true
+    @AppStorage(MobileSettings.cameraDirectSaveOriginalKey) private var cameraDirectSaveOriginal = false
 
     @State private var watermark = MWatermarkStore.load()
     @State private var watermarkEditorOpen = false
     @State private var luts: [GradeLUTEntry] = []
     @State private var showLUTImporter = false
     @State private var pendingDelete: GradeLUTEntry?
+    @State private var handoffCacheCount = 0
+    @State private var handoffCacheBytes: Int64 = 0
+    @State private var clearingCache = false
     @Environment(\.mSafeInsets) private var insets
 
     var body: some View {
@@ -133,16 +169,19 @@ struct SettingsScreen: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 0) {
                         inputSection
+                        cameraSection
                         exportSection
                         previewSection
                         launchSection
                         watermarkSection
                         lutSection
+                        cacheSection
                     }
                     .padding(.horizontal, MMetric.pageMargin)
                     .padding(.bottom, insets.bottom + 28)
                 }
                 .scrollIndicators(.never)
+                .defaultScrollAnchor(DebugLaunch.settingsBottom ? .bottom : .top)
             }
             .padding(.top, insets.top)
             .offset(x: watermarkEditorOpen ? -72 : 0)
@@ -159,7 +198,10 @@ struct SettingsScreen: View {
                 .zIndex(3)
             }
         }
-        .onAppear { luts = GradePresetStore.shared.luts() }
+        .onAppear {
+            luts = GradePresetStore.shared.luts()
+            refreshCacheStats()
+        }
         .onChange(of: watermark) { _, value in
             MWatermarkStore.saveSoon(value)
         }
@@ -218,6 +260,45 @@ struct SettingsScreen: View {
 
             hairline
         }
+    }
+
+    // MARK: 相机
+
+    private var cameraSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            MSectionHead(title: "相机")
+                .padding(.top, 18)
+
+            MToggleRow(label: "水平仪", isOn: $cameraLevel, compact: true,
+                       detail: "取景框中央显示水平与俯拍参考")
+
+            MToggleRow(label: "镜像前置相机", isOn: $cameraMirrorFront, compact: true,
+                       detail: "仅镜像取景预览；RAW 原片与成片不翻转")
+
+            MToggleRow(label: "拍摄后进入显影台", isOn: $cameraEnterDevelop, compact: true,
+                       detail: "关闭后停留在取景页，可连续拍摄")
+
+            MToggleRow(label: "音量键拍摄", isOn: $cameraVolumeShutter,
+                       isEnabled: volumeShutterAvailable, compact: true,
+                       detail: volumeShutterDetail)
+
+            MToggleRow(label: "直出模式保存原图", isOn: $cameraDirectSaveOriginal, compact: true,
+                       detail: "开启后保留 RAW 与可回放的显影 / 调色工程")
+
+            hairline
+        }
+    }
+
+    private var volumeShutterAvailable: Bool {
+        if #available(iOS 17.2, *) { return true }
+        return false
+    }
+
+    private var volumeShutterDetail: String {
+        if #available(iOS 17.2, *) {
+            return "音量键或相机控制键触发快门"
+        }
+        return "需要 iOS 17.2 或更高版本"
     }
 
     // MARK: 导出
@@ -503,6 +584,86 @@ struct SettingsScreen: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(MPressStyle(scale: 0.98))
+    }
+
+    // MARK: 缓存
+
+    private var cacheSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            MSectionHead(title: "缓存")
+                .padding(.top, 18)
+
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("显影交接图")
+                        .font(.mSans(11.5, .medium))
+                        .foregroundStyle(MColor.text2)
+                    Text(handoffCacheDetail)
+                        .font(.mSans(9.5, .medium))
+                        .foregroundStyle(MColor.text4)
+                }
+
+                Spacer(minLength: 8)
+
+                Button {
+                    clearCaches()
+                } label: {
+                    Text(clearingCache ? "清理中…" : "清理")
+                        .font(.mSans(10.5, .semibold))
+                        .foregroundStyle(MColor.brassInk)
+                        .padding(.horizontal, 14)
+                        .frame(height: 30)
+                        .background(Capsule().fill(MColor.brass))
+                }
+                .buttonStyle(MPressStyle(scale: 0.94))
+                .disabled(clearingCache || handoffCacheCount == 0)
+                .opacity(clearingCache || handoffCacheCount == 0 ? 0.45 : 1)
+            }
+            .padding(.vertical, 7)
+
+            Text("清理交接图与缩略图内存缓存；原片、导出成片与调色参数不受影响。")
+                .font(.mSans(9, .medium))
+                .foregroundStyle(MColor.text4)
+                .fixedSize(horizontal: false, vertical: true)
+
+            hairline.padding(.top, 10)
+        }
+    }
+
+    private var handoffCacheDetail: String {
+        guard handoffCacheCount > 0 else { return "暂无缓存" }
+        return "\(handoffCacheCount) 张 · \(cacheSizeText(handoffCacheBytes)) · 用于调色台秒开"
+    }
+
+    private func cacheSizeText(_ bytes: Int64) -> String {
+        let mb = Double(bytes) / 1_048_576
+        if mb >= 100 { return String(format: "%.0f MB", mb) }
+        if mb >= 1 { return String(format: "%.1f MB", mb) }
+        return String(format: "%.0f KB", Double(bytes) / 1024)
+    }
+
+    private func refreshCacheStats() {
+        guard let cacheRoot else { return }
+        let stats = MDevelopHandoffCache.statistics(root: cacheRoot)
+        handoffCacheCount = stats.count
+        handoffCacheBytes = stats.bytes
+    }
+
+    private func clearCaches() {
+        guard let cacheRoot, !clearingCache else { return }
+        let freed = handoffCacheBytes
+        clearingCache = true
+        MHaptic.medium()
+        Task.detached(priority: .userInitiated) {
+            MDevelopHandoffCache.clear(root: cacheRoot)
+            await MainActor.run {
+                // 缩略图只是解码加速层；清掉后滚动时会按需重新读盘。
+                MThumbnailCache.shared.removeAll()
+                clearingCache = false
+                refreshCacheStats()
+                onToast(freed > 0 ? "已清理 \(cacheSizeText(freed)) 缓存" : "缓存已清理")
+            }
+        }
     }
 
     private var hairline: some View {

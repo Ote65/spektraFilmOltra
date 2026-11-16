@@ -10,6 +10,7 @@ struct MobileRootView: View {
     @State private var gradeEntry: MGradeEntry = .direct
     @State private var gradeReturn: MScreen = .home
     @State private var toast: String? = nil
+    @State private var toastAction: MToastAction? = nil
     @State private var toastToken = 0
     @State private var debugOpened = false
 
@@ -69,7 +70,13 @@ struct MobileRootView: View {
 
             if screen == .camera {
                 // 拍完直接入库并进入这张照片的显影台；相册写入在相机页后台继续。
-                CameraScreen(onClose: closeCamera, onCaptured: openCaptured)
+                CameraScreen(onClose: closeCamera,
+                             onCaptured: { url, enterDevelop, meta in
+                                 openCaptured(url, enterDevelop: enterDevelop, meta: meta)
+                             },
+                             onDirectSave: { request in
+                                 await saveDirect(request)
+                             })
                     .transition(.opacity)
                     .zIndex(3)
             }
@@ -78,7 +85,8 @@ struct MobileRootView: View {
                 SettingsScreen(
                     onBack: closeSettings,
                     onToast: showToast,
-                    previewURL: engine.photos.first?.thumbnailURL
+                    previewURL: engine.photos.first?.thumbnailURL,
+                    cacheRoot: engine.store.root
                 )
                 .transition(.move(edge: .trailing))
                 .zIndex(3)
@@ -92,7 +100,8 @@ struct MobileRootView: View {
                         beginSuck(image: image, from: rect, photoID: develop.photoID, insets: insets)
                     },
                     previewHidden: developPreviewHidden,
-                    onToast: showToast
+                    onToast: showToast,
+                    onToastAction: { text, action in showToast(text, action: action) }
                 )
                 .offset(x: screen == .grade && gradeReturn == .develop ? -72 : 0)
                 .allowsHitTesting(screen == .develop)
@@ -106,6 +115,7 @@ struct MobileRootView: View {
                     onBack: { closeGrade() },
                     onGoHome: goHome,
                     onToast: showToast,
+                    onToastAction: { text, action in showToast(text, action: action) },
                     library: engine.photos,
                     onSwitchPhoto: switchGradePhoto
                 )
@@ -119,18 +129,33 @@ struct MobileRootView: View {
             if let toast {
                 VStack {
                     Spacer()
-                    Text(toast)
-                        .font(.mSans(11, .medium))
-                        .foregroundStyle(MColor.text1)
-                        .padding(.horizontal, 15)
-                        .frame(height: 38)
-                        .background(Capsule().fill(MColor.surface3.opacity(0.96)))
-                        .overlay(Capsule().strokeBorder(MColor.hairlineStrong, lineWidth: 1))
-                        .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
-                        .padding(.bottom, insets.bottom + 76)
+                    HStack(spacing: 10) {
+                        Text(toast)
+                            .font(.mSans(11, .medium))
+                            .foregroundStyle(MColor.text1)
+                        if let toastAction {
+                            Button(toastAction.title) {
+                                toastAction.handler()
+                                toastToken += 1
+                                withAnimation(MMotion.state) {
+                                    self.toast = nil
+                                    self.toastAction = nil
+                                }
+                            }
+                            .font(.mSans(11, .semibold))
+                            .foregroundStyle(MColor.brass)
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 15)
+                    .frame(minHeight: 44)
+                    .background(Capsule().fill(MColor.surface3.opacity(0.96)))
+                    .overlay(Capsule().strokeBorder(MColor.hairlineStrong, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+                    .padding(.bottom, insets.bottom + 76)
                 }
                 .transition(.opacity.combined(with: .offset(y: 8)))
-                .allowsHitTesting(false)
+                .allowsHitTesting(toastAction != nil)
             }
 
             if let flightImage {
@@ -195,7 +220,9 @@ struct MobileRootView: View {
             case .develop:
                 develop = engine.openDevelop(photoID: first.id)
             case .grade:
-                grade = engine.openGrade(photoID: first.id, entry: .direct)
+                grade = engine.openGrade(
+                    photoID: first.id,
+                    entry: DebugLaunch.gradeHandoff ? .handoff : .direct)
             case .home, .camera, .settings:
                 break
             }
@@ -238,11 +265,12 @@ struct MobileRootView: View {
         Task { await engine.refreshAssets() }
     }
 
-    /// 拍完 → 入库 → 直接进入这张照片的显影台；导入失败才退回主页。
+    /// 拍完 → 入库 → 按设置决定是否直接进入这张照片的显影台。
+    /// `enterDevelop == false` 时停留在相机页，实现连续拍摄。
     /// 入库会把原片写进相册（与主页相册映射一致），成功后清理相机临时文件。
-    private func openCaptured(_ url: URL) {
+    private func openCaptured(_ url: URL, enterDevelop: Bool, meta: MCameraCaptureMeta) {
         Task {
-            let report = await engine.importPhotos([url])
+            let report = await engine.importPhotos([url], captureMeta: meta)
             guard let photoID = report.firstID else {
                 showToast(report.reason.isEmpty ? "拍摄的照片没能入库" : report.reason)
                 // 只有仍停留在拍摄页时才退回主页，避免失败回调把用户从其他页面拽走。
@@ -252,8 +280,77 @@ struct MobileRootView: View {
             try? FileManager.default.removeItem(at: url)
             // 入库期间用户可能已经关掉相机：此时只保留入库结果，不再强行跳页。
             guard screen == .camera else { return }
-            openDevelop(photoID)
+            if enterDevelop {
+                openDevelop(photoID)
+            } else {
+                showToast("已保存到访达")
+            }
         }
+    }
+
+    /// 直出保存：先把成片写进系统相册，再按设置决定是否保留 RAW 工程。
+    /// 先相册后工程可以避免相册被拒时重复导入同一张 RAW。
+    private func saveDirect(_ request: MDirectSaveRequest) async -> MDirectSaveOutcome {
+        // 片边在保存时合进成片：只解码编码图，不重新显影。
+        var borderedURL: URL?
+        if request.border.enabled {
+            let source = request.renderedURL
+            let border = request.border
+            let filmID = request.edit.filmStock
+            // 与预览用同一个标识，片边的随机纹理 / 编号在预览与成片之间保持一致。
+            let identifier = "direct-preview"
+            let quality = MDirectRenderSettings.fromPreferences().jpegQuality
+            borderedURL = await Task.detached(priority: .userInitiated) {
+                MDirectRenderer.compositeBorder(
+                    renderedURL: source, config: border, filmID: filmID,
+                    photoID: identifier, jpegQuality: quality)
+            }.value
+            // 用户选了片边就必须带上；合成失败时宁可报错重试，也不能悄悄保存成无片边。
+            guard borderedURL != nil else { return .failed("片边合成失败，请重试") }
+        }
+        defer {
+            if let borderedURL { try? FileManager.default.removeItem(at: borderedURL) }
+        }
+        let albumURL = borderedURL ?? request.renderedURL
+
+        let outcome: PhotoLibraryExport.Outcome = await withCheckedContinuation { continuation in
+            PhotoLibraryExport.save(albumURL) { continuation.resume(returning: $0) }
+        }
+
+        switch outcome {
+        case .denied:
+            // 保留临时成片，用户授权后可以在卡片上直接重试保存。
+            return .denied
+        case .failed:
+            return .failed("成片写入相册失败")
+        case .saved:
+            break
+        }
+
+        guard MobileSettings.cameraDirectSaveOriginal else {
+            // 关闭保存原图：不生成工程、不写 RAW，只保留渲染成片。
+            try? FileManager.default.removeItem(at: request.rawURL)
+            try? FileManager.default.removeItem(at: request.renderedURL)
+            return .saved("成片已保存到相册")
+        }
+
+        defer {
+            try? FileManager.default.removeItem(at: request.rawURL)
+            try? FileManager.default.removeItem(at: request.renderedURL)
+        }
+        let report = await engine.importPhotos([request.rawURL], publishToAlbum: true,
+                                              generateThumbnails: false)
+        guard let photoID = report.firstID else {
+            return .saved("成片已保存，原图保存失败")
+        }
+        await engine.applyDirectResult(
+            photoID: photoID,
+            edit: request.edit,
+            grade: request.grade,
+            baseline: request.baseline,
+            renderedURL: albumURL
+        )
+        return .saved("已保存原图与成片")
     }
 
     private func openDevelop(_ photoID: String) {
@@ -379,12 +476,25 @@ struct MobileRootView: View {
     }
 
     private func showToast(_ text: String) {
+        presentToast(text, action: nil, duration: 2.1)
+    }
+
+    /// 带一次操作（例如删除预设后的“撤销”）的 Toast。
+    private func showToast(_ text: String, action: MToastAction) {
+        presentToast(text, action: action, duration: 4.0)
+    }
+
+    private func presentToast(_ text: String, action: MToastAction?, duration: TimeInterval) {
         toastToken += 1
         let token = toastToken
+        toastAction = action
         withAnimation(MMotion.state) { toast = text }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.1) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
             guard token == toastToken else { return }
-            withAnimation(MMotion.state) { toast = nil }
+            withAnimation(MMotion.state) {
+                toast = nil
+                toastAction = nil
+            }
         }
     }
 }

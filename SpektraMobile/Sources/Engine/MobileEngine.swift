@@ -159,6 +159,9 @@ final class MobileEngine: ObservableObject {
     }
 
     private var index = AlbumIndex()
+    /// 相册变化后的合并刷新：拍照入库、保存成片、关闭相机可能连续触发，
+    /// 合并成一次全量扫描，避免后台同时跑多条 User Initiated 扫描把主线程资源抢光。
+    private var refreshDebounce: DispatchWorkItem?
     private var captureOverrideURL: URL {
         store.root.appendingPathComponent("capture-origins.json")
     }
@@ -225,6 +228,17 @@ final class MobileEngine: ObservableObject {
 
     // MARK: - 相册映射
 
+    /// 合并短时间内的多次相册刷新请求，0.6 秒内只真正扫描一次。
+    func requestAssetsRefresh() {
+        refreshDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Task { await self.refreshAssets(force: true) }
+        }
+        refreshDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
     /// 切换主页筛选：已有缓存时立即出列表，只有相册真的变化过才后台重扫。
     func selectScope(_ newScope: MAssetScope) {
         guard scope != newScope else { return }
@@ -251,6 +265,9 @@ final class MobileEngine: ObservableObject {
     /// - `force == false`：无变化时直接吃缓存；冷启动先出快照，再后台刷新。
     /// - `force == true`：下拉刷新、权限/开关变化、导入或收藏/删除后强制重扫。
     func refreshAssets(force: Bool = false) async {
+        // 同一个刷新还在飞时，普通刷新直接复用结果；否则启动 .task、切前台、
+        // 关相机都会各排一次全量扫描，大相册会叠成几十秒的 CPU 峰值。
+        if refreshInFlight > 0 && !force { return }
         refreshInFlight += 1
         defer { refreshInFlight -= 1 }
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
@@ -298,7 +315,12 @@ final class MobileEngine: ObservableObject {
                 return
             }
         }
-        loadAlbums()
+        // 相簿列表在后台枚举：相册很多时 PhotoKit 的同步枚举会占住主线程。
+        let albumInfo = await Task.detached(priority: .utility) {
+            Self.fetchAlbums()
+        }.value
+        albums = albumInfo.albums
+        hasRawAlbum = albumInfo.hasRaw
 
         // 有旧结果就先展示，避免刷新期间列表闪空。
         if assets.isEmpty, let cached = index.entry(scope, allowNonRaw: allowNonRaw) {
@@ -591,8 +613,8 @@ final class MobileEngine: ObservableObject {
         }
     }
 
-    /// 用户相簿列表 + 系统 RAW 智能相簿是否可用。
-    private func loadAlbums() {
+    /// 用户相簿列表 + 系统 RAW 智能相簿是否可用。nonisolated：由调用方放到后台执行。
+    private nonisolated static func fetchAlbums() -> (albums: [MAlbum], hasRaw: Bool) {
         var found: [MAlbum] = []
         let collections = PHAssetCollection.fetchAssetCollections(
             with: .album, subtype: .albumRegular, options: nil)
@@ -600,10 +622,10 @@ final class MobileEngine: ObservableObject {
             guard let title = collection.localizedTitle else { return }
             found.append(MAlbum(id: collection.localIdentifier, title: title))
         }
-        albums = found.sorted {
+        let sorted = found.sorted {
             $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
-        hasRawAlbum = Self.smartAlbum(.smartAlbumRAW) != nil
+        return (sorted, smartAlbum(.smartAlbumRAW) != nil)
     }
 
     nonisolated static func smartAlbum(_ subtype: PHAssetCollectionSubtype) -> PHAssetCollection? {
@@ -764,31 +786,33 @@ final class MobileEngine: ObservableObject {
                 var found: [ScannedAsset] = []
                 var seen = Set<String>()
                 result.enumerateObjects { asset, _, _ in
-                    // 主页用 localIdentifier 当卡片身份，重复项会让网格重复渲染同一张照片。
-                    guard seen.insert(asset.localIdentifier).inserted else { return }
-                    let filename: String
-                    let isRaw: Bool
-                    if let cached = known[asset.localIdentifier] {
-                        filename = cached.filename
-                        isRaw = cached.isRaw
-                    } else {
-                        guard let info = scanResource(for: asset) else { return }
-                        filename = info.resource.originalFilename
-                        isRaw = info.isRaw
+                    autoreleasepool {
+                        // 主页用 localIdentifier 当卡片身份，重复项会让网格重复渲染同一张照片。
+                        guard seen.insert(asset.localIdentifier).inserted else { return }
+                        let filename: String
+                        let isRaw: Bool
+                        if let cached = known[asset.localIdentifier] {
+                            filename = cached.filename
+                            isRaw = cached.isRaw
+                        } else {
+                            guard let info = scanResource(for: asset) else { return }
+                            filename = info.resource.originalFilename
+                            isRaw = info.isRaw
+                        }
+                        // 只允许 RAW / JPEG / HEIC；PNG、GIF、WebP、TIFF 在任何筛选里都不出现。
+                        guard MAssetFormat.isAllowed(filename: filename, isRaw: isRaw) else { return }
+                        let verdict = MCaptureClassifier.classify(
+                            asset: asset, filename: filename, isRaw: isRaw)
+                        let override = overrides[asset.localIdentifier]
+                        found.append(ScannedAsset(
+                            asset: asset,
+                            filename: filename,
+                            isRaw: isRaw,
+                            included: allowNonRaw || isRaw,
+                            isCaptured: override ?? verdict.isCaptured,
+                            needsProbe: override == nil && !verdict.confident
+                        ))
                     }
-                    // 只允许 RAW / JPEG / HEIC；PNG、GIF、WebP、TIFF 在任何筛选里都不出现。
-                    guard MAssetFormat.isAllowed(filename: filename, isRaw: isRaw) else { return }
-                    let verdict = MCaptureClassifier.classify(
-                        asset: asset, filename: filename, isRaw: isRaw)
-                    let override = overrides[asset.localIdentifier]
-                    found.append(ScannedAsset(
-                        asset: asset,
-                        filename: filename,
-                        isRaw: isRaw,
-                        included: allowNonRaw || isRaw,
-                        isCaptured: override ?? verdict.isCaptured,
-                        needsProbe: override == nil && !verdict.confident
-                    ))
                 }
                 continuation.resume(returning: found)
             }
@@ -849,7 +873,9 @@ final class MobileEngine: ObservableObject {
     /// 导入照片：文件复制与头部探测在后台串行完成，主线程只提交库状态与刷新列表。
     /// 新入库的原片随后异步写进系统相册（`publishToAlbum`），主页按相册映射才能看到它们。
     @discardableResult
-    func importPhotos(_ urls: [URL], publishToAlbum: Bool = true) async -> ImportReport {
+    func importPhotos(_ urls: [URL], publishToAlbum: Bool = true,
+                      generateThumbnails: Bool = true,
+                      captureMeta: MCameraCaptureMeta? = nil) async -> ImportReport {
         var report = ImportReport()
         guard !urls.isEmpty else { return report }
 
@@ -878,7 +904,7 @@ final class MobileEngine: ObservableObject {
 
         let store = self.store
         let staged = await Self.stageImports(
-            accepted, allowingEncoded: allowingEncoded, store: store)
+            accepted, allowingEncoded: allowingEncoded, store: store, captureMeta: captureMeta)
         var imported: [LibraryPhoto] = []
         // 只有真正新增的库内记录才写相册；重复导入同名照片不会再产生相册副本。
         let knownIDs = Set(store.photos.map(\.id))
@@ -893,7 +919,9 @@ final class MobileEngine: ObservableObject {
                     if !knownIDs.contains(photo.id), publishedIDs.insert(photo.id).inserted {
                         imported.append(photo)
                     }
-                    generateThumbnail(for: photo)
+                    if generateThumbnails {
+                        generateThumbnail(for: photo)
+                    }
                 } catch {
                     report.rejected += 1
                     if report.reason.isEmpty {
@@ -920,9 +948,43 @@ final class MobileEngine: ObservableObject {
         return report
     }
 
+    /// 直出保存原图：把显影 / 调色参数与成片缩略图写回刚导入的 RAW 工程。
+    /// `baseline` 是含拍摄曝光的快速控制基线；缺省才退回中性基线。
+    func applyDirectResult(photoID: String, edit: PhotoEdit, grade: GradeRecipe,
+                           baseline: PhotoEdit? = nil,
+                           renderedURL: URL) async {
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        photo.edit = edit
+        photo.gradeData = try? JSONEncoder().encode(grade)
+        // 快速控制的基线必须包含拍摄曝光：直出预设的快速量是相对「拍摄基线」计算的，
+        // 若把已套用的直出参数当基线，快速滑条回到 0 时无法回到原始曝光 / 亮度。
+        photo.quickBaselineData = try? JSONEncoder().encode(baseline ?? PhotoEdit())
+        try? store.update(photo)
+
+        var wroteThumbnail = false
+        if let loaded = try? ImageLoader.load(url: renderedURL, maxSize: 320,
+                                              allowEncoded: true),
+           let path = try? store.writeThumbnailFile(
+               id: photoID,
+               image: Resize.smallPreview(loaded.image, maxSize: 320),
+               colorSpace: loaded.colorSpace) {
+            if let old = store.thumbnailURL(for: photo) {
+                MThumbnailCache.shared.remove(path: old.path)
+            }
+            store.commitThumbnail(id: photoID, relativePath: path)
+            wroteThumbnail = true
+        }
+        if !wroteThumbnail {
+            // 成片缩略图失败时至少用显影后的 RAW 兜底，避免主页空白。
+            generateThumbnail(for: photo)
+        }
+        refreshPhotos()
+    }
+
     /// 后台准备导入：只做复制与探测，不触碰库状态。
     private nonisolated static func stageImports(
-        _ urls: [URL], allowingEncoded: Bool, store: LibraryStore
+        _ urls: [URL], allowingEncoded: Bool, store: LibraryStore,
+        captureMeta: MCameraCaptureMeta?
     ) async -> [(url: URL, result: Result<LibraryStore.StagedImport, Error>)] {
         await withCheckedContinuation { continuation in
             importQueue.async {
@@ -930,7 +992,10 @@ final class MobileEngine: ObservableObject {
                 for url in urls {
                     let scoped = url.startAccessingSecurityScopedResource()
                     let result = Result {
-                        try store.stageImport(from: url, allowingEncoded: allowingEncoded)
+                        try store.stageImport(
+                            from: url, allowingEncoded: allowingEncoded,
+                            captureExposureEV: captureMeta?.exposureBias,
+                            captureTemperature: captureMeta?.temperature)
                     }
                     if scoped { url.stopAccessingSecurityScopedResource() }
                     results.append((url, result))
@@ -966,7 +1031,7 @@ final class MobileEngine: ObservableObject {
                     }
                 }
             }
-            await self.refreshAssets(force: true)
+            self.requestAssetsRefresh()
         }
     }
 
@@ -998,6 +1063,7 @@ final class MobileEngine: ObservableObject {
                 // 缓存键是缩略图的绝对路径，不能传索引里的相对路径。
                 MThumbnailCache.shared.remove(path: thumbnail.path)
             }
+            MDevelopHandoffCache.remove(root: store.root, photoID: photoID)
         }
         try? store.remove(ids: photoIDs)
         refreshPhotos()
@@ -1124,7 +1190,7 @@ final class MobileEngine: ObservableObject {
             isRaw: photo.isRaw,
             favorite: photo.favorite,
             color: photo.colorLabel.flatMap(MColorLabel.init(rawValue:)),
-            isGraded: !photo.edit.quickIntents.isEmpty,
+            isGraded: !photo.edit.quickIntents.isEmpty || photo.gradeData != nil,
             exposure: exposure,
             thumbnailURL: store.thumbnailURL(for: photo)
         )
@@ -1169,6 +1235,10 @@ final class MobileEngine: ObservableObject {
                 id: id, image: output, colorSpace: edit.io.outputColorSpace)
             Task { @MainActor in
                 guard let self, let path else { return }
+                // 直出会在导入后立刻写入成片缩略图；迟到的 RAW 缩略图不能把它覆盖回去。
+                guard self.store.photos.first(where: { $0.id == id })?.thumbnailPath == nil else {
+                    return
+                }
                 self.store.commitThumbnail(id: id, relativePath: path)
                 self.refreshPhotosSoon()
             }
@@ -1231,9 +1301,13 @@ final class MobileEngine: ObservableObject {
     // MARK: - 调色会话
 
     /// 从主页直接进调色台时，临时建一个不显示的显影会话，只为产出交接像素。
-    /// `.direct` 入口不跑显影：交接图由原片直接解码，照片原样进入调色台。
+    /// `.direct` 入口：有可复用的显影交接图缓存时按 `.developed` 秒开，
+    /// 没有缓存才退回原片直接调色（不跑显影）。
     func openGrade(photoID: String, entry: MGradeEntry) -> MobileGradeSession? {
         guard let photo = store.photos.first(where: { $0.id == photoID }) else { return nil }
+        let hasHandoffCache = MDevelopHandoffCache.hasEntry(
+            root: store.root, photoID: photoID,
+            fingerprint: MobileDevelopSession.handoffFingerprint(for: photo))
         let develop: MobileDevelopSession
         if let current = developSession, current.photoID == photoID {
             transientDevelopSession?.cancel()
@@ -1251,7 +1325,7 @@ final class MobileEngine: ObservableObject {
         }
         let grade = MobileGradeSession(
             photo: photo, store: store, develop: develop,
-            source: entry == .direct ? .original : .developed)
+            source: entry != .direct || hasHandoffCache ? .developed : .original)
         gradeSession = grade
         if let id = DebugLaunch.gradeBorder,
            let preset = MFilmBorderPreset.preset(id: id) {
@@ -1267,6 +1341,8 @@ final class MobileEngine: ObservableObject {
         // 分栏胶片条换图产生的临时显影会话不归 developSession 管，必须在这里收尾。
         transientDevelopSession?.cancel()
         transientDevelopSession = nil
+        // cancel() 里已把配方落盘；刷新主页才能让「已调色」标记与缩略图跟上。
+        refreshPhotos()
     }
 }
 

@@ -20,13 +20,16 @@ struct PhotoEdit: Codable {
     var rotationTurns = 0
     /// 黑白模式：移动端在显影结果之后做亮度归一，属于展示层的显影预设，不进入核心参数。
     var monochrome = false
+    /// 被专业模式接管的快速轴；nil 表示没有任何轴被冻结。
+    /// 存在 `PhotoEdit` 里，撤销栈与索引落盘会自动带上它。
+    var frozenQuick: [String]? = nil
 
     init() {}
 
     private enum CodingKeys: String, CodingKey {
         case filmStock, printStock, camera, enlarger, filmRender, printRender
         case scanner, io, settings, debug, quickIntents, loadRaw, rotationTurns
-        case monochrome
+        case monochrome, frozenQuick
     }
 
     /// 逐字段解码：旧索引缺少新字段时回退默认值，避免整库解码失败后读成空库。
@@ -46,6 +49,7 @@ struct PhotoEdit: Codable {
         loadRaw = try container.decodeIfPresent(LoadRawParams.self, forKey: .loadRaw) ?? LoadRawParams()
         rotationTurns = try container.decodeIfPresent(Int.self, forKey: .rotationTurns) ?? 0
         monochrome = try container.decodeIfPresent(Bool.self, forKey: .monochrome) ?? false
+        frozenQuick = try container.decodeIfPresent([String].self, forKey: .frozenQuick)
     }
 
     /// RAW 解码选项：白平衡/色温/色调/镜头校正。解码尺寸由调用方另行传入。
@@ -95,6 +99,8 @@ struct LibraryPhoto: Codable, Identifiable, Hashable {
     var borderData: Data? = nil
     /// 裁切与校正几何（移动端调色台配置，作用于交接图本身，片边后再合成）。
     var cropData: Data? = nil
+    /// 调色配方（直出工程回放用）：编码后的 `GradeRecipe`。
+    var gradeData: Data? = nil
 
     static func == (lhs: LibraryPhoto, rhs: LibraryPhoto) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -216,6 +222,10 @@ final class LibraryStore: @unchecked Sendable {
         let cctfDecoding: Bool
         /// 相机内写入 RAW 的曝光补偿，入库时恢复，保证显影台与相册观感一致。
         let exposureBias: Double
+        /// 相机页直接传入的快门瞬间曝光补偿：RAW 的 EXIF 不一定记录它。
+        var captureExposureEV: Double? = nil
+        /// 相机页锁定过的色温；nil 表示自动白平衡。
+        var captureTemperature: Int? = nil
     }
 
     /// 允许入库的扩展名：默认仅 RAW；打开「支持 JPEG」后放行所有可显影的编码图
@@ -228,7 +238,9 @@ final class LibraryStore: @unchecked Sendable {
     }
 
     /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。
-    func stageImport(from source: URL, allowingEncoded: Bool = false) throws -> StagedImport {
+    func stageImport(from source: URL, allowingEncoded: Bool = false,
+                     captureExposureEV: Double? = nil,
+                     captureTemperature: Int? = nil) throws -> StagedImport {
         let ext = source.pathExtension.lowercased()
         guard Self.accepts(source, allowingEncoded: allowingEncoded) else {
             throw NSError(domain: "Spektrafilm.Library", code: 2,
@@ -249,7 +261,9 @@ final class LibraryStore: @unchecked Sendable {
                             height: dimensions.height,
                             colorSpace: detected.space,
                             cctfDecoding: detected.cctfDecoding,
-                            exposureBias: bias)
+                            exposureBias: bias,
+                            captureExposureEV: captureExposureEV,
+                            captureTemperature: captureTemperature)
     }
 
     /// 提交 `stageImport` 的产物：查重、追加到库并落盘。必须在库的拥有线程（主线程）调用。
@@ -269,8 +283,18 @@ final class LibraryStore: @unchecked Sendable {
         edit.io.inputCCTFDecoding = staged.cctfDecoding
         // 相机内调过的曝光已写进 RAW 的感光数据；显影管线的自动曝光会把它归一化掉，
         // 这里把拍摄时的补偿读回来重新施加，让显影台与导出和相册观感一致。
-        if abs(staged.exposureBias) > 0.01 {
-            edit.camera.exposureCompensationEV = staged.exposureBias
+        // 相机页传入的快门参数优先：RAW 的 EXIF 曝光补偿并不可靠，
+        // 缺失时再退回 EXIF 读到的值。
+        let capturedEV = staged.captureExposureEV ?? staged.exposureBias
+        if abs(capturedEV) > 0.01 {
+            edit.camera.exposureCompensationEV = capturedEV
+        }
+        if let kelvin = staged.captureTemperature, kelvin > 0 {
+            // CIRAWFilter 的 neutralTemperature 会替换 as-shot 中性点，
+            // 用拍摄时锁定的色温解码，显影台看到的就是取景时的白平衡。
+            edit.loadRaw.whiteBalance = "custom"
+            edit.loadRaw.temperature = Double(kelvin)
+            edit.loadRaw.tint = 1.0
         }
         let photo = LibraryPhoto(
             id: staged.id,

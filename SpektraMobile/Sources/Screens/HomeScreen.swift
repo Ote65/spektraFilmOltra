@@ -953,6 +953,7 @@ struct HomeScreen: View {
             Task {
                 var files: [URL] = []
                 var scoped: [URL] = []
+                var folders: [URL] = []
                 for url in urls {
                     if url.startAccessingSecurityScopedResource() { scoped.append(url) }
                     var isDirectory: ObjCBool = false
@@ -960,10 +961,19 @@ struct HomeScreen: View {
                         continue
                     }
                     if isDirectory.boolValue {
-                        files.append(contentsOf: Self.photoFiles(in: url, allowed: allowed))
+                        folders.append(url)
                     } else if allowed.contains(url.pathExtension.lowercased()) {
                         files.append(url)
                     }
+                }
+                // 大目录递归枚举放到后台：主线程在文件夹导入时保持可交互，
+                // 不会出现「点导入后整个 App 像死机」的观感。
+                if !folders.isEmpty {
+                    let allowedCopy = allowed
+                    let found = await Task.detached(priority: .userInitiated) {
+                        folders.flatMap { Self.photoFiles(in: $0, allowed: allowedCopy) }
+                    }.value
+                    files.append(contentsOf: found)
                 }
                 // 安全作用域必须活到入库完成：目录里枚举出的子文件 URL 依赖父目录授权。
                 defer { for url in scoped { url.stopAccessingSecurityScopedResource() } }
@@ -983,7 +993,7 @@ struct HomeScreen: View {
     }
 
     /// 递归列出目录下的可导入文件（跳过隐藏文件与包）。
-    private static func photoFiles(in folder: URL, allowed: Set<String>) -> [URL] {
+    nonisolated private static func photoFiles(in folder: URL, allowed: Set<String>) -> [URL] {
         guard let enumerator = FileManager.default.enumerator(
             at: folder,
             includingPropertiesForKeys: [.isRegularFileKey],

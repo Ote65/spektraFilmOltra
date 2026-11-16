@@ -376,6 +376,22 @@ enum DebugLaunch {
         }
         return args[index + 1]
     }
+
+    /// 验收用：`--grade-handoff` 从显影交接入口进调色台（写入/复用交接图缓存）。
+    static var gradeHandoff: Bool { args.contains("--grade-handoff") }
+
+    /// 验收用：`--direct-image name.jpg` 直接把 App Documents 里的图片当作直出成片展示。
+    static var directImage: String? {
+        guard let index = args.firstIndex(of: "--direct-image"),
+              args.indices.contains(index + 1) else { return nil }
+        return args[index + 1]
+    }
+
+    /// 验收用：直出成片页启动时展开片边面板。
+    static var directBorderPanel: Bool { args.contains("--border-panel") }
+
+    /// 截图验收用：设置页默认滚到底部，检查缓存分区。
+    static var settingsBottom: Bool { args.contains("--settings-bottom") }
 }
 
 // MARK: - 面板高度测量

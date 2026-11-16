@@ -4,13 +4,23 @@ import CoreGraphics
 import ImageIO
 #if os(iOS)
 import AVFoundation
+import CoreMotion
 #endif
+
+/// 按下快门那一刻的拍摄参数。RAW 的 EXIF 不一定记录曝光补偿，
+/// 显影管线的自动曝光又会把感光差异归一化掉，所以必须显式带着这一份进入入库/显影。
+struct MCameraCaptureMeta: Equatable {
+    var exposureBias: Double = 0
+    /// nil 表示自动白平衡。
+    var temperature: Int?
+}
 
 /// 一次 RAW 拍摄的结果：临时 DNG 文件 + 取景器里用的缩略图。
 struct MCameraShot: Identifiable {
     let id = UUID()
     let url: URL
     let thumbnail: MPlatformImage?
+    var meta = MCameraCaptureMeta()
 }
 
 /// 相机页的拍摄会话：AVCaptureSession + AVCapturePhotoOutput 的薄封装。
@@ -315,7 +325,9 @@ final class MCameraSession: NSObject, ObservableObject {
             }
         }
 
-        let delegate = MCaptureDelegate { [weak self] result in
+        let delegate = MCaptureDelegate(
+            meta: MCameraCaptureMeta(exposureBias: exposureBias, temperature: temperature)
+        ) { [weak self] result in
             DispatchQueue.main.async { self?.finish(result) }
         }
         captureDelegate = delegate
@@ -668,9 +680,12 @@ private extension MCameraSession.FlashMode {
 /// AVCapturePhotoOutput 的代理：把 RAW 数据落到临时 DNG，并顺手取一张缩略图。
 private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     private let completion: (Result<MCameraShot, Error>) -> Void
+    /// 快门按下时的曝光/色温：异步回调里不能再读已经变化的相机状态。
+    private let meta: MCameraCaptureMeta
     private var finished = false
 
-    init(completion: @escaping (Result<MCameraShot, Error>) -> Void) {
+    init(meta: MCameraCaptureMeta, completion: @escaping (Result<MCameraShot, Error>) -> Void) {
+        self.meta = meta
         self.completion = completion
     }
 
@@ -697,7 +712,7 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
             completion(.failure(error))
             return
         }
-        completion(.success(MCameraShot(url: url, thumbnail: Self.thumbnail(url: url))))
+        completion(.success(MCameraShot(url: url, thumbnail: Self.thumbnail(url: url), meta: meta)))
     }
 
     /// 出片前就失败（如采集被中断）时只会回调这里；不复位的话 `isCapturing` 会永远卡住。
@@ -730,5 +745,166 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
         }
         return MImage.make(cgImage: image)
     }
+}
+#endif
+
+// MARK: - 水平仪
+
+#if os(iOS)
+/// 基于重力投影的相机水平仪：水平模式三横杠，俯拍模式双十字。
+///
+/// `roll` 已经扣除当前握持方向的旋转，所以水平拿稳时无论竖拍还是横拍都接近 0；
+/// 视图再按 `deviceAngle` 旋转，横屏时参考线跟着重力方向转，不会停在竖屏。
+@MainActor
+final class MLevelMonitor: ObservableObject {
+    enum Mode {
+        case horizontal
+        case topDown
+    }
+
+    /// 相对当前握持方向的倾角（度）：水平时为 0，俯拍时是画面内的旋转偏差。
+    @Published private(set) var roll: Double = 0
+    @Published private(set) var pitch: Double = 0
+    @Published private(set) var isLevel = false
+    @Published private(set) var mode: Mode = .horizontal
+    /// 设备相对竖屏的旋转角（度）：0 / 90 / -90 / 180，供覆盖层整体旋转。
+    @Published private(set) var deviceAngle: Double = 0
+    /// 世界竖直方向在屏幕上的投影（x 向右、y 向下），俯拍时移动十字像气泡一样浮向高处。
+    @Published private(set) var planarTilt = CGSize.zero
+
+    private let manager = CMMotionManager()
+    private let queue = OperationQueue()
+    private var running = false
+    private var hapticArmed = true
+    private let haptic = UIImpactFeedbackGenerator(style: .light)
+    /// 低通后的重力向量：传感器抖动会让参考线高频跳动，先平滑再算角度。
+    private var smoothGravity = SIMD3<Double>(0, 0, 0)
+    private var hasSample = false
+
+    /// 水平对齐容差（度）。太严会很难对准，这里按「肉眼可接受」放到 1.6°。
+    private static let levelTolerance = 1.6
+    private static let levelReleaseTolerance = 3.0
+    private static let topDownTolerance = 2.5
+    private static let topDownPitch = 85.0
+
+    func start() {
+        #if os(iOS)
+        guard !running, manager.isDeviceMotionAvailable else { return }
+        running = true
+        hasSample = false
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        manager.deviceMotionUpdateInterval = 1.0 / 30.0
+        queue.qualityOfService = .userInitiated
+        haptic.prepare()
+        manager.startDeviceMotionUpdates(to: queue) { [weak self] motion, _ in
+            guard let motion else { return }
+            let gravity = SIMD3<Double>(
+                Double(motion.gravity.x),
+                Double(motion.gravity.y),
+                Double(motion.gravity.z)
+            )
+            Task { @MainActor [weak self] in
+                self?.handle(gravity: gravity)
+            }
+        }
+        #endif
+    }
+
+    func stop() {
+        guard running else { return }
+        running = false
+        manager.stopDeviceMotionUpdates()
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
+    }
+
+    private func handle(gravity: SIMD3<Double>) {
+        #if os(iOS)
+        if hasSample {
+            smoothGravity = smoothGravity * 0.78 + gravity * 0.22
+        } else {
+            smoothGravity = gravity
+            hasSample = true
+        }
+        let g = smoothGravity
+
+        // UIDeviceOrientation.landscapeLeft 是「Home 键在右侧」，对应设备逆时针转 90°，
+        // 此时屏幕平面里的重力投影是 +90°，所以补偿角取 +90；右侧横屏反之。
+        let angle: Double
+        switch UIDevice.current.orientation {
+        case .landscapeLeft: angle = 90
+        case .landscapeRight: angle = -90
+        case .portraitUpsideDown: angle = 180
+        default: angle = 0
+        }
+        if deviceAngle != angle { deviceAngle = angle }
+
+        // 设备坐标系中的倾角；减去握持方向后才是「相对参考线」的偏差。
+        let rawRoll = atan2(-g.x, -g.y) * 180 / .pi
+        var tilt = rawRoll - angle
+        while tilt > 180 { tilt -= 360 }
+        while tilt < -180 { tilt += 360 }
+        let newPitch = asin(min(1, max(-1, -g.z))) * 180 / .pi
+
+        // 只在小数点后第二位变化时才发布，减少无意义的 SwiftUI 失效。
+        if abs(tilt - roll) > 0.03 { roll = tilt }
+        if abs(newPitch - pitch) > 0.03 { pitch = newPitch }
+        let planar = CGSize(width: -g.x, height: g.y)
+        if abs(planar.width - planarTilt.width) > 0.002
+            || abs(planar.height - planarTilt.height) > 0.002 {
+            planarTilt = planar
+        }
+
+        if mode == .horizontal, newPitch >= 45 {
+            mode = .topDown
+        } else if mode == .topDown, newPitch < 42 {
+            mode = .horizontal
+        }
+
+        let aligned: Bool
+        switch mode {
+        case .horizontal:
+            aligned = abs(tilt) <= Self.levelTolerance
+        case .topDown:
+            aligned = abs(tilt) <= Self.topDownTolerance && newPitch >= Self.topDownPitch
+        }
+
+        if aligned, hapticArmed {
+            hapticArmed = false
+            haptic.impactOccurred(intensity: 0.7)
+            haptic.prepare()
+        } else if !aligned {
+            switch mode {
+            case .horizontal where abs(tilt) > Self.levelReleaseTolerance:
+                hapticArmed = true
+            case .topDown where abs(tilt) > Self.topDownTolerance + 1.0
+                || newPitch < Self.topDownPitch - 3:
+                hapticArmed = true
+            default:
+                break
+            }
+        }
+
+        if isLevel != aligned { isLevel = aligned }
+        #endif
+    }
+}
+#else
+/// 非 iOS 预览构建的占位：保证 SwiftUI 视图可以编译，不产生任何传感器行为。
+@MainActor
+final class MLevelMonitor: ObservableObject {
+    enum Mode {
+        case horizontal
+        case topDown
+    }
+
+    @Published private(set) var roll: Double = 0
+    @Published private(set) var pitch: Double = 0
+    @Published private(set) var isLevel = false
+    @Published private(set) var mode: Mode = .horizontal
+    @Published private(set) var deviceAngle: Double = 0
+    @Published private(set) var planarTilt = CGSize.zero
+
+    func start() {}
+    func stop() {}
 }
 #endif
