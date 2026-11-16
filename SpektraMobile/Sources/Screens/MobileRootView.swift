@@ -300,10 +300,14 @@ struct MobileRootView: View {
             // 与预览用同一个标识，片边的随机纹理 / 编号在预览与成片之间保持一致。
             let identifier = "direct-preview"
             let quality = MDirectRenderSettings.fromPreferences().jpegQuality
+            let rawURL = request.rawURL
             borderedURL = await Task.detached(priority: .userInitiated) {
-                MDirectRenderer.compositeBorder(
+                // 日期戳内容取自拍摄文件，与成片页预览保持一致。
+                let stamp = MFilmBorderRenderer.captureStamp(url: rawURL)
+                return MDirectRenderer.compositeBorder(
                     renderedURL: source, config: border, filmID: filmID,
-                    photoID: identifier, jpegQuality: quality)
+                    photoID: identifier, jpegQuality: quality,
+                    dateLabel: stamp.date, timeLabel: stamp.time)
             }.value
             // 用户选了片边就必须带上；合成失败时宁可报错重试，也不能悄悄保存成无片边。
             guard borderedURL != nil else { return .failed("片边合成失败，请重试") }

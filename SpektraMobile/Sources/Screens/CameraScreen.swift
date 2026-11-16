@@ -63,6 +63,8 @@ struct CameraScreen: View {
     /// 成片页的片边：默认沿用跨照片记忆（冷启动关闭）。
     @State private var directBorder = MFilmBorderMemory.load() ?? MFilmBorderConfig()
     @State private var directBorderOpen = false
+    /// 片边面板实测高度：面板展开时按它缩放并上移预览，保证整张照片露出。
+    @State private var directBorderPanelHeight: CGFloat = 480
     /// 未加片边的成片预览：换片边时只重合成这一张，不重新显影。
     @State private var directPreviewCG: CGImage?
 
@@ -1033,8 +1035,6 @@ struct CameraScreen: View {
                 }
                 if !isOn { value.preset = "none" }
                 directBorder = value.normalized()
-                MFilmBorderMemory.save(directBorder)
-                refreshDirectBorderPreview()
             }
         )
     }
@@ -1044,8 +1044,14 @@ struct CameraScreen: View {
         value.enabled = preset.id != "none"
         value.preset = preset.id
         directBorder = value.normalized()
-        MFilmBorderMemory.save(directBorder)
-        refreshDirectBorderPreview()
+    }
+
+    /// 片边参数绑定：所有改动统一归一化，随后由 onChange 记忆并重合成预览。
+    private var directBorderConfig: Binding<MFilmBorderConfig> {
+        Binding(
+            get: { directBorder },
+            set: { directBorder = $0.normalized() }
+        )
     }
 
     private static let directBorderSpring = Animation.spring(response: 0.34, dampingFraction: 0.9)
@@ -1104,6 +1110,19 @@ struct CameraScreen: View {
             }
             .frame(height: 84)
 
+            if directBorder.enabled {
+                Divider()
+                    .overlay(MColor.hairline)
+                    .padding(.vertical, 2)
+
+                ScrollView(.vertical) {
+                    MFilmBorderControls(config: directBorderConfig)
+                        .padding(.bottom, 4)
+                }
+                .scrollIndicators(.never)
+                .frame(maxHeight: 320)
+            }
+
             Text("片边只合成到这张成片，不会重新显影。")
                 .font(.mSans(9, .medium))
                 .foregroundStyle(MColor.text4)
@@ -1112,6 +1131,7 @@ struct CameraScreen: View {
         .padding(.top, 8)
         .padding(.bottom, max(12, insets.bottom))
         .frame(maxWidth: .infinity)
+        .background(MPanelHeightReporter())
         .background(
             UnevenRoundedRectangle(topLeadingRadius: 22, topTrailingRadius: 22,
                                    style: .continuous)
@@ -1129,9 +1149,14 @@ struct CameraScreen: View {
             return
         }
         let filmID = directEdit?.filmStock ?? MobileCatalog.films.first?.id ?? ""
+        let rawURL = directRawURL
         Task.detached(priority: .userInitiated) {
+            // 日期戳内容取自拍摄文件，保证预览与保存的成片一致。
+            let stamp = rawURL.map { MFilmBorderRenderer.captureStamp(url: $0) }
+                ?? (date: "", time: "")
             let framed = MFilmBorderRenderer.preview(
-                photo: cg, config: config, filmID: filmID, photoID: "direct-preview")
+                photo: cg, config: config, filmID: filmID, photoID: "direct-preview",
+                dateLabel: stamp.date, timeLabel: stamp.time)
             await MainActor.run {
                 guard directBorder == config, let framed else { return }
                 directPhoto = MImage.make(cgImage: framed)
@@ -1149,120 +1174,137 @@ struct CameraScreen: View {
     }
 
     private func directCardView(_ phase: MDirectCardPhase) -> some View {
-        ZStack {
-            // 独立显影页：纯黑背景，不渲染相机取景，也不让相机继续跑。
-            Color.black
-                .ignoresSafeArea()
+        GeometryReader { geo in
+            let panelHeight = directBorderOpen ? max(directBorderPanelHeight, 220) : 0
+            // 面板上方的可见高度（扣除状态栏）：预览按它缩放，保证整张照片不被遮住。
+            let available = max(180, geo.size.height - panelHeight - insets.top - 24)
+            let contentHeight: CGFloat = 452
+            let scale = directBorderOpen ? min(1, available / contentHeight) : 1
 
-            VStack(spacing: 22) {
-                directPhotoCard(phase)
+            ZStack {
+                // 独立显影页：纯黑背景，不渲染相机取景，也不让相机继续跑。
+                Color.black
+                    .ignoresSafeArea()
 
-                VStack(spacing: 12) {
-                    switch phase {
-                    case .developing:
-                        VStack(spacing: 8) {
-                            ProgressView(value: min(max(directProgress, 0), 1))
-                                .progressViewStyle(.linear)
-                                .tint(MColor.brass)
-                                .frame(width: 176)
-                            Text("正在显影 \(Int(min(max(directProgress, 0), 1) * 100))%")
-                                .font(.mSans(10, .medium).monospacedDigit())
-                                .foregroundStyle(MColor.text2)
-                        }
-                        .frame(height: 52)
+                VStack(spacing: 22) {
+                    directPhotoCard(phase)
 
-                    case .ready(let result):
-                        HStack(spacing: 8) {
-                            Button {
-                                MHaptic.light()
-                                retakeDirect(result)
-                            } label: {
-                                Text("重拍")
-                                    .font(.mSans(11, .medium))
-                                    .foregroundStyle(MColor.text1)
+                    VStack(spacing: 12) {
+                        switch phase {
+                        case .developing:
+                            VStack(spacing: 8) {
+                                ProgressView(value: min(max(directProgress, 0), 1))
+                                    .progressViewStyle(.linear)
+                                    .tint(MColor.brass)
+                                    .frame(width: 176)
+                                Text("正在显影 \(Int(min(max(directProgress, 0), 1) * 100))%")
+                                    .font(.mSans(10, .medium).monospacedDigit())
+                                    .foregroundStyle(MColor.text2)
+                            }
+                            .frame(height: 52)
+
+                        case .ready(let result):
+                            HStack(spacing: 8) {
+                                Button {
+                                    MHaptic.light()
+                                    retakeDirect(result)
+                                } label: {
+                                    Text("重拍")
+                                        .font(.mSans(11, .medium))
+                                        .foregroundStyle(MColor.text1)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: 44)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                .fill(Color.white.opacity(0.1))
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(directSaving)
+
+                                // 显影完成后仍然可以改片边：只重合成预览与成片，不再跑显影。
+                                Button {
+                                    MHaptic.tick()
+                                    withAnimation(Self.directBorderSpring) { directBorderOpen = true }
+                                } label: {
+                                    VStack(spacing: 1) {
+                                        Image(systemName: "square.dashed")
+                                            .font(.system(size: 12, weight: .medium))
+                                        Text(directBorder.enabled ? directBorderName : "片边")
+                                            .font(.mSans(8.5, .medium))
+                                            .lineLimit(1)
+                                            .minimumScaleFactor(0.8)
+                                    }
+                                    .foregroundStyle(MColor.brassHigh)
                                     .frame(maxWidth: .infinity)
                                     .frame(height: 44)
                                     .background(
                                         RoundedRectangle(cornerRadius: 9, style: .continuous)
                                             .fill(Color.white.opacity(0.1))
                                     )
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(directSaving)
-
-                            // 显影完成后仍然可以改片边：只重合成预览与成片，不再跑显影。
-                            Button {
-                                MHaptic.tick()
-                                withAnimation(Self.directBorderSpring) { directBorderOpen = true }
-                            } label: {
-                                VStack(spacing: 1) {
-                                    Image(systemName: "square.dashed")
-                                        .font(.system(size: 12, weight: .medium))
-                                    Text(directBorder.enabled ? directBorderName : "片边")
-                                        .font(.mSans(8.5, .medium))
-                                        .lineLimit(1)
-                                        .minimumScaleFactor(0.8)
                                 }
-                                .foregroundStyle(MColor.brassHigh)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 44)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                        .fill(Color.white.opacity(0.1))
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(directSaving)
+                                .buttonStyle(.plain)
+                                .disabled(directSaving)
 
-                            Button {
-                                MHaptic.light()
-                                saveDirectResult(result)
-                            } label: {
-                                Group {
-                                    if directSaving {
-                                        ProgressView().controlSize(.small).tint(MColor.brassInk)
-                                    } else {
-                                        Text("保存").font(.mSans(11, .semibold))
+                                Button {
+                                    MHaptic.light()
+                                    saveDirectResult(result)
+                                } label: {
+                                    Group {
+                                        if directSaving {
+                                            ProgressView().controlSize(.small).tint(MColor.brassInk)
+                                        } else {
+                                            Text("保存").font(.mSans(11, .semibold))
+                                        }
                                     }
+                                    .foregroundStyle(MColor.brassInk)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 44)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                            .fill(MColor.brass)
+                                    )
                                 }
-                                .foregroundStyle(MColor.brassInk)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 44)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                        .fill(MColor.brass)
-                                )
+                                .buttonStyle(.plain)
+                                .disabled(directSaving)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(directSaving)
-                        }
-                        .frame(width: 300)
+                            .frame(width: 300)
 
-                    case .failed(let message):
-                        VStack(spacing: 10) {
-                            Text(message)
-                                .font(.mSans(9.5, .medium))
-                                .foregroundStyle(MColor.filmRed)
-                                .multilineTextAlignment(.center)
-                                .frame(maxWidth: 260)
-                            HStack(spacing: 18) {
-                                Button("重拍") { retakeDirect(nil) }
-                                    .font(.mSans(10.5, .medium))
-                                    .foregroundStyle(MColor.text2)
-                                Button("重试") { retryDirect() }
-                                    .font(.mSans(10.5, .semibold))
-                                    .foregroundStyle(MColor.brassHigh)
+                        case .failed(let message):
+                            VStack(spacing: 10) {
+                                Text(message)
+                                    .font(.mSans(9.5, .medium))
+                                    .foregroundStyle(MColor.filmRed)
+                                    .multilineTextAlignment(.center)
+                                    .frame(maxWidth: 260)
+                                HStack(spacing: 18) {
+                                    Button("重拍") { retakeDirect(nil) }
+                                        .font(.mSans(10.5, .medium))
+                                        .foregroundStyle(MColor.text2)
+                                    Button("重试") { retryDirect() }
+                                        .font(.mSans(10.5, .semibold))
+                                        .foregroundStyle(MColor.brassHigh)
+                                }
                             }
+                            .frame(minHeight: 52)
                         }
-                        .frame(minHeight: 52)
                     }
+                    .animation(MMotion.state, value: directPhaseKey)
                 }
-                .animation(MMotion.state, value: directPhaseKey)
+                .padding(.horizontal, 24)
+                // 片边面板打开时整体缩放并上移：整张照片落在面板上方的可见区域。
+                .scaleEffect(scale)
+                .offset(y: directBorderOpen ? (insets.top - panelHeight) / 2 : 0)
+                .animation(Self.directBorderSpring, value: directBorderOpen)
             }
-            .padding(.horizontal, 24)
-            // 片边面板打开时整体上移：预览完整露出，且不会被面板压暗。
-            .offset(y: directBorderOpen ? -84 : 0)
-            .animation(Self.directBorderSpring, value: directBorderOpen)
+        }
+        .onChange(of: directBorder) { _, value in
+            MFilmBorderMemory.save(value)
+            refreshDirectBorderPreview()
+        }
+        .onPreferenceChange(MPanelHeightKey.self) { height in
+            guard height > 0, abs(height - directBorderPanelHeight) > 0.5 else { return }
+            directBorderPanelHeight = height
         }
         .overlay { directBorderLayer }
         .overlay(alignment: .topTrailing) {

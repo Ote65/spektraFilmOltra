@@ -2245,7 +2245,8 @@ enum MDirectRenderer {
     /// 这条路径不接触 RAW，也不需要显影，所以直出成片页改片边是秒级操作。
     nonisolated static func compositeBorder(
         renderedURL: URL, config: MFilmBorderConfig,
-        filmID: String, photoID: String, jpegQuality: Double
+        filmID: String, photoID: String, jpegQuality: Double,
+        dateLabel: String = "", timeLabel: String = ""
     ) -> URL? {
         let value = config.normalized()
         guard value.enabled else { return nil }
@@ -2254,7 +2255,8 @@ enum MDirectRenderer {
         var output = loaded.image
         output = MFilmBorderRenderer.composite(
             image: output, config: value, filmID: filmID, photoID: photoID,
-            colorSpace: loaded.colorSpace, cctfEncoding: loaded.cctfDecoding)
+            colorSpace: loaded.colorSpace, cctfEncoding: loaded.cctfDecoding,
+            dateLabel: dateLabel, timeLabel: timeLabel)
         let ext = renderedURL.pathExtension.lowercased()
         let bitDepth = (ext == "jpg" || ext == "jpeg") ? 8 : 16
         let destination = FileManager.default.temporaryDirectory
