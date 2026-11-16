@@ -1120,12 +1120,9 @@ struct CameraScreen: View {
                         .padding(.bottom, 4)
                 }
                 .scrollIndicators(.never)
+                .defaultScrollAnchor(.top)
                 .frame(maxHeight: 320)
             }
-
-            Text("片边只合成到这张成片，不会重新显影。")
-                .font(.mSans(9, .medium))
-                .foregroundStyle(MColor.text4)
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
@@ -1182,8 +1179,8 @@ struct CameraScreen: View {
             let scale = directBorderOpen ? min(1, available / contentHeight) : 1
 
             ZStack {
-                // 独立显影页：纯黑背景，不渲染相机取景，也不让相机继续跑。
-                Color.black
+                // 独立显影页：与主页同一底色，不渲染相机取景，也不让相机继续跑。
+                MColor.app
                     .ignoresSafeArea()
 
                 VStack(spacing: 22) {
