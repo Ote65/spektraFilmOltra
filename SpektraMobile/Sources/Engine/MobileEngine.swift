@@ -178,6 +178,7 @@ final class MobileEngine: ObservableObject {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Spektrafilm/MobileLibrary", isDirectory: true)
         store = LibraryStore(root: base, keepsEncodedRecords: true)
+        scope = DebugLaunch.launchScope ?? MobileSettings.launchScope
         loadCaptureOverrides()
         refreshPhotos()
         warmThumbnails()

@@ -33,7 +33,7 @@ final class PrintingStage {
         colorReference.logRawPrintBlack = filmCMYToPrintLogRaw(ImageRGB(width: 1, height: 1, data: cmyBlackData))
         colorReference.logRawPrintWhite = filmCMYToPrintLogRaw(ImageRGB(width: 1, height: 1, data: cmyWhiteData))
 
-        let logRaw = lutService.computeEnlarger(
+        var raw = lutService.computeEnlarger(
             cmyData: cmyFilmDensity,
             function: { [unowned self] image in self.filmCMYToPrintLogRaw(image) },
             dataMin: cmyBlackData,
@@ -41,15 +41,16 @@ final class PrintingStage {
             useLUT: settings.useEnlargerLUT,
             key: enlargerCacheKey(dataMin: cmyBlackData, dataMax: cmyWhiteData)
         )
-        var raw = logRaw.map {
+        raw.mapInPlace {
             Vec3(ImageMath.pow10Fast($0.x), ImageMath.pow10Fast($0.y), ImageMath.pow10Fast($0.z))
         }
         let exposure = enlarger.printExposure
-        raw = raw.map { $0 * exposure }
+        raw.mapInPlace { $0 * exposure }
         let correction = colorReference.blackWhitePrintingExposureCorrection()
-        raw = raw.map { $0 * correction }
+        raw.mapInPlace { $0 * correction }
         raw = applyDiffusion(raw, params: enlarger.diffusionFilter, pixelSizeUM: pixelSizeUM)
-        return raw.map { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        raw.mapInPlace { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        return raw
     }
 
     func develop(logRaw: ImageRGB) -> ImageRGB {
@@ -119,7 +120,7 @@ final class PrintingStage {
         )
         let pixelCount = cmyFilmDensity.width * cmyFilmDensity.height
         let factor = computeExposureFactorMidgray(sensitivity: sensitivity, printIlluminant: printIlluminant)
-        raw = raw.map { $0 * factor }
+        raw.mapInPlace { $0 * factor }
         if enlarger.preflashExposure > 0 {
             let lightSource = (try? Illuminants.standard(enlarger.illuminant)) ?? []
             let preflashIlluminant = enlargerService.preflashIlluminant(lightSource)
@@ -135,7 +136,8 @@ final class PrintingStage {
                 }
             }
         }
-        return raw.map { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        raw.mapInPlace { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        return raw
     }
 
     private func computeExposureFactorMidgray(sensitivity: [[Double]], printIlluminant: [Double]) -> Double {

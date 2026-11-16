@@ -32,6 +32,7 @@ struct MobileRootView: View {
             case "camera": start = MLayout.isPad ? .home : .camera
             case "develop": start = .develop
             case "grade": start = .grade
+            case "settings": start = .settings
             default: break
             }
         }

@@ -162,7 +162,7 @@ enum ImageLoader {
         if linearSuffixes.contains(suffix) {
             var image = try renderToImage(url: url, colorSpace: "sRGB",
                                           linear: true)
-            image = image.map { ColorMath.rgbToRGB($0, from: "sRGB", to: "ACES2065-1") }
+            image.mapInPlace { ColorMath.rgbToRGB($0, from: "sRGB", to: "ACES2065-1") }
             return LoadedImage(image: image, colorSpace: "ACES2065-1",
                                cctfDecoding: false, isRaw: false)
         }
@@ -206,10 +206,9 @@ enum ImageLoader {
                 bounds: extent, format: .RGBAf, colorSpace: outputSpace
             )
         }
-        var values = [Double](repeating: 0, count: width * height * 3)
-        for i in 0..<(width * height) {
-            for c in 0..<3 { values[i * 3 + c] = Double(buffer[i * 4 + c]) }
-        }
-        return ImageRGB(width: width, height: height, data: values)
+        // 直接收成 RGB Float 后释放 RGBA 缓冲，避免 34 MP 下再背一份 Double 整图。
+        var image = ImageRGB(width: width, height: height, rgbaFloat: buffer)
+        buffer = []
+        return image
     }
 }

@@ -312,7 +312,7 @@ struct HomeScreen: View {
             chips.append(ScopeChip(id: "saved", title: "保存", scope: .saved))
         }
         chips.append(ScopeChip(id: "favorites", title: "收藏", scope: .favorites))
-        if engine.hasRawAlbum {
+        if engine.hasRawAlbum || engine.scope == .raw {
             chips.append(ScopeChip(id: "raw", title: "RAW", scope: .raw))
         }
         chips.append(ScopeChip(id: "graded", title: "已调色", scope: .graded))

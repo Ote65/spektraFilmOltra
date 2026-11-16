@@ -186,10 +186,12 @@ final class MobileGradeSession: ObservableObject {
     }
 
     /// 交接像素：正常链路走显影结果，直接调色入口走原片。
-    private func handoff(maxEdge: Int, completion: @escaping (ImageRGB?) -> Void) {
+    private func handoff(maxEdge: Int, tiled: Bool = false, bandPixelBudget: Int = 0,
+                         completion: @escaping (ImageRGB?) -> Void) {
         switch sourceMode {
         case .developed:
-            develop.prepareHandoff(maxEdge: maxEdge, completion: completion)
+            develop.prepareHandoff(maxEdge: maxEdge, tiled: tiled,
+                                   bandPixelBudget: bandPixelBudget, completion: completion)
         case .original:
             develop.prepareOriginalHandoff(maxEdge: maxEdge, completion: completion)
         }
@@ -602,8 +604,13 @@ final class MobileGradeSession: ObservableObject {
             completion(.failure(MobileExportError.busy))
             return
         }
-        let originalEdge = max(store.photos.first(where: { $0.id == photoID })?.width ?? 0,
-                               store.photos.first(where: { $0.id == photoID })?.height ?? 0)
+        let photo = store.photos.first(where: { $0.id == photoID })
+        let originalWidth = photo?.width ?? 0
+        let originalHeight = photo?.height ?? 0
+        let originalEdge = max(originalWidth, originalHeight)
+        let aspect = (originalWidth > 0 && originalHeight > 0)
+            ? Double(min(originalWidth, originalHeight)) / Double(max(originalWidth, originalHeight))
+            : 0.75
         let borderConfig = border
         let filmID = develop.filmID
         let dateLabel = captureDateLabel
@@ -611,10 +618,13 @@ final class MobileGradeSession: ObservableObject {
         let watermarkEnabled = includeWatermark
         let watermark = MWatermarkStore.load()
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
-        // 原始档和带片边的大图都可能超过前台内存预算：所有档位统一按可用内存钳位，
-        // 实际尺寸写进导出文案，避免 48 MP 级原片导出时被 jetsam。
-        let edge = ExportEdge.clampToMemoryBudget(rawEdge)
-        let exportNote = edge < rawEdge ? "导出调色 · 内存上限 \(edge)" : "导出调色"
+        // 与显影台共用同一套内存计划：能整张算就整张算，放不下就分带。
+        let plan = develop.exportPlan(index: longEdgeIndex, originalEdge: originalEdge,
+                                      aspect: aspect, includeGrade: true)
+            ?? ExportEdge.Plan(edge: rawEdge, tiled: false, bandPixelBudget: 0,
+                               haloRows: 0, bandCount: 1, clamped: false)
+        let edge = plan.edge
+        let exportNote = plan.clamped ? "导出调色 · 内存上限 \(edge)" : "导出调色"
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
         let geometry = geometry
         let targetSpace: String
@@ -638,9 +648,9 @@ final class MobileGradeSession: ObservableObject {
         phaseLabel = "导出调色"
         exportLabel = exportNote
         phaseProgress = 0
-        handoff(maxEdge: edge) { [weak self] image in
+        handoff(maxEdge: edge, tiled: plan.tiled, bandPixelBudget: plan.bandPixelBudget) { [weak self] image in
             guard let self else { return }
-            guard let image else {
+            guard var image else {
                 Task { @MainActor in
                     self.isExporting = false
                     self.exportLabel = ""
@@ -651,12 +661,19 @@ final class MobileGradeSession: ObservableObject {
             let exportPhotoID = self.photoID
             self.gradeQueue.async {
                 do {
-                    let linear = GradeEngine.prepareSource(image)
-                    let warped = geometry.apply(to: linear)
-                    let result = try GradeEngine.render(warped, recipe: recipe)
-                    if let lutError = result.lutError { throw lutError }
-                    var output = Self.convertForExport(
-                        result.image, colorSpace: targetSpace, cctfEncoding: targetCCTF)
+                    // 交接图只在 prepare 阶段用一次；原地转换后立刻释放引用，
+                    // 34 MP 下能省掉一整张 400 MB 的 COW 副本。
+                    var linear = image
+                    image = ImageRGB(width: 0, height: 0)
+                    GradeEngine.prepareSourceInPlace(&linear)
+                    var warped = geometry.apply(to: linear)
+                    linear = ImageRGB(width: 0, height: 0)
+                    var rendered = try GradeEngine.renderInPlace(&warped, recipe: recipe)
+                    if let lutError = rendered.lutError { throw lutError }
+                    var output = rendered.image
+                    // 把 result 里的引用也清掉，convertForExport 原地写回时才是唯一所有权。
+                    rendered.image = ImageRGB(width: 0, height: 0)
+                    Self.convertForExport(&output, colorSpace: targetSpace, cctfEncoding: targetCCTF)
                     // 水印属于照片本身：先压进画面，再合成片边，避免盖到片基与边字上。
                     if watermarkEnabled {
                         Task { @MainActor in self.exportLabel = "合成水印" }
@@ -706,12 +723,12 @@ final class MobileGradeSession: ObservableObject {
     // MARK: - 工具
 
     private nonisolated static func convertForExport(
-        _ image: ImageRGB, colorSpace: String, cctfEncoding: Bool
-    ) -> ImageRGB {
-        if colorSpace == "sRGB" && cctfEncoding { return image }
+        _ image: inout ImageRGB, colorSpace: String, cctfEncoding: Bool
+    ) {
+        if colorSpace == "sRGB" && cctfEncoding { return }
         let sourceKind = ColorMath.cctfKind(for: "sRGB")
         let targetKind = ColorMath.cctfKind(for: colorSpace)
-        return image.map { pixel in
+        image.mapInPlace { pixel in
             let decoded = Vec3(
                 ColorMath.cctfDecode(pixel.x, kind: sourceKind),
                 ColorMath.cctfDecode(pixel.y, kind: sourceKind),

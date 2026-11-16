@@ -208,7 +208,7 @@ enum Resize {
         return output
     }
 
-    private static func cubicWeights(_ t: Double) -> [Double] {
+    static func cubicWeights(_ t: Double) -> [Double] {
         let t2 = t * t
         let t3 = t2 * t
         return [

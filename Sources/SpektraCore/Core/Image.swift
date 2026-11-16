@@ -29,6 +29,34 @@ struct ImageRGB {
         for i in 0..<count { self.data[i] = Float(data[i]) }
     }
 
+    /// 从 Core Image 的 RGBAf 渲染缓冲直接构造。
+    ///
+    /// 解码曾经先摊成 `[Double]` 的 RGB 再转 Float，34 MP 下会多出 0.8 GB 临时缓冲；
+    /// 这里只做一次 Float 拷贝，调用方随后即可释放 RGBA 缓冲。
+    init(width: Int, height: Int, rgbaFloat: [Float]) {
+        self.width = width
+        self.height = height
+        let pixelCount = width * height
+        precondition(rgbaFloat.count >= pixelCount * 4)
+        var data = [Float](repeating: 0, count: pixelCount * 3)
+        data.withUnsafeMutableBufferPointer { destination in
+            guard let dst = destination.baseAddress else { return }
+            rgbaFloat.withUnsafeBufferPointer { source in
+                guard let src = source.baseAddress else { return }
+                var srcIndex = 0
+                var dstIndex = 0
+                for _ in 0..<pixelCount {
+                    dst[dstIndex] = src[srcIndex]
+                    dst[dstIndex + 1] = src[srcIndex + 1]
+                    dst[dstIndex + 2] = src[srcIndex + 2]
+                    srcIndex += 4
+                    dstIndex += 3
+                }
+            }
+        }
+        self.data = data
+    }
+
     init(width: Int, height: Int, r: Double, g: Double, b: Double) {
         self.width = width
         self.height = height

@@ -153,19 +153,19 @@ enum RawDecoder {
             )
         }
 
-        var values = [Double](repeating: 0, count: width * height * 3)
-        for i in 0..<(width * height) {
-            for c in 0..<3 { values[i * 3 + c] = Double(buffer[i * 4 + c]) }
-        }
-        var image = ImageRGB(width: width, height: height, data: values)
+        // 直接从 RGBAf 收成 RGB Float，随后立刻释放 RGBA 缓冲；
+        // 34 MP 下比旧实现（RGBAf + Double RGB + Float RGB 三份并存）少约 1.3 GB。
+        var image = ImageRGB(width: width, height: height, rgbaFloat: buffer)
+        buffer = []
         if options.outputColorSpace != "sRGB" {
-            image = image.map { pixel in
-                ColorMath.rgbToRGB(pixel, from: "sRGB", to: options.outputColorSpace)
+            let target = options.outputColorSpace
+            image.mapInPlace { pixel in
+                ColorMath.rgbToRGB(pixel, from: "sRGB", to: target)
             }
         }
         if options.outputCCTFEncoding {
             let kind = ColorMath.cctfKind(for: options.outputColorSpace)
-            image = image.map { pixel in
+            image.mapInPlace { pixel in
                 Vec3(
                     ColorMath.cctfEncode(pixel.x, kind: kind),
                     ColorMath.cctfEncode(pixel.y, kind: kind),
@@ -173,7 +173,8 @@ enum RawDecoder {
                 )
             }
         }
-        return image.sanitizedNonFinite()
+        image.sanitizeNonFinite()
+        return image
     }
 
     /// 模拟器专用回退：`CIRAWFilter` 在 iOS 模拟器上会卡住（MobileAsset 拿不到相机描述）。
@@ -228,11 +229,10 @@ enum RawDecoder {
                 format: .RGBAf, colorSpace: linearSRGB
             )
         }
-        var values = [Double](repeating: 0, count: width * height * 3)
-        for i in 0..<(width * height) {
-            for c in 0..<3 { values[i * 3 + c] = Double(buffer[i * 4 + c]) }
-        }
-        return ImageRGB(width: width, height: height, data: values).sanitizedNonFinite()
+        var image = ImageRGB(width: width, height: height, rgbaFloat: buffer)
+        buffer = []
+        image.sanitizeNonFinite()
+        return image
     }
 
     /// 基础 EXIF（相机 / 镜头 / 焦距 / 光圈），供导出与界面显示使用。

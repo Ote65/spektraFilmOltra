@@ -639,12 +639,14 @@ final class MobileDevelopSession: ObservableObject {
             return
         }
         // “原始”必须用库里记录的原图像素尺寸，而不是预览缓冲的 1600 长边。
-        // 但原始档同样可能超过前台内存预算（48 MP ProRAW 峰值可达数 GB），
-        // 因此所有档位都按可用内存钳位，实际尺寸通过 exportLabel 明确告诉用户。
+        // 大图优先分带显影：内存只跟条带高度有关，不再按整张面积一刀切降采样。
+        let photo = store.photos.first(where: { $0.id == photoID })
+        let originalWidth = photo?.width ?? 0
+        let originalHeight = photo?.height ?? 0
         let originalEdge = originalLongEdge > 0 ? originalLongEdge : max(image.width, image.height)
-        let requested = ExportEdge.resolve(index: longEdgeIndex, originalLongEdge: originalEdge)
-        let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
-        let clampedNote = requested < rawEdge ? "导出 · 内存上限 \(requested)" : "导出"
+        let aspect = (originalWidth > 0 && originalHeight > 0)
+            ? Double(min(originalWidth, originalHeight)) / Double(max(originalWidth, originalHeight))
+            : 0.75
         var params: RuntimePhotoParams
         do {
             params = try edit.runtimeParams()
@@ -652,6 +654,10 @@ final class MobileDevelopSession: ObservableObject {
             completion(.failure(error))
             return
         }
+        let plan = ExportEdge.plan(index: longEdgeIndex, originalLongEdge: originalEdge,
+                                   params: params, aspect: aspect)
+        let requested = plan.edge
+        let clampedNote = plan.clamped ? "导出 · 内存上限 \(requested)" : "导出"
         params.io.inputColorSpace = inputColorSpace
         params.io.inputCCTFDecoding = inputCCTF
         let ext: String
@@ -688,7 +694,7 @@ final class MobileDevelopSession: ObservableObject {
         exportLabel = clampedNote
         exportQueue.async { [weak self] in
             // 导出按目标长边重新解码原图：预览缓存是缩小版，不能拿它放大。
-            guard let loaded = try? ImageLoader.load(
+            guard var loaded = try? ImageLoader.load(
                 url: sourceURL, maxSize: requested, rawOptions: options,
                 rotationTurns: rotation, allowEncoded: true, rawTimeout: 60,
                 allowPreviewFallback: false) else {
@@ -703,12 +709,24 @@ final class MobileDevelopSession: ObservableObject {
             exportParams.io.inputColorSpace = loaded.colorSpace
             exportParams.io.inputCCTFDecoding = loaded.cctfDecoding
             let pipeline = SimulationPipeline(params: exportParams, keepTaps: false)
-            let prepared = PreviewRenderer.prepared(loaded.image, maxSize: requested)
-            let result = pipeline.process(prepared, progress: { label, _, _ in
+            var prepared = PreviewRenderer.prepared(loaded.image, maxSize: requested)
+            // 解码结果与 prepared 共享同一块存储；把 loaded 的引用清掉，
+            // 后续 COW / 分带分配才能拿到唯一所有权。
+            loaded.image = ImageRGB(width: 0, height: 0)
+            let progress: (String, Int, Int) -> Void = { label, _, _ in
                 Task { @MainActor [weak self] in
                     self?.exportLabel = Self.stageLabel(label)
                 }
-            })
+            }
+            let result: PipelineResult
+            if plan.tiled {
+                result = pipeline.processTiled(prepared,
+                                               bandPixelBudget: plan.bandPixelBudget,
+                                               progress: progress)
+            } else {
+                result = pipeline.process(prepared, progress: progress)
+            }
+            prepared = ImageRGB(width: 0, height: 0)
             var output = result.rgbOut
             if monochrome {
                 output = Self.monochrome(output, colorSpace: colorSpace)
@@ -747,11 +765,21 @@ final class MobileDevelopSession: ObservableObject {
 
     // MARK: - 交接给调色台
 
+    /// 调色台导出用的内存计划：与显影台共用同一套可用内存/分带计算。
+    func exportPlan(index: Int, originalEdge: Int, aspect: Double = 0.75,
+                    includeGrade: Bool = false) -> ExportEdge.Plan? {
+        guard let params = try? edit.runtimeParams() else { return nil }
+        return ExportEdge.plan(index: index, originalLongEdge: originalEdge,
+                               params: params, aspect: aspect, includeGrade: includeGrade)
+    }
+
     /// 显影 → 线性 ProPhoto 交接像素。调色台只接收这一份结果，不再接触 RAW。
     /// 若 RAW 还在解码，先挂起，解码完成或失败后再回调。
-    func prepareHandoff(maxEdge: Int = 1600, completion: @escaping (ImageRGB?) -> Void) {
+    func prepareHandoff(maxEdge: Int = 1600, tiled: Bool = false, bandPixelBudget: Int = 0,
+                        completion: @escaping (ImageRGB?) -> Void) {
         if let image {
-            renderHandoff(image, maxEdge: maxEdge, completion: completion)
+            renderHandoff(image, maxEdge: maxEdge, tiled: tiled,
+                          bandPixelBudget: bandPixelBudget, completion: completion)
             return
         }
         if errorMessage != nil {
@@ -762,6 +790,7 @@ final class MobileDevelopSession: ObservableObject {
     }
 
     private func renderHandoff(_ previewImage: ImageRGB, maxEdge: Int,
+                               tiled: Bool = false, bandPixelBudget: Int = 0,
                                completion: @escaping (ImageRGB?) -> Void) {
         guard let baseParams = try? edit.runtimeParams() else {
             completion(nil)
@@ -797,7 +826,8 @@ final class MobileDevelopSession: ObservableObject {
             }
             params.io.outputColorSpace = "ProPhoto RGB"
             params.io.outputCCTFEncoding = false
-            renderer.render(params: params, image: source, maxSize: maxEdge) { outcome in
+            renderer.render(params: params, image: source, maxSize: maxEdge,
+                            tiled: tiled, bandPixelBudget: bandPixelBudget) { outcome in
                 let result = monochrome
                     ? Self.monochrome(outcome.image, colorSpace: "ProPhoto RGB")
                     : outcome.image
@@ -1478,6 +1508,7 @@ final class MobileDevelopSession: ObservableObject {
         case "printing.develop": return "印相显影"
         case "scanning.scan_print": return "扫描打印"
         case "scanning.scan_film": return "正片扫描"
+        case "tile": return "分带显影"
         default: return label
         }
     }
@@ -1523,16 +1554,35 @@ enum MobileExportError: Error {
 }
 
 /// 导出长边档位：0 原始（原图真实像素，不静默降采样）、1 2048、2 4096。
+///
+/// 大图不再一刀切降采样：先判断当前可用内存能否一次算完整张图；
+/// 不够就改用「分带显影」——内存只跟条带高度有关，像素数不再被内存卡死。
+/// 只有连分带都放不下（例如同时开了超大半径柔光镜）才退回按余量钳位。
 enum ExportEdge {
-    /// 单像素实测峰值：ImageRGB 改为 Float32 后，12.19 MP 全流程峰值约 1.45 GB，
-    /// 折算约 119 B/px（含阶段缓冲与工具自身持有）。乘 1.1 取 130 B/px 做安全余量。
-    private static let bytesPerPixelFootprint = 130.0
+    /// 单像素峰值估算（含阶段缓冲）。12 MP 单张实测（含工具持有的源图）约 109 B/px，
+    /// 这里取 110 B/px；分带后每条带实际更低，同一口径偏保守。
+    private static let pipelineBytesPerPixel = 110.0
+    /// 解码临时峰值：RGBAf 16 B/px + 目标缓冲 12 B/px + Core Image 内部余量。
+    private static let decodeBytesPerPixel = 44.0
+    /// 编码峰值：成图 12 B/px + 16-bit 编码缓冲。编码发生在条带释放之后，单独核算。
+    private static let encodeBytesPerPixel = 36.0
+    /// 调色台导出额外的工作缓冲（GradeEngine 的 Double 工作图 + Float 局部滤波）。
+    /// 34 MP 实测峰值常驻 1.76 GB，折算约 52 B/px，取 58 B/px 留余量。
+    private static let gradeBytesPerPixel = 58.0
+    /// 只使用可用内存的 72%，其余留给系统、SwiftUI 和突发分配。
+    private static let safetyFraction = 0.72
 
-    static func resolve(index: Int, originalLongEdge: Int) -> Int {
-        let edge = requested(index: index, originalLongEdge: originalLongEdge)
-        // 原始档也必须钳位：48 MP 级原片按 119 B/px 的全流程峰值会超过前台预算，
-        // 直接按原尺寸导出会被系统 jetsam。调用方负责把实际尺寸展示给用户。
-        return clampToMemoryBudget(edge)
+    struct Plan {
+        /// 实际输出长边。
+        var edge: Int
+        /// true：分带显影；false：整张一次算。
+        var tiled: Bool
+        /// 分带时每条带的目标像素数（含上下重叠）。
+        var bandPixelBudget: Int
+        var haloRows: Int
+        var bandCount: Int
+        /// 实际输出小于用户选择的尺寸。
+        var clamped: Bool
     }
 
     /// 用户选定的档位换算成长边，不做内存钳位。
@@ -1544,17 +1594,99 @@ enum ExportEdge {
         }
     }
 
-    /// 显式档位（2048/4096）按当前进程可用内存回退长边，避免把 App 撑到 jetsam。
-    /// 4:3 画幅下长边 L 的像素数 ≈ 0.75·L²；峰值 ≈ 像素数 × bytesPerPixelFootprint。
-    static func clampToMemoryBudget(_ edge: Int) -> Int {
+    static func plan(index: Int, originalLongEdge: Int, params: RuntimePhotoParams,
+                     aspect: Double = 0.75, includeGrade: Bool = false) -> Plan {
+        let requestedEdge = requested(index: index, originalLongEdge: originalLongEdge)
         let available = Int(os_proc_available_memory())
-        guard available > 0 else { return edge }
-        let budget = Double(available) * 0.60
-        let maxEdge = Int(sqrt(budget / (0.75 * bytesPerPixelFootprint)))
-        guard maxEdge > 0 else { return edge }
-        // 不要钳到 1/2 以下：宁可让系统去回收，也不要导出到几乎不可用的尺寸。
-        // 但也不能把小于 1024 的原图反向放大，所以下限取 min(edge, 1024)。
-        let floorEdge = min(edge, 1024)
-        return max(floorEdge, min(edge, maxEdge))
+        guard available > 0 else {
+            return Plan(edge: requestedEdge, tiled: false, bandPixelBudget: 0,
+                        haloRows: 0, bandCount: 1, clamped: false)
+        }
+        let budget = Double(available) * safetyFraction
+        // 「放大」倍率会把输出像素成平方放大；解码仍按原图长边，
+        // 所以解码、显影、编码要分别按源像素 / 输出像素核算。
+        let upscale = max(params.io.upscaleFactor, 1.0)
+        // 长边与短边的比例：像素数 = 长边² × aspect。裁切只会减少像素，
+        // 所以用原图比例就是安全上界。
+        let aspectRatio = min(max(aspect, 0.2), 1.0)
+        func outputEdge(_ sourceEdge: Int) -> Int {
+            max(1, Int((Double(sourceEdge) * upscale).rounded(.toNearestOrEven)))
+        }
+        func sourcePixels(_ edge: Int) -> Double {
+            Double(edge) * Double(edge) * aspectRatio
+        }
+        func outputPixels(_ edge: Int) -> Double {
+            let value = Double(outputEdge(edge))
+            return value * value * aspectRatio
+        }
+        func gradePeak(_ edge: Int) -> Double {
+            guard includeGrade else { return 0 }
+            return outputPixels(edge) * gradeBytesPerPixel + 64 * 1024 * 1024
+        }
+        func singlePassPeak(_ edge: Int) -> Double {
+            max(sourcePixels(edge) * decodeBytesPerPixel,
+                outputPixels(edge) * pipelineBytesPerPixel) + 64 * 1024 * 1024
+        }
+        func encodePeak(_ edge: Int) -> Double {
+            outputPixels(edge) * encodeBytesPerPixel + 64 * 1024 * 1024
+        }
+        /// 分带方案。`nil` 表示这张图不能分带（柔光镜核太大）或分带也放不下。
+        func tiledPlan(_ edge: Int) -> Plan? {
+            guard !params.camera.diffusionFilter.active,
+                  !params.enlarger.diffusionFilter.active else { return nil }
+            let longEdge = outputEdge(edge)
+            let pixelSize = SimulationPipeline.exportPixelSizeUM(params: params, outputLongEdge: longEdge)
+            let halo = SimulationPipeline.haloRows(for: params, pixelSizeUM: pixelSize)
+            // 核比条带还大时分带没有意义，退回整张/钳位。
+            guard halo > 0, halo <= 1200 else { return nil }
+            let width = longEdge
+            let height = longEdge
+            let outputCount = outputPixels(edge)
+            let fixedBytes = sourcePixels(edge) * 12 + outputCount * 12 + 64 * 1024 * 1024
+            let bandBudget = budget - fixedBytes
+            guard bandBudget > 160 * 1024 * 1024 else { return nil }
+            let bandPixels = max(1_000_000, min(8_000_000,
+                                                Int(bandBudget / pipelineBytesPerPixel)))
+            let rows = SimulationPipeline.tileRows(outputWidth: width, outputHeight: height,
+                                                   haloRows: halo, bandPixelBudget: bandPixels)
+            guard rows.bandCount > 1 else { return nil }
+            let bandArea = (rows.coreRows + 2 * halo) * width
+            let peak = fixedBytes + Double(bandArea) * pipelineBytesPerPixel
+            let decodePeak = sourcePixels(edge) * decodeBytesPerPixel + 64 * 1024 * 1024
+            guard max(max(max(peak, decodePeak), encodePeak(edge)), gradePeak(edge)) <= budget else {
+                return nil
+            }
+            return Plan(edge: edge, tiled: true, bandPixelBudget: bandPixels,
+                        haloRows: halo, bandCount: rows.bandCount, clamped: edge < requestedEdge)
+        }
+
+        if max(max(singlePassPeak(requestedEdge), encodePeak(requestedEdge)),
+               gradePeak(requestedEdge)) <= budget {
+            return Plan(edge: requestedEdge, tiled: false, bandPixelBudget: 0,
+                        haloRows: 0, bandCount: 1, clamped: false)
+        }
+        if let tiled = tiledPlan(requestedEdge) { return tiled }
+
+        // 连分带都放不下：二分出能安全处理的最大长边，保留旧的钳位语义。
+        var low = min(512, requestedEdge)
+        var high = requestedEdge
+        var best: Plan?
+        while low <= high {
+            let mid = (low + high) / 2
+            if max(max(singlePassPeak(mid), encodePeak(mid)), gradePeak(mid)) <= budget {
+                best = Plan(edge: mid, tiled: false, bandPixelBudget: 0,
+                            haloRows: 0, bandCount: 1, clamped: mid < requestedEdge)
+                low = mid + 1
+            } else if let tiled = tiledPlan(mid) {
+                best = tiled
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        if let best { return best }
+        let floorEdge = min(1024, requestedEdge)
+        return Plan(edge: floorEdge, tiled: false, bandPixelBudget: 0,
+                    haloRows: 0, bandCount: 1, clamped: floorEdge < requestedEdge)
     }
 }

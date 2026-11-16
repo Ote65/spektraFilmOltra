@@ -65,6 +65,25 @@ enum GradeEngine {
         ])
     }()
 
+    /// 线性 ProPhoto float → 线性 sRGB float（原地版，导出大图时省一张整图）。
+    static func prepareSourceInPlace(_ image: inout ImageRGB) {
+        let matrix = proPhotoToSRGB
+        let count = image.data.count
+        image.data.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var index = 0
+            while index < count {
+                let converted = matrix.apply(Vec3(Double(base[index]),
+                                                  Double(base[index + 1]),
+                                                  Double(base[index + 2])))
+                base[index] = Float(converted.x)
+                base[index + 1] = Float(converted.y)
+                base[index + 2] = Float(converted.z)
+                index += 3
+            }
+        }
+    }
+
     /// 线性 ProPhoto float → 线性 sRGB float。
     static func prepareSource(_ image: ImageRGB) -> ImageRGB {
         let matrix = proPhotoToSRGB
@@ -97,11 +116,49 @@ enum GradeEngine {
         guard sourceLinearSRGB.width > 0, sourceLinearSRGB.height > 0 else {
             return GradeRenderResult(image: sourceLinearSRGB, analysis: .neutral)
         }
-        let count = sourceLinearSRGB.width * sourceLinearSRGB.height
-        var data = [Double](repeating: 0, count: count * 3)
-        for i in 0..<(count * 3) { data[i] = Double(sourceLinearSRGB.data[i]) }
         let width = sourceLinearSRGB.width
         let height = sourceLinearSRGB.height
+        let count = width * height
+        var data = [Double](repeating: 0, count: count * 3)
+        for i in 0..<(count * 3) { data[i] = Double(sourceLinearSRGB.data[i]) }
+        return try renderPrepared(&data, width: width, height: height, recipe: recipe,
+                                  analyze: analyze, shouldCancel: shouldCancel)
+    }
+
+    /// 导出专用：把源图读进工作缓冲后立刻把源缓冲置空，
+    /// 大图在后续滤镜阶段不再多背一张整图（34 MP 下约 400 MB）。
+    @discardableResult
+    static func renderInPlace(
+        _ source: inout ImageRGB,
+        recipe: GradeRecipe,
+        analyze: Bool = true,
+        shouldCancel: (() -> Bool)? = nil
+    ) throws -> GradeRenderResult {
+        guard source.width > 0, source.height > 0 else {
+            return GradeRenderResult(image: source, analysis: .neutral)
+        }
+        let width = source.width
+        let height = source.height
+        let count = width * height
+        var data = [Double](repeating: 0, count: count * 3)
+        source.data.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            for i in 0..<(count * 3) { data[i] = Double(base[i]) }
+        }
+        source = ImageRGB(width: 0, height: 0)
+        return try renderPrepared(&data, width: width, height: height, recipe: recipe,
+                                  analyze: analyze, shouldCancel: shouldCancel)
+    }
+
+    private static func renderPrepared(
+        _ data: inout [Double],
+        width: Int,
+        height: Int,
+        recipe: GradeRecipe,
+        analyze: Bool,
+        shouldCancel: (() -> Bool)?
+    ) throws -> GradeRenderResult {
+        let count = width * height
 
         func checkCancel() throws {
             if shouldCancel?() == true { throw GradeCancelled.cancelled }
@@ -163,60 +220,60 @@ enum GradeEngine {
         return t * t * (3 - 2 * t)
     }
 
-    private static func boxBlur(_ values: [Double], width: Int, height: Int,
-                                radius: Double) -> [Double] {
+    private static func boxBlur(_ values: [Float], width: Int, height: Int,
+                                radius: Double) -> [Float] {
         guard width > 0, height > 0 else { return values }
         let size = max(3, Int((radius * 2).rounded()) | 1)
         let half = size / 2
-        var horizontal = [Double](repeating: 0, count: values.count)
+        var horizontal = [Float](repeating: 0, count: values.count)
         var prefix = [Double](repeating: 0, count: max(width, height) + 1)
 
         for y in 0..<height {
             let row = y * width
             prefix[0] = 0
             for x in 0..<width {
-                prefix[x + 1] = prefix[x] + values[row + x]
+                prefix[x + 1] = prefix[x] + Double(values[row + x])
             }
             for x in 0..<width {
                 let low = max(0, x - half)
                 let high = min(width - 1, x + half)
-                horizontal[row + x] = (prefix[high + 1] - prefix[low]) / Double(high - low + 1)
+                horizontal[row + x] = Float((prefix[high + 1] - prefix[low]) / Double(high - low + 1))
             }
         }
 
-        var output = [Double](repeating: 0, count: values.count)
+        var output = [Float](repeating: 0, count: values.count)
         for x in 0..<width {
             prefix[0] = 0
             for y in 0..<height {
-                prefix[y + 1] = prefix[y] + horizontal[y * width + x]
+                prefix[y + 1] = prefix[y] + Double(horizontal[y * width + x])
             }
             for y in 0..<height {
                 let low = max(0, y - half)
                 let high = min(height - 1, y + half)
-                output[y * width + x] = (prefix[high + 1] - prefix[low]) / Double(high - low + 1)
+                output[y * width + x] = Float((prefix[high + 1] - prefix[low]) / Double(high - low + 1))
             }
         }
         return output
     }
 
-    private static func minimumFilter(_ values: [Double], width: Int, height: Int,
-                                      size: Int) -> [Double] {
+    private static func minimumFilter(_ values: [Float], width: Int, height: Int,
+                                      size: Int) -> [Float] {
         let half = max(1, size / 2)
-        var horizontal = [Double](repeating: 0, count: values.count)
+        var horizontal = [Float](repeating: 0, count: values.count)
         for y in 0..<height {
             let row = y * width
             for x in 0..<width {
-                var value = Double.greatestFiniteMagnitude
+                var value = Float.greatestFiniteMagnitude
                 for k in max(0, x - half)...min(width - 1, x + half) {
                     value = min(value, values[row + k])
                 }
                 horizontal[row + x] = value
             }
         }
-        var output = [Double](repeating: 0, count: values.count)
+        var output = [Float](repeating: 0, count: values.count)
         for x in 0..<width {
             for y in 0..<height {
-                var value = Double.greatestFiniteMagnitude
+                var value = Float.greatestFiniteMagnitude
                 for k in max(0, y - half)...min(height - 1, y + half) {
                     value = min(value, horizontal[k * width + x])
                 }
@@ -234,6 +291,16 @@ enum GradeEngine {
         let high = min(low + 1, sorted.count - 1)
         let fraction = position - Double(low)
         return sorted[low] * (1 - fraction) + sorted[high] * fraction
+    }
+
+    private static func percentile(_ values: [Float], _ percent: Double) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let position = Double(sorted.count - 1) * percent / 100
+        let low = Int(floor(position))
+        let high = min(low + 1, sorted.count - 1)
+        let fraction = position - Double(low)
+        return Double(sorted[low]) * (1 - fraction) + Double(sorted[high]) * fraction
     }
 
     private static func postprocess(_ data: inout [Double]) {
@@ -753,13 +820,13 @@ enum GradeEngine {
 
     // MARK: - 画质
 
-    private static func coreDetail(_ detail: [Double], threshold: Double) -> [Double] {
-        var output = detail
+    private static func coreDetailInPlace(_ detail: inout [Float], threshold: Double) {
+        let squaredThreshold = threshold * threshold
         for i in 0..<detail.count {
-            let squared = detail[i] * detail[i]
-            output[i] = detail[i] * squared / (squared + threshold * threshold)
+            let value = Double(detail[i])
+            let squared = value * value
+            detail[i] = Float(value * squared / (squared + squaredThreshold))
         }
-        return output
     }
 
     private static func applyClarityStructure(
@@ -770,9 +837,9 @@ enum GradeEngine {
         guard abs(clarity) > 1e-6 || abs(texture) > 1e-6 else { return }
         let count = width * height
         let shortEdge = max(1, min(width, height))
-        var logLuma = [Double](repeating: 0, count: count)
+        var logLuma = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            logLuma[i] = log2(max(luma(data, i), 1e-4))
+            logLuma[i] = Float(log2(max(luma(data, i), 1e-4)))
         }
         let steps: [(Double, Double, Double)] = [
             (clarity, 0.008, 0.35),
@@ -782,7 +849,7 @@ enum GradeEngine {
             let radius = max(1, Double(shortEdge) * ratio)
             let base = boxBlur(logLuma, width: width, height: height, radius: radius)
             for i in 0..<count {
-                let detail = logLuma[i] - base[i]
+                let detail = Double(logLuma[i]) - Double(base[i])
                 let shaped = detail / (1 + pow(detail / sigma, 2))
                 let gain = pow(2.0, amount / 100 * 0.5 * shaped)
                 data[i * 3] *= gain
@@ -805,18 +872,19 @@ enum GradeEngine {
         }
         let strength = 1 - pow(1 - amount / 100, 2)
         let shortEdge = max(1, min(width, height))
-        var dark = [Double](repeating: 0, count: count)
+        var dark = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            dark[i] = min(data[i * 3], data[i * 3 + 1], data[i * 3 + 2])
+            let minimum = min(min(data[i * 3], data[i * 3 + 1]), data[i * 3 + 2])
+            dark[i] = Float(minimum)
         }
         let window = max(3, Int((Double(shortEdge) * 0.02).rounded()) | 1)
         let darkSmooth = minimumFilter(dark, width: width, height: height, size: window)
-        var lumaSamples = [Double](repeating: 0, count: count)
-        for i in 0..<count { lumaSamples[i] = luma(data, i) }
+        var lumaSamples = [Float](repeating: 0, count: count)
+        for i in 0..<count { lumaSamples[i] = Float(luma(data, i)) }
         let airlight = max(percentile(lumaSamples, 99), 0.30)
         for i in 0..<count {
             let transmission = min(max(
-                1 - strength * 0.95 * darkSmooth[i] / max(airlight, 0.1), 0.1
+                1 - strength * 0.95 * Double(darkSmooth[i]) / max(airlight, 0.1), 0.1
             ), 1)
             data[i * 3] = airlight + (data[i * 3] - airlight) / transmission
             data[i * 3 + 1] = airlight + (data[i * 3 + 1] - airlight) / transmission
@@ -833,31 +901,33 @@ enum GradeEngine {
         let count = width * height
         let shortEdge = max(1, min(width, height))
         if luminance > 1e-6 {
-            var y = [Double](repeating: 0, count: count)
-            for i in 0..<count { y[i] = luma(data, i) }
+            var y = [Float](repeating: 0, count: count)
+            for i in 0..<count { y[i] = Float(luma(data, i)) }
             let smooth = boxBlur(y, width: width, height: height,
                                  radius: max(0.8, Double(shortEdge) * 0.0015))
             for i in 0..<count {
-                let delta = (smooth[i] - y[i]) * (luminance * 0.85)
+                let delta = (Double(smooth[i]) - Double(y[i])) * (luminance * 0.85)
                 data[i * 3] += delta
                 data[i * 3 + 1] += delta
                 data[i * 3 + 2] += delta
             }
         }
         if chroma > 1e-6 {
-            var cr = [Double](repeating: 0, count: count)
-            var cb = [Double](repeating: 0, count: count)
+            var cr = [Float](repeating: 0, count: count)
+            var cb = [Float](repeating: 0, count: count)
             for i in 0..<count {
                 let y = luma(data, i)
-                cr[i] = data[i * 3] - y
-                cb[i] = data[i * 3 + 2] - y
+                cr[i] = Float(data[i * 3] - y)
+                cb[i] = Float(data[i * 3 + 2] - y)
             }
             let radius = max(1, Double(shortEdge) * 0.0025)
             let crSmooth = boxBlur(cr, width: width, height: height, radius: radius)
+            for i in 0..<count {
+                data[i * 3] += (Double(crSmooth[i]) - Double(cr[i])) * (chroma * 0.85)
+            }
             let cbSmooth = boxBlur(cb, width: width, height: height, radius: radius)
             for i in 0..<count {
-                data[i * 3] += (crSmooth[i] - cr[i]) * (chroma * 0.85)
-                data[i * 3 + 2] += (cbSmooth[i] - cb[i]) * (chroma * 0.85)
+                data[i * 3 + 2] += (Double(cbSmooth[i]) - Double(cb[i])) * (chroma * 0.85)
             }
         }
     }
@@ -871,21 +941,21 @@ enum GradeEngine {
         let shortEdge = max(1, min(width, height))
         let scale = max(0.6, min(2.0, Double(shortEdge) / 1080))
         let radius = quality.sharpenRadius * scale
-        var y = [Double](repeating: 0, count: count)
-        for i in 0..<count { y[i] = luma(data, i) }
+        var y = [Float](repeating: 0, count: count)
+        for i in 0..<count { y[i] = Float(luma(data, i)) }
         let blurOne = boxBlur(y, width: width, height: height,
                               radius: max(0.6, radius * 0.9))
         let blurWide = boxBlur(y, width: width, height: height,
                                radius: max(1.2, radius * 2.6))
         let threshold = 0.002 + quality.sharpenThreshold / 100 * 0.06
-        var detail = [Double](repeating: 0, count: count)
+        var detail = [Float](repeating: 0, count: count)
         for i in 0..<count { detail[i] = y[i] - blurOne[i] }
-        let core = coreDetail(detail, threshold: threshold)
-        var wide = [Double](repeating: 0, count: count)
+        coreDetailInPlace(&detail, threshold: threshold)
+        var wide = [Float](repeating: 0, count: count)
         for i in 0..<count { wide[i] = blurOne[i] - blurWide[i] }
-        let wideCore = coreDetail(wide, threshold: threshold)
+        coreDetailInPlace(&wide, threshold: threshold)
         for i in 0..<count {
-            let delta = (core[i] + 0.5 * wideCore[i]) * (amount * 2)
+            let delta = (Double(detail[i]) + 0.5 * Double(wide[i])) * (amount * 2)
             data[i * 3] += delta
             data[i * 3 + 1] += delta
             data[i * 3 + 2] += delta
@@ -919,7 +989,7 @@ enum GradeEngine {
     }
 
     private static func bilinearSample(
-        _ channel: [Double], width: Int, height: Int,
+        _ channel: [Float], width: Int, height: Int,
         x: Double, y: Double
     ) -> Double {
         let x0 = Int(floor(x))
@@ -930,8 +1000,8 @@ enum GradeEngine {
         let xb = min(max(x0 + 1, 0), width - 1)
         let ya = min(max(y0, 0), height - 1)
         let yb = min(max(y0 + 1, 0), height - 1)
-        let top = channel[ya * width + xa] * (1 - fx) + channel[ya * width + xb] * fx
-        let bottom = channel[yb * width + xa] * (1 - fx) + channel[yb * width + xb] * fx
+        let top = Double(channel[ya * width + xa]) * (1 - fx) + Double(channel[ya * width + xb]) * fx
+        let bottom = Double(channel[yb * width + xa]) * (1 - fx) + Double(channel[yb * width + xb]) * fx
         return top * (1 - fy) + bottom * fy
     }
 
@@ -941,44 +1011,42 @@ enum GradeEngine {
         let strength = amount / 100 * 0.004
         guard strength > 1e-6 else { return }
         let count = width * height
-        var red = [Double](repeating: 0, count: count)
-        var green = [Double](repeating: 0, count: count)
-        var blue = [Double](repeating: 0, count: count)
+        var red = [Float](repeating: 0, count: count)
+        var blue = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            red[i] = data[i * 3]
-            green[i] = data[i * 3 + 1]
-            blue[i] = data[i * 3 + 2]
+            red[i] = Float(data[i * 3])
+            blue[i] = Float(data[i * 3 + 2])
         }
         let cy = Double(height) / 2
         let cx = Double(width) / 2
-        var outputRed = [Double](repeating: 0, count: count)
-        var outputBlue = [Double](repeating: 0, count: count)
+        var outputRed = [Float](repeating: 0, count: count)
+        var outputBlue = [Float](repeating: 0, count: count)
         for y in 0..<height {
             for x in 0..<width {
                 let index = y * width + x
-                outputRed[index] = bilinearSample(
+                outputRed[index] = Float(bilinearSample(
                     red, width: width, height: height,
                     x: cx + (Double(x) - cx) * (1 + strength),
                     y: cy + (Double(y) - cy) * (1 + strength)
-                )
-                outputBlue[index] = bilinearSample(
+                ))
+                outputBlue[index] = Float(bilinearSample(
                     blue, width: width, height: height,
                     x: cx + (Double(x) - cx) * (1 - strength),
                     y: cy + (Double(y) - cy) * (1 - strength)
-                )
+                ))
             }
         }
         for i in 0..<count {
-            data[i * 3] = outputRed[i]
-            data[i * 3 + 2] = outputBlue[i]
+            data[i * 3] = Double(outputRed[i])
+            data[i * 3 + 2] = Double(outputBlue[i])
         }
     }
 
     private static let grainLock = NSLock()
-    private static var grainCache: [String: [Double]] = [:]
+    private static var grainCache: [String: [Float]] = [:]
 
     /// 确定性噪声；与 numpy `default_rng(20240101)` 不逐位一致，但同尺寸同种子稳定。
-    private static func grainNoise(width: Int, height: Int) -> [Double] {
+    private static func grainNoise(width: Int, height: Int) -> [Float] {
         let key = "\(width)x\(height)"
         grainLock.lock()
         if let cached = grainCache[key] {
@@ -986,7 +1054,7 @@ enum GradeEngine {
             return cached
         }
         grainLock.unlock()
-        var noise = [Double](repeating: 0, count: width * height)
+        var noise = [Float](repeating: 0, count: width * height)
         var state: UInt64 = 20240101
         func next() -> Double {
             state &+= 0x9E3779B97F4A7C15
@@ -1001,11 +1069,12 @@ enum GradeEngine {
             let u2 = next()
             let radius = sqrt(-2 * log(u1))
             let angle = 2 * Double.pi * u2
-            noise[i] = radius * cos(angle)
-            if i + 1 < noise.count { noise[i + 1] = radius * sin(angle) }
+            noise[i] = Float(radius * cos(angle))
+            if i + 1 < noise.count { noise[i + 1] = Float(radius * sin(angle)) }
         }
         grainLock.lock()
-        if grainCache.count >= 4 { grainCache.removeAll() }
+        // 大图噪声很大，只保留最近两份，避免缓存反噬内存。
+        if grainCache.count >= 2 { grainCache.removeAll() }
         grainCache[key] = noise
         grainLock.unlock()
         return noise
@@ -1025,22 +1094,26 @@ enum GradeEngine {
         let roughness = optics.grainRoughness / 100
         if roughness > 1e-6 {
             for i in 0..<count {
-                noise[i] = (noise[i] < 0 ? -1 : 1) * pow(abs(noise[i]), 1 - roughness * 0.7)
+                let value = Double(noise[i])
+                noise[i] = Float((value < 0 ? -1 : 1) * pow(abs(value), 1 - roughness * 0.7))
             }
         }
         var mean = 0.0
-        for value in noise { mean += value }
+        for value in noise { mean += Double(value) }
         mean /= Double(count)
         var variance = 0.0
-        for value in noise { variance += (value - mean) * (value - mean) }
+        for value in noise {
+            let delta = Double(value) - mean
+            variance += delta * delta
+        }
         let deviation = sqrt(variance / Double(count))
         if deviation > 1e-6 {
-            for i in 0..<count { noise[i] /= deviation }
+            for i in 0..<count { noise[i] = Float(Double(noise[i]) / deviation) }
         }
         for i in 0..<count {
             let y = luma(data, i)
             let weight = 0.4 + 0.6 * 4 * y * max(1 - y, 0)
-            let delta = noise[i] * (amount * 0.06) * weight
+            let delta = Double(noise[i]) * (amount * 0.06) * weight
             data[i * 3] += delta
             data[i * 3 + 1] += delta
             data[i * 3 + 2] += delta

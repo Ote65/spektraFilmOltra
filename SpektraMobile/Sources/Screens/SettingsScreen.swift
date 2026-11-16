@@ -12,6 +12,8 @@ enum MobileSettings {
     static let defaultExportEdgeKey = "mobile.export.defaultEdgeIndex"
     static let defaultExportQualityKey = "mobile.export.defaultQualityIndex"
     static let launchScreenKey = "mobile.launch.screen"
+    /// 冷启动时主页默认选中的筛选类型；相簿 ID 不稳定，不参与默认值。
+    static let launchScopeKey = "mobile.launch.scope"
 
     /// 与导出面板的 formats 顺序一致：JPEG / TIFF sRGB / TIFF ProPhoto / EXR。
     static let exportFormatTitles = [
@@ -29,6 +31,33 @@ enum MobileSettings {
 
         var id: String { rawValue }
         var title: String { self == .home ? "访达" : "相机" }
+    }
+
+    /// 启动筛选只开放固定类型；系统相簿是动态 ID，不适合做默认值。
+    enum MLaunchScope: String, CaseIterable, Identifiable {
+        case all
+        case captured
+        case saved
+        case favorites
+        case raw
+        case graded
+
+        var id: String { rawValue }
+
+        var title: String { scope.title }
+
+        var requiresEncoded: Bool { self == .captured || self == .saved }
+
+        var scope: MAssetScope {
+            switch self {
+            case .all: return .all
+            case .captured: return .captured
+            case .saved: return .saved
+            case .favorites: return .favorites
+            case .raw: return .raw
+            case .graded: return .graded
+            }
+        }
     }
 
     static var predictivePreviewEnabled: Bool {
@@ -57,6 +86,14 @@ enum MobileSettings {
         return value
     }
 
+    static var launchScope: MAssetScope {
+        guard let raw = UserDefaults.standard.string(forKey: launchScopeKey),
+              let value = MLaunchScope(rawValue: raw) else { return .all }
+        // 关闭「支持 JPEG」后拍摄/保存筛选没有入口，启动时回落到全部。
+        if value.requiresEncoded && !allowNonRaw { return .all }
+        return value.scope
+    }
+
     private static func index(forKey key: String, count: Int, fallback: Int) -> Int {
         guard let number = UserDefaults.standard.object(forKey: key) as? Int else {
             return fallback
@@ -79,6 +116,7 @@ struct SettingsScreen: View {
     @AppStorage(MobileSettings.defaultExportEdgeKey) private var exportEdge = 0
     @AppStorage(MobileSettings.defaultExportQualityKey) private var exportQuality = 1
     @AppStorage(MobileSettings.launchScreenKey) private var launchScreen = MobileSettings.MLaunchScreen.home.rawValue
+    @AppStorage(MobileSettings.launchScopeKey) private var launchScope = MobileSettings.MLaunchScope.all.rawValue
 
     @State private var watermark = MWatermarkStore.load()
     @State private var watermarkEditorOpen = false
@@ -275,6 +313,12 @@ struct SettingsScreen: View {
                 launchScreen = value.rawValue
             }
 
+            MChoiceRow(label: "默认筛选", value: launchScopeTitle,
+                       options: launchScopeOptions) { raw in
+                guard MobileSettings.MLaunchScope(rawValue: raw) != nil else { return }
+                launchScope = raw
+            }
+
             hairline
         }
     }
@@ -289,6 +333,21 @@ struct SettingsScreen: View {
     private var launchOptions: [MProOption] {
         MobileSettings.MLaunchScreen.allCases
             .filter { !MLayout.isPad || $0 != .camera }
+            .map {
+                MProOption(value: $0.rawValue, label: $0.title)
+            }
+    }
+
+    private var launchScopeTitle: String {
+        let value = MobileSettings.MLaunchScope(rawValue: launchScope) ?? .all
+        // 关闭「支持 JPEG」时拍摄/保存没有入口，显示与启动行为都回落到全部。
+        if value.requiresEncoded && !allowNonRaw { return MobileSettings.MLaunchScope.all.title }
+        return value.title
+    }
+
+    private var launchScopeOptions: [MProOption] {
+        MobileSettings.MLaunchScope.allCases
+            .filter { allowNonRaw || !$0.requiresEncoded }
             .map {
                 MProOption(value: $0.rawValue, label: $0.title)
             }

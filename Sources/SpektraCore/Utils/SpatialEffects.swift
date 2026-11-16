@@ -13,6 +13,17 @@ enum SpatialEffects {
         return output
     }
 
+    /// 原地 USM：调用方传入独占缓冲时省掉一整张 12 MP 的 COW 拷贝。
+    static func applyUnsharpMaskInPlace(_ image: inout ImageRGB, sigma: Double, amount: Double) {
+        guard sigma > 0, amount > 0 else { return }
+        let blurred = FastGaussian.filter(image, sigma: sigma)
+        for i in 0..<image.data.count {
+            let value = Double(image.data[i])
+            let blur = Double(blurred.data[i])
+            image.data[i] = Float(value + amount * (value - blur))
+        }
+    }
+
     static func gaussianBlurUM(_ image: ImageRGB, sigmaUM: Double, pixelSizeUM: Double) -> ImageRGB {
         guard sigmaUM > 0, pixelSizeUM > 0 else { return image }
         return FastGaussian.filter(image, sigma: sigmaUM / pixelSizeUM)
@@ -47,6 +58,9 @@ enum SpatialEffects {
 
     static func halation(_ image: ImageRGB, params: HalationParams, pixelSizeUM: Double) -> ImageRGB {
         guard params.active, pixelSizeUM > 0 else { return image }
+        let width = image.width
+        let height = image.height
+        let pixelCount = width * height
         var raw = image
         let scatterAmount = params.scatterAmount
         let scatterScale = params.scatterSpatialScale
@@ -54,14 +68,23 @@ enum SpatialEffects {
         let coreSigmas = params.scatterCoreUM.map { max($0 * scatterScale / pixelSizeUM, 1e-6) }
         let tailDecays = params.scatterTailUM.map { max($0 * scatterScale / pixelSizeUM, 1e-6) }
         if scatterAmount > 0 {
-            let core = FastGaussian.filter(raw, sigma: coreSigmas)
-            let tail = FastGaussian.exponentialFilter(raw, decay: tailDecays, nGaussians: 3)
+            // 逐通道处理：旧实现同时保留 core / tail 两张 RGB 整图，
+            // 34 MP 下多占约 0.8 GB；这里每次只留一条通道缓冲。
             for c in 0..<3 {
-                for i in 0..<(image.width * image.height) {
-                    let scattered = (1 - tailWeights[c]) * Double(core.data[i * 3 + c])
-                        + tailWeights[c] * Double(tail.data[i * 3 + c])
-                    let original = Double(raw.data[i * 3 + c])
-                    raw.data[i * 3 + c] = Float((1 - scatterAmount) * original + scatterAmount * scattered)
+                var plane = [Double](repeating: 0, count: pixelCount)
+                for p in 0..<pixelCount { plane[p] = Double(raw.data[p * 3 + c]) }
+                let core = FastGaussian.filterChannel(plane, width: width, height: height,
+                                                      sigma: coreSigmas[c])
+                let tail = FastGaussian.exponentialFilterChannel(
+                    plane, width: width, height: height, decay: tailDecays[c], nGaussians: 3)
+                let tailWeight = tailWeights[c]
+                for p in 0..<pixelCount {
+                    // 旧实现里 core / tail 是 ImageRGB，组合前已量化到 Float；
+                    // 这里显式过一遍 Float，保证逐像素结果一致。
+                    let scattered = (1 - tailWeight) * Double(Float(core[p]))
+                        + tailWeight * Double(tail[p])
+                    let original = Double(raw.data[p * 3 + c])
+                    raw.data[p * 3 + c] = Float((1 - scatterAmount) * original + scatterAmount * scattered)
                 }
             }
         }
@@ -73,22 +96,30 @@ enum SpatialEffects {
             for k in 1...n { decay[k - 1] = pow(params.halationBounceDecay, Double(k - 1)) }
             let sum = decay.reduce(0, +)
             decay = decay.map { $0 / sum }
-            var blur = ImageRGB(width: image.width, height: image.height)
-            for k in 1...n {
-                let sigmaK = sigmas.map { max($0 * sqrt(Double(k)), 1e-6) }
-                let component = FastGaussian.filter(raw, sigma: sigmaK)
-                let weight = decay[k - 1]
-                for i in 0..<blur.data.count { blur.data[i] += Float(weight * Double(component.data[i])) }
-            }
-            for c in 0..<3 {
-                for i in 0..<(image.width * image.height) {
-                    raw.data[i * 3 + c] += Float(strengths[c] * Double(blur.data[i * 3 + c]))
+            for c in 0..<3 where strengths[c] > 0 || params.halationRenormalize {
+                var plane = [Double](repeating: 0, count: pixelCount)
+                for p in 0..<pixelCount { plane[p] = Double(raw.data[p * 3 + c]) }
+                // 旧实现的累加缓冲是 ImageRGB（Float），这里保持 Float 累加，
+                // 避免改变多次反弹的量化顺序。
+                var blur = [Float](repeating: 0, count: pixelCount)
+                for k in 1...n {
+                    let sigmaK = max(sigmas[c] * sqrt(Double(k)), 1e-6)
+                    let component = FastGaussian.filterChannel(plane, width: width, height: height,
+                                                               sigma: sigmaK)
+                    let weight = decay[k - 1]
+                    for p in 0..<pixelCount {
+                        blur[p] += Float(weight * Double(Float(component[p])))
+                    }
+                }
+                for p in 0..<pixelCount {
+                    raw.data[p * 3 + c] += Float(strengths[c] * Double(blur[p]))
                 }
             }
             if params.halationRenormalize {
                 for c in 0..<3 {
-                    for i in 0..<(image.width * image.height) {
-                        raw.data[i * 3 + c] = Float(Double(raw.data[i * 3 + c]) / (1 + strengths[c]))
+                    let divisor = 1 + strengths[c]
+                    for p in 0..<pixelCount {
+                        raw.data[p * 3 + c] = Float(Double(raw.data[p * 3 + c]) / divisor)
                     }
                 }
             }

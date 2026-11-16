@@ -113,7 +113,7 @@ struct ParityCheck {
         params.sublayersActive = true
         let curves = normalizedCurves(film.data.densityCurves)
         let output = Grain.apply(
-            densityCMY: density, pixelSizeUM: 6.0, params: params,
+            densityCMY: &density, pixelSizeUM: 6.0, params: params,
             densityCurves: curves, densityCurvesLayers: film.data.densityCurvesLayers,
             profileType: film.info.type, bypass: false
         )

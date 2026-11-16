@@ -67,8 +67,10 @@ enum DensityCurves {
         }
 
         let input = densityCMY.data
-        var output = [Double](repeating: 0, count: pixelCount * 3)
-        output.withUnsafeMutableBufferPointer { out in
+        // 直接写进 Float 成图缓冲：旧实现先摊一张 Double 整图再复制成 Float，
+        // 34 MP 下会多占约 0.8 GB 峰值。写回值仍是 `Float(acc)`，逐位结果不变。
+        var result = ImageRGB(width: width, height: height)
+        result.data.withUnsafeMutableBufferPointer { out in
             guard let base = out.baseAddress else { return }
             flatDensity.withUnsafeBufferPointer { cd in
                 flatWeights.withUnsafeBufferPointer { wt in
@@ -91,9 +93,9 @@ enum DensityCurves {
                                     acc1 += value * wt[i + 1]
                                     acc2 += value * wt[i + 2]
                                 }
-                                base[offset] = acc0
-                                base[offset + 1] = acc1
-                                base[offset + 2] = acc2
+                                base[offset] = Float(acc0)
+                                base[offset + 1] = Float(acc1)
+                                base[offset + 2] = Float(acc2)
                             }
                         }
                         Interpolation.parallelRows(height: height, pixels: pixelCount, row)
@@ -101,7 +103,7 @@ enum DensityCurves {
                 }
             }
         }
-        return ImageRGB(width: width, height: height, data: output)
+        return result
     }
 
     static func interpolateExposureToDensity(logExposureRGB: ImageRGB, densityCurves: [[Double]],

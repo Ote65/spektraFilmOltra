@@ -159,11 +159,11 @@ enum MLayout {
     }
 
     /// 主页网格列数：按可用宽度决定，iPad 横屏不再固定两列。
+    /// 列数随窗口宽度渐进增减：窗口缩小时列数变少、卡片保持体量，
+    /// 而不是整排卡片被挤扁。iPhone 一律保持两列横幅卡片。
     static func gridColumns(for width: CGFloat) -> Int {
-        if width >= 1180 { return 5 }
-        if width >= 980 { return 4 }
-        if width >= 720 { return 3 }
-        return 2
+        guard isPad else { return 2 }
+        return max(1, min(5, Int((width - 28) / 190)))
     }
 }
 
@@ -287,6 +287,14 @@ enum DebugLaunch {
         guard let index = args.firstIndex(of: "--develop-file"),
               args.indices.contains(index + 1) else { return nil }
         return args[index + 1]
+    }
+
+    /// 验收用：`--launch-scope graded` 临时覆盖启动筛选，方便截图验证。
+    static var launchScope: MAssetScope? {
+        guard let index = args.firstIndex(of: "--launch-scope"),
+              args.indices.contains(index + 1),
+              let value = MobileSettings.MLaunchScope(rawValue: args[index + 1]) else { return nil }
+        return value.scope
     }
     /// 截图验收用：显影「细节」专业页默认滚到底部，好截到输入/输出分组。
     static var developPanelBottom: Bool { args.contains("--detail-bottom") }

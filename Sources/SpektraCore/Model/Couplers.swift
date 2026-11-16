@@ -101,13 +101,27 @@ enum Couplers {
             }
         }
         if diffusionSizePixel > 0 {
-            let gaussian = FastGaussian.filter(correction, sigma: diffusionSizePixel)
-            let tail = FastGaussian.exponentialFilter(correction, decay: diffusionTailPixel, nGaussians: 3)
-            for i in 0..<correction.data.count {
-                let gaussianValue = Double(gaussian.data[i])
-                let tailValue = Double(tail.data[i])
-                correction.data[i] = Float((1 - diffusionTailWeight) * gaussianValue
-                    + diffusionTailWeight * tailValue)
+            // 逐通道做高斯 + 指数尾：旧实现同时保留两张 RGB 模糊图，
+            // 34 MP 下多占约 0.8 GB。滤波核仍是同一组参数，结果逐像素一致。
+            let width = densityCMY.width
+            let height = densityCMY.height
+            let pixelCount = width * height
+            for c in 0..<3 {
+                var plane = [Double](repeating: 0, count: pixelCount)
+                for p in 0..<pixelCount { plane[p] = Double(correction.data[p * 3 + c]) }
+                let gaussian = FastGaussian.filterChannel(plane, width: width, height: height,
+                                                          sigma: diffusionSizePixel)
+                let tail = FastGaussian.exponentialFilterChannel(
+                    plane, width: width, height: height,
+                    decay: diffusionTailPixel, nGaussians: 3)
+                for p in 0..<pixelCount {
+                    // 旧实现的 gaussian / tail 是 ImageRGB，组合前已量化到 Float。
+                    let gaussianValue = Double(Float(gaussian[p]))
+                    let tailValue = Double(tail[p])
+                    correction.data[p * 3 + c] = Float(
+                        (1 - diffusionTailWeight) * gaussianValue
+                            + diffusionTailWeight * tailValue)
+                }
             }
         }
         var output = logRaw

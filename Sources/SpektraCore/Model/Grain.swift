@@ -63,7 +63,8 @@ enum Grain {
     static func layerParticleModel(density: [Double], densityMax: Double,
                                    nParticlesPerPixel: Double, grainUniformity: Double,
                                    seed: UInt64, blurParticle: Double,
-                                   width: Int, height: Int) -> [Double] {
+                                   width: Int, height: Int,
+                                   rowOffset: Int = 0) -> [Double] {
         guard densityMax > 0, nParticlesPerPixel > 0 else { return [Double](repeating: 0, count: density.count) }
         let odParticle = densityMax / nParticlesPerPixel
         var output = [Double](repeating: 0, count: density.count)
@@ -88,6 +89,9 @@ enum Grain {
         // 而它是全分辨率导出里最贵的一段：12 MP 下 11 s → 约 3 s。
         // `map` 那类纯逐像素变换不能这样并行（缺页争用），这里因为每个像素要算
         // 几十次随机采样，属于计算密集，才划算。
+        //
+        // `rowOffset` 供分带导出使用：条带内的行号要加上它在整图中的起始行，
+        // 否则每条带都会重复同一套颗粒图案，接缝处会出现明显重复。
         if width > 0, height > 1, density.count == width * height, width * height >= 120_000 {
             output.withUnsafeMutableBufferPointer { destination in
                 guard let dst = destination.baseAddress else { return }
@@ -98,7 +102,7 @@ enum Grain {
                         // 相邻行就等于同一随机流的相邻位置。每像素抽样次数固定时，下一行
                         // 会成为上一行左移几个像素的副本，颗粒退化成 45° 斜纹。
                         // 先做一次雪崩混合，保证各行种子在状态空间里彼此远离。
-                        var rng = SplitMix64(seed: rowSeed(seed, y))
+                        var rng = SplitMix64(seed: rowSeed(seed, rowOffset + y))
                         let start = y * width
                         sample(src, dst, start..<(start + width), &rng)
                     }
@@ -151,7 +155,8 @@ enum Grain {
 
     static func applyToDensityLayers(densityCMY: ImageRGB, pixelSizeUM: Double, params: GrainParams,
                                      densityCurves: [[Double]], densityCurvesLayers: [[[Double]]],
-                                     positive: Bool) -> ImageRGB {
+                                     positive: Bool, rowOffset: Int = 0,
+                                     rowSeeded: Bool = false) -> ImageRGB {
         let width = densityCMY.width
         let height = densityCMY.height
         let pixelCount = width * height
@@ -203,13 +208,14 @@ enum Grain {
                     grainUniformity: params.uniformity[c],
                     seed: seed,
                     blurParticle: params.blurDyeCloudsUM,
-                    width: width, height: height
+                    width: width, height: height, rowOffset: rowOffset
                 )
                 for p in 0..<pixelCount { output.data[p * 3 + c] += Float(modelled[p]) }
             }
         }
 
-        addMicroStructure(&output, micro: params.microStructure, pixelSizeUM: pixelSizeUM)
+        addMicroStructure(&output, micro: params.microStructure, pixelSizeUM: pixelSizeUM,
+                          rowOffset: rowOffset, rowSeeded: rowSeeded)
         for c in 0..<3 {
             for p in 0..<pixelCount {
                 output.data[p * 3 + c] = Float(Double(output.data[p * 3 + c]) - params.densityMin[c])
@@ -221,19 +227,33 @@ enum Grain {
         return output
     }
 
-    static func addMicroStructure(_ density: inout ImageRGB, micro: [Double], pixelSizeUM: Double) {
+    static func addMicroStructure(_ density: inout ImageRGB, micro: [Double], pixelSizeUM: Double,
+                                  rowOffset: Int = 0, rowSeeded: Bool = false) {
         guard micro.count >= 2, pixelSizeUM > 0 else { return }
         let blurPixels = micro[0] / pixelSizeUM
         let sigma = micro[1] * 0.001 / pixelSizeUM
         guard sigma > 0.05 else { return }
-        let pixelCount = density.width * density.height
-        var rng = SplitMix64(seed: 7)
+        let width = density.width
+        let height = density.height
+        let pixelCount = width * height
         var clumping = [Double](repeating: 0, count: pixelCount)
-        for p in 0..<pixelCount {
-            clumping[p] = RandomStats.lognormalFromMeanStd(1.0, sigma, &rng)
+        if rowSeeded {
+            // 分带导出：每行用绝对行号派生子种子，条带之间才接得上。
+            for y in 0..<height {
+                var rng = SplitMix64(seed: rowSeed(7, rowOffset + y))
+                let start = y * width
+                for p in start..<(start + width) {
+                    clumping[p] = RandomStats.lognormalFromMeanStd(1.0, sigma, &rng)
+                }
+            }
+        } else {
+            var rng = SplitMix64(seed: 7)
+            for p in 0..<pixelCount {
+                clumping[p] = RandomStats.lognormalFromMeanStd(1.0, sigma, &rng)
+            }
         }
         if blurPixels > 0.4 {
-            clumping = FastGaussian.filterChannel(clumping, width: density.width, height: density.height, sigma: blurPixels)
+            clumping = FastGaussian.filterChannel(clumping, width: width, height: height, sigma: blurPixels)
         }
         for c in 0..<3 {
             for p in 0..<pixelCount {
@@ -242,8 +262,10 @@ enum Grain {
         }
     }
 
-    static func applyToDensity(densityCMY: ImageRGB, pixelSizeUM: Double, params: GrainParams,
-                               densityCurves: [[Double]]) -> ImageRGB {
+    /// 原地颗粒：直接复用传入的密度缓冲，省掉 working + output 两张整图。
+    /// 逐通道的读、算、写顺序与原实现一致，Float 累加也保持一致。
+    static func applyToDensity(_ densityCMY: inout ImageRGB, pixelSizeUM: Double, params: GrainParams,
+                               densityCurves: [[Double]], rowOffset: Int = 0) {
         let densityMaxCurves = maxPerChannel(densityCurves)
         let pixelArea = pixelSizeUM * pixelSizeUM
         let subLayers = max(params.nSubLayers, 1)
@@ -257,51 +279,53 @@ enum Grain {
         let width = densityCMY.width
         let height = densityCMY.height
         let pixelCount = width * height
-        var working = densityCMY
-        for c in 0..<3 {
-            for p in 0..<pixelCount {
-                working.data[p * 3 + c] = Float(Double(working.data[p * 3 + c]) + params.densityMin[c])
-            }
-        }
-        var output = ImageRGB(width: width, height: height)
         for c in 0..<3 {
             var plane = [Double](repeating: 0, count: pixelCount)
-            for p in 0..<pixelCount { plane[p] = Double(working.data[p * 3 + c]) }
+            for p in 0..<pixelCount {
+                // 原实现先把 `密度 + densityMin` 写进 Float 缓冲再读成 Double，
+                // 这里显式过一遍 Float，逐位保持同样的量化点。
+                plane[p] = Double(Float(Double(densityCMY.data[p * 3 + c]) + params.densityMin[c]))
+                densityCMY.data[p * 3 + c] = 0
+            }
             for sub in 0..<subLayers {
                 let modelled = layerParticleModel(
                     density: plane, densityMax: densityMax[c],
                     nParticlesPerPixel: particles[c], grainUniformity: params.uniformity[c],
                     seed: UInt64(c + sub * 10), blurParticle: 0,
-                    width: width, height: height
+                    width: width, height: height, rowOffset: rowOffset
                 )
-                for p in 0..<pixelCount { output.data[p * 3 + c] += Float(modelled[p]) }
+                for p in 0..<pixelCount { densityCMY.data[p * 3 + c] += Float(modelled[p]) }
             }
         }
         for c in 0..<3 {
             for p in 0..<pixelCount {
-                output.data[p * 3 + c] = Float(
-                    Double(output.data[p * 3 + c]) / Double(subLayers) - params.densityMin[c]
+                densityCMY.data[p * 3 + c] = Float(
+                    Double(densityCMY.data[p * 3 + c]) / Double(subLayers) - params.densityMin[c]
                 )
             }
         }
         if params.blur > 0.4 {
-            output = FastGaussian.filter(output, sigma: params.blur)
+            densityCMY = FastGaussian.filter(densityCMY, sigma: params.blur)
         }
-        return output
     }
 
-    static func apply(densityCMY: ImageRGB, pixelSizeUM: Double, params: GrainParams,
+    static func apply(densityCMY: inout ImageRGB, pixelSizeUM: Double, params: GrainParams,
                       densityCurves: [[Double]], densityCurvesLayers: [[[Double]]],
-                      profileType: String, bypass: Bool) -> ImageRGB {
+                      profileType: String, bypass: Bool,
+                      rowOffset: Int = 0, rowSeeded: Bool = false) -> ImageRGB {
         guard params.active, !bypass, pixelSizeUM > 0 else { return densityCMY }
         if !params.sublayersActive {
-            return applyToDensity(densityCMY: densityCMY, pixelSizeUM: pixelSizeUM,
-                                  params: params, densityCurves: densityCurves)
+            applyToDensity(&densityCMY, pixelSizeUM: pixelSizeUM,
+                           params: params, densityCurves: densityCurves,
+                           rowOffset: rowOffset)
+            return densityCMY
         }
-        return applyToDensityLayers(
+        densityCMY = applyToDensityLayers(
             densityCMY: densityCMY, pixelSizeUM: pixelSizeUM, params: params,
             densityCurves: densityCurves, densityCurvesLayers: densityCurvesLayers,
-            positive: profileType == "positive"
+            positive: profileType == "positive",
+            rowOffset: rowOffset, rowSeeded: rowSeeded
         )
+        return densityCMY
     }
 }
