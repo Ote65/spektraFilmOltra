@@ -154,6 +154,8 @@ struct SettingsScreen: View {
     @State private var watermark = MWatermarkStore.load()
     @State private var watermarkEditorOpen = false
     @State private var luts: [GradeLUTEntry] = []
+    /// LUT 库默认折叠：列表长了会把缓存分区推得太远。
+    @State private var lutExpanded = false
     @State private var showLUTImporter = false
     @State private var pendingDelete: GradeLUTEntry?
     @State private var handoffCacheCount = 0
@@ -493,32 +495,48 @@ struct SettingsScreen: View {
 
     private var lutSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                MSectionHead(title: "LUT 库")
-                Spacer(minLength: 8)
-                Text("\(luts.count) 个")
-                    .mMeta(9, color: MColor.text4)
+            Button {
+                MHaptic.tick()
+                withAnimation(MMotion.state) { lutExpanded.toggle() }
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("LUT 库")
+                        .mLabel(9.5, color: MColor.text3)
+                    Spacer(minLength: 8)
+                    Text("\(luts.count) 个")
+                        .mMeta(9, color: MColor.text4)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(MColor.text4)
+                        .rotationEffect(.degrees(lutExpanded ? 180 : 0))
+                }
+                .padding(.top, 18)
+                .contentShape(Rectangle())
             }
-            .padding(.top, 18)
+            .buttonStyle(.plain)
+            .accessibilityLabel("LUT 库")
+            .accessibilityValue(lutExpanded ? "已展开" : "已折叠")
 
-            if luts.isEmpty {
-                Text("暂无 LUT")
-                    .mMeta(10, color: MColor.text4)
-                    .padding(.top, 10)
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(luts) { entry in
-                        lutRow(entry)
-                        if entry.id != luts.last?.id {
-                            hairline
+            if lutExpanded {
+                if luts.isEmpty {
+                    Text("暂无 LUT")
+                        .mMeta(10, color: MColor.text4)
+                        .padding(.top, 10)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(luts) { entry in
+                            lutRow(entry)
+                            if entry.id != luts.last?.id {
+                                hairline
+                            }
                         }
                     }
+                    .padding(.top, 4)
                 }
-                .padding(.top, 4)
-            }
 
-            importLUTButton
-                .padding(.top, 12)
+                importLUTButton
+                    .padding(.top, 12)
+            }
         }
     }
 

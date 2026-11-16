@@ -390,6 +390,9 @@ enum DebugLaunch {
     /// 验收用：直出成片页启动时展开片边面板。
     static var directBorderPanel: Bool { args.contains("--border-panel") }
 
+    /// 验收用：相机页启动时展开直出预设面板。
+    static var directPicker: Bool { args.contains("--direct-picker") }
+
     /// 截图验收用：设置页默认滚到底部，检查缓存分区。
     static var settingsBottom: Bool { args.contains("--settings-bottom") }
 }

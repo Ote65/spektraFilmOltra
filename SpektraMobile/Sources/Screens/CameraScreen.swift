@@ -131,6 +131,11 @@ struct CameraScreen: View {
             syncLevelMonitor()
             normalizeDirectSelection()
             showDebugDirectImageIfNeeded()
+            if DebugLaunch.directPicker {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                    withAnimation(Self.directPickerFade) { directPickerOpen = true }
+                }
+            }
         }
         .onDisappear {
             cancelCountdown()
@@ -289,7 +294,7 @@ struct CameraScreen: View {
             }
             // 菜单开着时，再点一次按钮只负责收回，不切换直出状态。
             if directPickerOpen {
-                withAnimation(Self.directPop) { directPickerOpen = false }
+                withAnimation(Self.directPickerFade) { directPickerOpen = false }
                 return
             }
             MHaptic.tick()
@@ -330,7 +335,7 @@ struct CameraScreen: View {
                 directLongPressed = true
                 normalizeDirectSelection()
                 MHaptic.medium()
-                withAnimation(Self.directPop) { directPickerOpen = true }
+                withAnimation(Self.directPickerFade) { directPickerOpen = true }
             }
         )
         .accessibilityLabel(directMode ? "关闭直出模式" : "打开直出模式")
@@ -846,55 +851,40 @@ struct CameraScreen: View {
         }
     }
 
-    /// 从直出按钮下方弹出的预设面板：上下两排，各自左右滚动。
+    /// 从直出按钮下方展开的预设面板：上下两排，各自左右滚动。
+    /// 宽度与屏幕齐平，用渐显出现。
     private var directPickerLayer: some View {
         GeometryReader { geo in
-            let panelWidth = min(geo.size.width - 24, 360)
+            let panelWidth = geo.size.width
             // 一屏正好 5 张卡、四道 4pt 间距：左右边缘与面板内边距严格对齐，
             // 不再出现第 5 张被裁掉半张的情况。
             let cardWidth = (panelWidth - 24 - 16) / 5
-            let anchorX = directButtonFrame == .zero
-                ? geo.size.width - 24
-                : directButtonFrame.midX
-            let panelX = min(max(anchorX - panelWidth / 2, 12),
-                             geo.size.width - panelWidth - 12)
             let topY = directButtonFrame == .zero
                 ? insets.top + 52
                 : directButtonFrame.maxY + 8
-            let popAnchor = UnitPoint(
-                x: min(max((anchorX - panelX) / panelWidth, 0), 1),
-                y: 0
-            )
 
             ZStack(alignment: .topLeading) {
                 if directPickerOpen {
-                    // 遮罩瞬现：不做透明度过渡，避免整层读成「渐显」。
                     Color.black.opacity(0.18)
                         .ignoresSafeArea()
                         .contentShape(Rectangle())
                         .onTapGesture {
                             directLongPressed = false
-                            withAnimation(Self.directPop) { directPickerOpen = false }
+                            withAnimation(Self.directPickerFade) { directPickerOpen = false }
                         }
-                        .transition(.identity)
+                        .transition(.opacity)
 
                     directPickerPanel(cardWidth: cardWidth)
                         .frame(width: panelWidth)
-                        .offset(x: panelX, y: topY)
-                        // 只做 scale、不叠 opacity：像原生菜单一样从按钮位置弹出来。
-                        .transition(
-                            .asymmetric(
-                                insertion: .scale(scale: 0.42, anchor: popAnchor),
-                                removal: .scale(scale: 0.9, anchor: popAnchor)
-                            )
-                        )
+                        .offset(y: topY)
+                        .transition(.opacity)
                 }
             }
         }
     }
 
-    /// 原生菜单式的短弹簧：起手快、收尾轻微回弹，不是渐显。
-    private static let directPop = Animation.spring(response: 0.26, dampingFraction: 0.78)
+    /// 预设面板的渐显：短促的淡入淡出，不做缩放。
+    private static let directPickerFade = Animation.easeOut(duration: 0.18)
 
     private func directPickerPanel(cardWidth: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 10) {
