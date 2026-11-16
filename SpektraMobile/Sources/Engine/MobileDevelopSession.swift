@@ -125,9 +125,9 @@ final class MobileDevelopSession: ObservableObject {
     init(photo: LibraryPhoto, store: LibraryStore) {
         self.photoID = photo.id
         self.filename = photo.filename
-        self.isRawInput = ImageLoader.rawSuffixes.contains(
-            (photo.filename as NSString).pathExtension.lowercased()
-        )
+        // isRaw 以 LibraryStore 入库时写入的字段为准（单一口径），
+        // 不再按 filename 扩展名重算，避免两处判定漂移。
+        self.isRawInput = photo.isRaw
         self.store = store
         // 旧版本的库记录可能把 ARW 的内嵌预览尺寸当成原图尺寸（如 1616×1080）。
         // 这里直接读 RAW 头，取库记录与真实尺寸的较大值，已有照片也能恢复全分辨率导出。

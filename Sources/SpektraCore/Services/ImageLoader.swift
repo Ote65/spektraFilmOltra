@@ -14,6 +14,17 @@ struct LoadedImage {
 
 /// 输入图像识别与解码。对齐 Python `spektrafilm_gui/input_color.py`：
 /// RAW → ProPhoto 线性；EXR/HDR → ACES 线性；编码图按 ICC 描述匹配，缺省 sRGB + CCTF 解码。
+///
+/// 除色彩解码外还承担以下行为，调用方需一并知晓：
+/// - **JPEG 门槛**：`rejectedSuffixes`（jpg/jpeg）默认拒绝，只有设置打开「支持 JPEG」、
+///   调用方传 `allowEncoded: true` 才放行；其余编码图（png/tif/heic 等）不受此门槛限制。
+/// - **RAW 降级**：真机上 CIRAWFilter 打不开或首次 MobileAsset 查询超时时，预览可经
+///   `allowPreviewFallback` 退回 ImageIO 内嵌预览并在 `LoadedImage.usedFallback` 标记；
+///   导出必须传 `allowPreviewFallback: false`，否则会把低分辨率预览写成成品。
+/// - **模拟器**：无相机 RAW 描述，RAW 一律走 ImageIO 缩略图管线（线性 sRGB，不能应用
+///   白平衡/镜头校正），仅用于预览与验收。
+/// - **方向**：EXIF 方向在 `renderToImage` 统一应用（显影/调色/导出/缩略图共用入口），
+///   用户手动旋转在 `load` 施加。
 enum ImageLoader {
     static let rawSuffixes: Set<String> = [
         "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef",
