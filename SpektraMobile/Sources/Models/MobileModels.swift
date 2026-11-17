@@ -729,30 +729,20 @@ enum MScreen: Hashable {
 /// 直出模式的画幅比例：拍摄永远是 RAW 全幅（4:3），比例只在渲染时居中裁切，
 /// 同时写入库记录的 cropData，让调色台的裁切功能保持同一构图。
 enum MDirectAspect: String, CaseIterable, Identifiable {
-    case original
-    case square = "1:1"
-    case landscape4_3 = "4:3"
+    /// 传感器 4:3 与 3:4 是同一比例，只保留竖幅一档（也是默认）。
     case portrait3_4 = "3:4"
-    case landscape16_9 = "16:9"
+    case square = "1:1"
     case portrait9_16 = "9:16"
 
     var id: String { rawValue }
 
-    var label: String {
-        switch self {
-        case .original: return "全幅"
-        default: return rawValue
-        }
-    }
+    var label: String { rawValue }
 
-    /// 目标宽高比（宽/高）；nil 表示不裁切。
-    var ratio: Double? {
+    /// 目标宽高比（宽/高）。
+    var ratio: Double {
         switch self {
-        case .original: return nil
-        case .square: return 1
-        case .landscape4_3: return 4.0 / 3
         case .portrait3_4: return 3.0 / 4
-        case .landscape16_9: return 16.0 / 9
+        case .square: return 1
         case .portrait9_16: return 9.0 / 16
         }
     }
@@ -797,7 +787,7 @@ struct MDirectSaveRequest {
     /// 快速控制基线（含拍摄曝光）；重新打开显影台时快速滑条回到 0 不会丢掉拍摄曝光。
     var baseline: PhotoEdit? = nil
     /// 相机页选择的画幅比例；保存时写进 cropData，与调色台裁切共用。
-    var aspect: MDirectAspect = .original
+    var aspect: MDirectAspect = .portrait3_4
 }
 
 enum MDirectSaveOutcome {
@@ -814,7 +804,7 @@ struct MDirectDevelopRequest {
     let grade: GradeRecipe
     var baseline: PhotoEdit? = nil
     /// 相机页选择的画幅比例；入库时写进 cropData，调色台裁切直接呈现同一构图。
-    var aspect: MDirectAspect = .original
+    var aspect: MDirectAspect = .portrait3_4
 }
 
 enum MDirectDevelopOutcome {

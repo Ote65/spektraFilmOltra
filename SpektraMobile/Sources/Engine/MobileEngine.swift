@@ -953,26 +953,24 @@ final class MobileEngine: ObservableObject {
     func applyDirectResult(photoID: String, edit: PhotoEdit, grade: GradeRecipe,
                            baseline: PhotoEdit? = nil,
                            renderedURL: URL,
-                           aspect: MDirectAspect = .original) async {
+                           aspect: MDirectAspect = .portrait3_4) async {
         guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
         photo.edit = edit
         photo.gradeData = try? JSONEncoder().encode(grade)
         // 快速控制的基线必须包含拍摄曝光：直出预设的快速量是相对「拍摄基线」计算的，
         // 若把已套用的直出参数当基线，快速滑条回到 0 时无法回到原始曝光 / 亮度。
         photo.quickBaselineData = try? JSONEncoder().encode(baseline ?? PhotoEdit())
-        // 相机页选的画幅比例写进裁切数据：调色台打开就是同一构图，
-        // 后续调色导出沿用裁切；全幅则不覆盖用户已有的裁切。
-        if let ratio = aspect.ratio {
-            let size = LibraryStore.pixelSize(url: store.originalURL(for: photo))
-            var geometry = MPhotoGeometry()
-            if let data = photo.cropData,
-               let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
-                geometry = decoded
-            }
-            geometry.crop = MPhotoGeometry.centerCrop(ratio: ratio,
-                                                      width: size.width, height: size.height)
-            photo.cropData = try? JSONEncoder().encode(geometry.normalized())
+        // 相机页选的画幅写进裁切数据：调色台打开就是同一构图，
+        // 后续调色导出沿用裁切。
+        let size = LibraryStore.pixelSize(url: store.originalURL(for: photo))
+        var geometry = MPhotoGeometry()
+        if let data = photo.cropData,
+           let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
+            geometry = decoded
         }
+        geometry.crop = MPhotoGeometry.centerCrop(ratio: aspect.ratio,
+                                                  width: size.width, height: size.height)
+        photo.cropData = try? JSONEncoder().encode(geometry.normalized())
         try? store.update(photo)
 
         var wroteThumbnail = false

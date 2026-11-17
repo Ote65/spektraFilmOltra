@@ -657,7 +657,7 @@ struct GradeScreen: View {
                 )
                 .frame(height: 78)
                 .allowsHitTesting(false)
-                .opacity(chromeHidden || drawerHeight > 500 ? 0 : 1)
+                .opacity(chromeHidden || drawerHeight > MMetric.drawerMin + 1 ? 0 : 1)
                 .animation(MMotion.quick, value: chromeHidden)
                 .animation(MMotion.quick, value: drawerHeight)
             }
@@ -728,7 +728,7 @@ struct GradeScreen: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
-                .opacity(chromeHidden || drawerHeight > 500 ? 0 : 1)
+                .opacity(chromeHidden || drawerHeight > MMetric.drawerMin + 1 ? 0 : 1)
                 .animation(MMotion.quick, value: chromeHidden)
                 .animation(MMotion.quick, value: drawerHeight)
             }

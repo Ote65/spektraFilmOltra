@@ -36,14 +36,13 @@ final class MCameraSession: NSObject, ObservableObject {
     }
 
     enum FlashMode: String, CaseIterable, Identifiable {
-        case off, auto, on
+        case off, on
 
         var id: String { rawValue }
 
         var title: String {
             switch self {
             case .off: return "关闭"
-            case .auto: return "自动"
             case .on: return "开启"
             }
         }
@@ -51,7 +50,6 @@ final class MCameraSession: NSObject, ObservableObject {
         var symbol: String {
             switch self {
             case .off: return "bolt.slash"
-            case .auto: return "bolt"
             case .on: return "bolt.fill"
             }
         }
@@ -442,12 +440,7 @@ final class MCameraSession: NSObject, ObservableObject {
         if hasFlash {
             let mode = flash.avMode
             if photoOutput.supportedFlashModes.contains(mode) {
-                if flash == .auto, !photoOutput.isFlashScene {
-                    // 自动档在亮场景不触发是系统行为；明示出来，免得以为开关坏了。
-                    message = "自动闪光：场景亮度足够，本次未触发闪光"
-                } else {
-                    settings.flashMode = mode
-                }
+                settings.flashMode = mode
             } else if flash == .on {
                 message = "当前设备或模式不支持强制闪光"
             }
@@ -984,7 +977,6 @@ private extension MCameraSession.FlashMode {
     var avMode: AVCaptureDevice.FlashMode {
         switch self {
         case .off: return .off
-        case .auto: return .auto
         case .on: return .on
         }
     }

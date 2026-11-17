@@ -786,6 +786,7 @@ struct DevelopScreen: View {
 
     private var previewMeta: some View {
         HStack(alignment: .bottom, spacing: 10) {
+            // 抽屉升过一档后画布被压扁，文件名与胶片信息会透到 sheet 顶部，直接隐藏。
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Circle()
@@ -804,6 +805,8 @@ struct DevelopScreen: View {
                     .foregroundStyle(MColor.text3)
                     .lineLimit(1)
             }
+            .opacity(drawerHeight > MMetric.drawerMin + 1 ? 0 : 1)
+            .animation(MMotion.quick, value: drawerHeight)
 
             Spacer(minLength: 0)
 

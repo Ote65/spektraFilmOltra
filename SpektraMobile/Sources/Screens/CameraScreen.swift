@@ -72,12 +72,18 @@ struct CameraScreen: View {
     /// 未加片边的成片预览：换片边时只重合成这一张，不重新显影。
     @State private var directPreviewCG: CGImage?
     /// 直出画幅比例：拍摄仍是 RAW 全幅，渲染时居中裁切，并写进 cropData。
-    @AppStorage("m.directAspect") private var directAspectRaw: String = MDirectAspect.original.rawValue
+    @AppStorage("m.directAspect") private var directAspectRaw: String = MDirectAspect.portrait3_4.rawValue
     /// 直出分辨率档位：按总像素显示，渲染时按目标长边解码。
     @AppStorage("m.directResolution") private var directResolutionRaw: String = MDirectResolution.maximum.rawValue
+    /// 画幅 / 分辨率菜单是否展开：展开后徽标移到左端，选项占据右侧。
+    @State private var aspectPanelOpen = false
+    /// 徽标实测宽度：展开时用它给左侧徽标精确让位。
+    @State private var aspectBadgeWidth: CGFloat = 90
+    /// 选中块在两条选项胶囊之间滑动的几何匹配命名空间。
+    @Namespace private var aspectSlideSpace
 
     private var directAspect: MDirectAspect {
-        MDirectAspect(rawValue: directAspectRaw) ?? .original
+        MDirectAspect(rawValue: directAspectRaw) ?? .portrait3_4
     }
 
     private var directResolution: MDirectResolution {
@@ -96,6 +102,17 @@ struct CameraScreen: View {
         let edge = camera.maxPhotoEdge
         guard edge > 0 else { return MDirectResolution.allCases }
         return MDirectResolution.allCases.filter { $0.available(forMaxEdge: edge) }
+    }
+
+    /// 取景框长宽比（宽/高）：跟随所选画幅，非直出模式保持传感器 3:4 竖幅。
+    private var finderRatio: CGFloat {
+        guard directMode else { return 3.0 / 4.0 }
+        return CGFloat(directAspect.ratio)
+    }
+
+    /// 只有 9:16 需要放大到贴住底部按钮上沿，其余比例在可用区域内居中。
+    private var finderBottomAligned: Bool {
+        directMode && directAspect == .portrait9_16
     }
 
     @State private var flashOpacity: Double = 0
@@ -119,15 +136,40 @@ struct CameraScreen: View {
 
             // 显影独立页：不再把相机取景留在背后。相机已 stop，黑色背景只承载相纸与进度。
             if directCard == nil {
-                VStack(spacing: 0) {
+                // 根视图忽略了安全区，这里手动让出状态栏：取景槽从状态栏下沿开始，
+                // 顶栏按钮恢复原位（状态栏下 4pt）悬浮在取景框内。
+                // 9:16 放大到贴住底部三按钮上沿，其余比例在槽内居中。
+                ZStack(alignment: .top) {
+                    VStack(spacing: 0) {
+                        GeometryReader { _ in
+                            ZStack(alignment: finderBottomAligned ? .bottom : .center) {
+                                Color.black
+                                viewfinder
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
+                            .overlay(alignment: .bottom) {
+                                lensBar
+                                    .padding(.bottom, 10)
+                            }
+                            // 菜单展开时，点取景框任意位置收回顶栏。
+                            .overlay {
+                                if aspectPanelOpen {
+                                    Color.black.opacity(0.001)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            withAnimation(Self.topBarSlide) { aspectPanelOpen = false }
+                                        }
+                                }
+                            }
+                        }
+
+                        controlRow
+                            .frame(height: 60)
+                        bottomRow
+                    }
+                    .padding(.top, insets.top)
+
                     topBar
-                    Spacer(minLength: 0)
-                    viewfinder
-                    controlRow
-                        .frame(height: 72)
-                        .padding(.top, 22)
-                    Spacer(minLength: 20)
-                    bottomRow
                 }
 
                 Color.white
@@ -156,12 +198,17 @@ struct CameraScreen: View {
         }
         .coordinateSpace(name: "cameraRoot")
         .onPreferenceChange(MDirectButtonFrameKey.self) { directButtonFrame = $0 }
+        .onPreferenceChange(MTopBadgeWidthKey.self) { aspectBadgeWidth = $0 }
         .background(MColor.canvas)
         .preferredColorScheme(.dark)
         .onAppear {
             camera.start()
             syncLevelMonitor()
             normalizeDirectSelection()
+            // 旧版本存过已下线的画幅（全幅 / 4:3 / 16:9）：回落到 3:4。
+            if MDirectAspect(rawValue: directAspectRaw) == nil {
+                directAspectRaw = MDirectAspect.portrait3_4.rawValue
+            }
             showDebugDirectImageIfNeeded()
             if DebugLaunch.directPicker {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
@@ -217,95 +264,167 @@ struct CameraScreen: View {
     // MARK: - 顶栏
 
     private var topBar: some View {
-        ZStack {
-            HStack(spacing: 8) {
-                Button {
-                    onClose()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(MColor.text1)
-                        .frame(width: 38, height: 38)
-                        .background(Circle().fill(Color.white.opacity(0.08)))
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                // 关闭按钮：菜单展开后让位给徽标。
+                if !aspectPanelOpen {
+                    closeButton
+                        .transition(.opacity)
                 }
-                .buttonStyle(MPressStyle(scale: 0.9))
-                .accessibilityLabel("关闭相机")
 
-                Spacer()
+                // 工具按钮绝对居中，不随左右内容变化偏移。
+                if !aspectPanelOpen {
+                    HStack(spacing: 8) {
+                        cameraToolButton(icon: "timer", active: timerSeconds > 0,
+                                         badge: timerSeconds > 0 ? "\(timerSeconds)s" : nil,
+                                         label: timerMenuOpen ? "收起计时器菜单" : "拍摄计时器") {
+                            withAnimation(MMotion.pill) { timerMenuOpen.toggle() }
+                        }
 
-                // 直出模式：RAW 标签换成画幅比例按钮，点击选择裁切比例。
-                if directMode {
-                    Menu {
-                        Section("画幅") {
-                            ForEach(MDirectAspect.allCases) { option in
-                                Button {
-                                    MHaptic.tick()
-                                    directAspectRaw = option.rawValue
-                                } label: {
-                                    if directAspect == option {
-                                        Label(option.label, systemImage: "checkmark")
-                                    } else {
-                                        Text(option.label)
-                                    }
-                                }
+                        if timerMenuOpen {
+                            timerMenuRow
+                                .transition(.asymmetric(
+                                    insertion: .scale(scale: 0.45, anchor: .leading)
+                                        .combined(with: .opacity),
+                                    removal: .scale(scale: 0.45, anchor: .leading)
+                                        .combined(with: .opacity)
+                                ))
+                        } else {
+                            cameraToolButton(icon: "square.grid.3x3", active: gridEnabled,
+                                             label: gridEnabled ? "关闭网格线" : "显示网格线") {
+                                withAnimation(MMotion.quick) { gridEnabled.toggle() }
                             }
+
+                            directModeButton
                         }
-                        Section("分辨率") {
-                            ForEach(selectableResolutions) { option in
-                                Button {
-                                    MHaptic.tick()
-                                    directResolutionRaw = option.rawValue
-                                } label: {
-                                    if directResolution == option {
-                                        Label(option.label, systemImage: "checkmark")
-                                    } else {
-                                        Text(option.label)
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        aspectBadge
                     }
-                    .menuIndicator(.hidden)
-                    .fixedSize()
+                    .animation(MMotion.pill, value: timerMenuOpen)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .transition(.opacity)
+                }
+
+                // 画幅徽标：收起时停在右端；展开时滑到左端，右侧让给选项行。
+                if directMode {
+                    aspectBadgeButton
+                        .offset(x: aspectPanelOpen
+                                ? 0
+                                : max(0, geo.size.width - aspectBadgeWidth))
+                        .zIndex(1)
                 } else {
                     rawBadge
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+
+                if directMode, aspectPanelOpen {
+                    aspectMenuOptions
+                        .padding(.leading, aspectBadgeWidth + 8)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
-
-            // 工具按钮整体居中，RAW 标签仍在右侧。
-            HStack(spacing: 8) {
-                cameraToolButton(icon: "timer", active: timerSeconds > 0,
-                                 badge: timerSeconds > 0 ? "\(timerSeconds)s" : nil,
-                                 label: timerMenuOpen ? "收起计时器菜单" : "拍摄计时器") {
-                    withAnimation(MMotion.pill) { timerMenuOpen.toggle() }
-                }
-
-                if timerMenuOpen {
-                    timerMenuRow
-                        .transition(.asymmetric(
-                            insertion: .scale(scale: 0.45, anchor: .leading)
-                                .combined(with: .opacity),
-                            removal: .scale(scale: 0.45, anchor: .leading)
-                                .combined(with: .opacity)
-                        ))
-                } else {
-                    cameraToolButton(icon: "square.grid.3x3", active: gridEnabled,
-                                     label: gridEnabled ? "关闭网格线" : "显示网格线") {
-                        withAnimation(MMotion.quick) { gridEnabled.toggle() }
-                    }
-
-                    directModeButton
-                }
-            }
-            .animation(MMotion.pill, value: timerMenuOpen)
         }
-        .padding(.horizontal, 16)
-        // 先定 44pt 内容高度，再加安全区上边距；顺序反过来会让 51pt 的 padding
-        // 被 44pt 的 frame 居中压缩，按钮实际会跑到状态栏 / 灵动岛下面。
+        // 根视图忽略了安全区：顶栏按真实安全区下移，回到原来的位置。
         .frame(height: 44)
+        .padding(.horizontal, 16)
         .padding(.top, insets.top + 4)
+    }
+
+    private var closeButton: some View {
+        Button {
+            onClose()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(MColor.text1)
+                .frame(width: 38, height: 38)
+                .background(Circle().fill(Color.white.opacity(0.08)))
+        }
+        .buttonStyle(MPressStyle(scale: 0.9))
+        .accessibilityLabel("关闭相机")
+    }
+
+    /// 画幅按钮：收起时停在右端，展开后移动到左端成为菜单标题。
+    private var aspectBadgeButton: some View {
+        Button {
+            MHaptic.tick()
+            withAnimation(Self.topBarSlide) {
+                aspectPanelOpen.toggle()
+                if aspectPanelOpen { timerMenuOpen = false }
+            }
+        } label: {
+            // 命中区是整个 44pt 方块，不是文字或胶囊轮廓：
+            // 用户点在图标、留白、边角都必须响应。
+            aspectBadge
+                .frame(height: 44)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: MTopBadgeWidthKey.self, value: proxy.size.width)
+            }
+        )
+        .accessibilityLabel("画幅与直出分辨率")
+    }
+
+    /// 展开后的选项：两条长胶囊，类别用矢量图标标注，选中块像变焦条一样滑动。
+    private var aspectMenuOptions: some View {
+        HStack(spacing: 6) {
+            aspectSegment(icon: "crop", slideID: "aspect",
+                          items: MDirectAspect.allCases.map(\.label),
+                          selectedIndex: MDirectAspect.allCases.firstIndex(of: directAspect) ?? 0) { index in
+                directAspectRaw = MDirectAspect.allCases[index].rawValue
+            }
+
+            aspectSegment(icon: "arrow.up.left.and.arrow.down.right", slideID: "resolution",
+                          items: selectableResolutions.map(\.label),
+                          selectedIndex: selectableResolutions.firstIndex(of: effectiveResolution) ?? 0) { index in
+                directResolutionRaw = selectableResolutions[index].rawValue
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 一条长胶囊：左侧矢量图标标类别，选项等宽铺满，选中块用几何匹配滑动。
+    private func aspectSegment(icon: String, slideID: String,
+                               items: [String], selectedIndex: Int,
+                               pick: @escaping (Int) -> Void) -> some View {
+        HStack(spacing: 2) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(MColor.text3)
+                .frame(width: 20, height: 30)
+
+            ForEach(items.indices, id: \.self) { index in
+                let selected = index == selectedIndex
+                Button {
+                    MHaptic.tick()
+                    pick(index)
+                } label: {
+                    Text(items[index])
+                        .font(.mSans(10, .semibold).monospacedDigit())
+                        .foregroundStyle(selected ? MColor.brassInk : MColor.text1)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 30)
+                        .background {
+                            if selected {
+                                Capsule()
+                                    .fill(MColor.brass)
+                                    .padding(.vertical, 2)
+                                    .matchedGeometryEffect(id: slideID, in: aspectSlideSpace)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(items[index])
+            }
+        }
+        .padding(3)
+        .background(Capsule().fill(Color.black.opacity(0.45)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
     }
 
     /// Spektra 只拍 RAW：这里只做状态显示，不提供开关。
@@ -339,14 +458,12 @@ struct CameraScreen: View {
             Text(effectiveResolution.label)
                 .font(.mSans(10, .semibold))
                 .foregroundStyle(MColor.brassHigh)
-            Text("RAW")
-                .font(.mSans(10, .medium))
-                .foregroundStyle(MColor.text4)
         }
         .padding(.horizontal, 10)
-        .frame(height: 28)
+        // 与右侧画幅 / 分辨率长胶囊同高（30 + 上下 3pt 内边距）。
+        .frame(height: 36)
         .background(Capsule().fill(Color.white.opacity(0.07)))
-        .contentShape(Capsule())
+        .allowsHitTesting(false)
         .accessibilityLabel("画幅比例 \(directAspect.label)")
     }
 
@@ -393,6 +510,7 @@ struct CameraScreen: View {
             MHaptic.tick()
             withAnimation(MMotion.quick) {
                 directMode.toggle()
+                if !directMode { aspectPanelOpen = false }
             }
             if directMode {
                 showHint("长按选择预设")
@@ -536,24 +654,20 @@ struct CameraScreen: View {
             }
             .allowsHitTesting(false)
 
-            VStack {
-                Spacer()
-                lensBar
-                    .padding(.bottom, 12)
-            }
-
             noticeCard
         }
         .animation(MMotion.state, value: levelEnabled)
         .animation(MMotion.state, value: camera.permission)
-        // 传感器是 4:3，竖着拿就是 3:4：取景框按 3:4 才和默认相机一致，不会上下裁掉一大截。
-        .aspectRatio(3.0 / 4.0, contentMode: .fit)
+        // 默认按传感器 3:4 竖幅；直出选了画幅比例后取景框跟着变。
+        .aspectRatio(finderRatio, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
         )
         .padding(.horizontal, 12)
+        .animation(MMotion.pill, value: directAspectRaw)
+        .animation(MMotion.pill, value: directMode)
     }
 
     @ViewBuilder
@@ -695,7 +809,8 @@ struct CameraScreen: View {
                     icon: camera.flash.symbol,
                     label: camera.flash.title,
                     active: camera.flash != .off,
-                    enabled: camera.isRawReady && camera.hasFlash
+                    enabled: camera.isRawReady && camera.hasFlash,
+                    showsLabel: false
                 ) {
                     MHaptic.tick()
                     camera.cycleFlash()
@@ -707,7 +822,8 @@ struct CameraScreen: View {
 
     private func axisButton(_ axis: MCaptureAxis, icon: String,
                             label: String, active: Bool) -> some View {
-        MCaptureControl(icon: icon, label: label, active: active, enabled: camera.isRawReady) {
+        MCaptureControl(icon: icon, label: label, active: active,
+                        enabled: camera.isRawReady, showsLabel: false) {
             MHaptic.tick()
             scaleValue = axis.seedValue(temperature: camera.temperature,
                                         exposure: camera.exposureBias)
@@ -759,7 +875,10 @@ struct CameraScreen: View {
             .accessibilityLabel("翻转相机")
         }
         .padding(.horizontal, 30)
-        .padding(.bottom, max(14, insets.bottom))
+        // 快门栏与三按钮栏之间补 10pt：三按钮上移、快门留在原位（已比原来低 10pt），
+        // 变焦条↔三按钮、三按钮↔快门都变成 17pt。
+        .padding(.top, 10)
+        .padding(.bottom, max(10, insets.bottom - 10))
     }
 
     /// 只显示本次拍摄的照片：`lastShot` 随这个页面一起创建 / 销毁。
@@ -809,6 +928,8 @@ struct CameraScreen: View {
         }
         .buttonStyle(MPressStyle(scale: 0.9))
         .disabled(!camera.canCapture)
+        // 色温 / 曝光刻度条展开时快门缩小 10%，给刻度条让出空间。
+        .scaleEffect(activeAxis == nil ? 1 : 0.9)
         .accessibilityLabel("拍照")
     }
 
@@ -978,6 +1099,9 @@ struct CameraScreen: View {
 
     /// 预设面板的渐显：短促的淡入淡出，不做缩放。
     private static let directPickerFade = Animation.easeOut(duration: 0.18)
+
+    /// 顶栏横移：四段贝塞尔（快出慢收），横移过程不带弹簧过冲。
+    private static let topBarSlide = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.42)
 
     private func directPickerPanel(cardWidth: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1747,6 +1871,9 @@ struct CameraScreen: View {
             return
         }
         timerMenuOpen = false
+        if aspectPanelOpen {
+            withAnimation(Self.topBarSlide) { aspectPanelOpen = false }
+        }
         if timerSeconds > 0 {
             startCountdown()
         } else {
@@ -2113,6 +2240,7 @@ private struct MCaptureControl: View {
     let label: String
     let active: Bool
     let enabled: Bool
+    var showsLabel: Bool = true
     let action: () -> Void
 
     var body: some View {
@@ -2130,9 +2258,11 @@ private struct MCaptureControl: View {
                         )
                     )
 
-                Text(label)
-                    .font(.mSans(9, .medium).monospacedDigit())
-                    .foregroundStyle(active ? MColor.brassHigh : MColor.text4)
+                if showsLabel {
+                    Text(label)
+                        .font(.mSans(9, .medium).monospacedDigit())
+                        .foregroundStyle(active ? MColor.brassHigh : MColor.text4)
+                }
             }
         }
         .buttonStyle(MPressStyle(scale: 0.92))
@@ -2297,6 +2427,14 @@ private final class MDirectRenderToken: @unchecked Sendable {
 private struct MDirectButtonFrameKey: PreferenceKey {
     static var defaultValue: CGRect = .zero
     static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        value = nextValue()
+    }
+}
+
+/// 顶栏画幅徽标宽度：展开菜单时按它把选项行推到徽标右侧。
+private struct MTopBadgeWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 90
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }
 }

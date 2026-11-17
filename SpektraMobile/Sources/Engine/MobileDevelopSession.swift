@@ -2159,7 +2159,7 @@ struct MDirectRenderSettings {
     /// 相册不支持 EXR：直出时自动改用 JPEG，并让相机页给出一次说明。
     var downgradedFromEXR: Bool = false
     /// 相机页选择的画幅比例：渲染末尾居中裁切，拍摄仍是 RAW 全幅。
-    var aspect: MDirectAspect = .original
+    var aspect: MDirectAspect = .portrait3_4
     /// 相机页选择的直出分辨率档位；非 MAX 时覆盖设置页的尺寸档。
     var resolution: MDirectResolution = .maximum
 
@@ -2455,9 +2455,7 @@ enum MDirectRenderer {
         graded.image = ImageRGB(width: 0, height: 0)
         // 画幅比例在渲染末尾居中裁切：拍摄永远是 RAW 全幅，片边 / 水印 / 预览
         // 都作用在裁切后的画幅上，与调色台的裁切是同一构图。
-        if let ratio = settings.aspect.ratio {
-            output = autoreleasepool { Self.centerCrop(output, ratio: ratio) }
-        }
+        output = autoreleasepool { Self.centerCrop(output, ratio: settings.aspect.ratio) }
         // 预览必须在转换到导出色彩空间之前生成：ProPhoto / ACES 线性图直接显示会偏色。
         var previewSource = Resize.longEdge(output, maxSize: 1200)
         if settings.watermark {
