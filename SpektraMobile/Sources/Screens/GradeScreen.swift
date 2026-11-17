@@ -97,6 +97,7 @@ struct GradeScreen: View {
                 MExportSheet(
                     filename: session.filename,
                     phaseLabel: session.exportLabel,
+                    progress: session.exportProgress,
                     originalLongEdge: session.exportOriginalEdge,
                     canExport: session.sourceReady,
                     readFailed: session.sourceFailure != nil,
