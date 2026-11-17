@@ -236,10 +236,12 @@ enum QuickExposureMapping {
     }
 
     /// 用户预设里的曝光补偿按「相对保存时基线的调整量」复现。
-    /// 旧预设没有保存基线，仍按绝对值覆盖，避免误加拍摄曝光。
+    /// 旧预设没有保存基线：直出沿用原行为「绝对值 + 本次拍摄曝光补偿」，
+    /// 显影台套用传 captureBias = 0，即按绝对值覆盖，避免误加拍摄曝光。
     static func presetExposure(absolute value: Double, savedBaseline: Double?,
-                               currentBaseline: Double) -> Double {
-        guard let savedBaseline else { return value }
+                               currentBaseline: Double,
+                               captureBias: Double = 0) -> Double {
+        guard let savedBaseline else { return min(max(value + captureBias, -5), 5) }
         return min(max(value - savedBaseline + currentBaseline, -5), 5)
     }
 }

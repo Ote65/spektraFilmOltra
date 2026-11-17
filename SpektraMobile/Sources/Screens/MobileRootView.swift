@@ -13,6 +13,8 @@ struct MobileRootView: View {
     @State private var toastAction: MToastAction? = nil
     @State private var toastToken = 0
     @State private var debugOpened = false
+    /// 台前调度窗口宽度锁的去重状态（视图持有，不放全局）。
+    @State private var lastWidthFloor: CGFloat = -1
 
     // 显影 → 调色的「吸入」过渡
     @State private var metrics: MSafeInsets = .fallback
@@ -190,7 +192,13 @@ struct MobileRootView: View {
             guard abs(size.width - metrics.width) > 1 || abs(size.height - metrics.height) > 1 else { return }
             let current = MScreenMetrics.current()
             metrics = MSafeInsets(top: current.top, bottom: current.bottom, size: size)
-            MLayout.applyWindowWidthFloor(size)
+            // 去重状态放在视图里；窗口场景改动推迟到布局回调之外，
+            // 避免在 SwiftUI 布局事务里写 sizeRestrictions 形成反馈环。
+            if let floor = MLayout.windowWidthFloor(for: size),
+               abs(floor - lastWidthFloor) > 1 {
+                lastWidthFloor = floor
+                DispatchQueue.main.async { MLayout.applyWindowWidthFloor(floor) }
+            }
         }
         .task {
             guard !debugOpened else { return }
@@ -365,9 +373,11 @@ struct MobileRootView: View {
     }
 
     /// 直出成片页「进入显影台」：原片入库后写回拍摄时的显影 / 调色参数，再打开显影台。
+    /// 显影台必须有库记录，RAW 一定入库；是否写进系统相册跟随「保存原图」设置（§5.5）。
     @MainActor
     private func openDirectDevelop(_ request: MDirectDevelopRequest) async -> MDirectDevelopOutcome {
-        let report = await engine.importPhotos([request.rawURL], publishToAlbum: true,
+        let report = await engine.importPhotos([request.rawURL],
+                                               publishToAlbum: MobileSettings.cameraDirectSaveOriginal,
                                                generateThumbnails: false)
         guard let photoID = report.firstID else {
             return .failed(report.reason.isEmpty ? "原片没能入库" : report.reason)
@@ -389,10 +399,7 @@ struct MobileRootView: View {
         grade = nil
         // 会话建不出来时不要切 screen：否则主页会被关闭命中测试，
         // 看起来就是整页点不动。
-        guard let session = engine.openDevelop(photoID: photoID) else {
-            NSLog("MOpen develop session nil id=%@", photoID)
-            return
-        }
+        guard let session = engine.openDevelop(photoID: photoID) else { return }
         withAnimation(MMotion.push) {
             develop = session
             screen = .develop

@@ -189,7 +189,7 @@ enum RawDecoder {
     /// 按行分带渲染进整图。
     ///
     /// Core Image 的坐标原点在左下角，而 `ImageRGB` 的第 0 行是画面顶部：
-    /// 顶部第 `top` 行对应 CI 的 `height - top - rows`。整图缓冲只分配一次，
+    /// 顶部第 `top` 行对应 CI 的 `extent.maxY - top - rows`。整图缓冲只分配一次，
     /// 每条带的 RGBAf 缓冲渲染完立刻释放，峰值 = 整图 RGB + 一条带。
     private static func renderBanded(
         _ output: CIImage, width: Int, height: Int, bandRows: Int,
@@ -197,11 +197,13 @@ enum RawDecoder {
     ) -> ImageRGB {
         var image = ImageRGB(width: width, height: height)
         let rows = max(16, bandRows)
+        // 滤镜链的 extent 原点不保证是 (0,0)，带矩形必须按 extent 反推。
+        let extent = output.extent
         var top = 0
         while top < height {
             let bandHeight = min(rows, height - top)
-            let rect = CGRect(x: 0, y: height - top - bandHeight,
-                              width: width, height: bandHeight)
+            let rect = CGRect(x: extent.minX, y: extent.maxY - CGFloat(top + bandHeight),
+                              width: extent.width, height: CGFloat(bandHeight))
             let band = output.cropped(to: rect)
             var buffer = [Float](repeating: 0, count: width * bandHeight * 4)
             buffer.withUnsafeMutableBytes { raw in
@@ -216,14 +218,15 @@ enum RawDecoder {
                 guard let dst = destination.baseAddress else { return }
                 buffer.withUnsafeBufferPointer { source in
                     guard let src = source.baseAddress else { return }
-                    var srcIndex = 0
-                    var dstIndex = top * width * 3
-                    for _ in 0..<(width * bandHeight) {
-                        dst[dstIndex] = src[srcIndex]
-                        dst[dstIndex + 1] = src[srcIndex + 1]
-                        dst[dstIndex + 2] = src[srcIndex + 2]
-                        srcIndex += 4
-                        dstIndex += 3
+                    // RGBA→RGB 步长不同（4→3），无法整行 memcpy，按行推进指针。
+                    for row in 0..<bandHeight {
+                        let srcRow = src + row * width * 4
+                        let dstRow = dst + (top + row) * width * 3
+                        for x in 0..<width {
+                            dstRow[x * 3] = srcRow[x * 4]
+                            dstRow[x * 3 + 1] = srcRow[x * 4 + 1]
+                            dstRow[x * 3 + 2] = srcRow[x * 4 + 2]
+                        }
                     }
                 }
             }

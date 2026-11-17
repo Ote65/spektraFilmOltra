@@ -1059,6 +1059,28 @@ struct CameraScreen: View {
     }
 
     private static let directBorderSpring = Animation.spring(response: 0.34, dampingFraction: 0.9)
+    /// 直出显影卡片最短展示时长（秒），避免小图一闪而过（§5.3）。
+    private static let directCardMinDisplay: Double = 1.2
+
+    /// 成片卡片按钮统一外壳：44pt 触控目标 + 圆角底，四个按钮共用一套样式。
+    private func directCardButton<Label: View>(
+        background: Color,
+        disabled: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> Label
+    ) -> some View {
+        Button(action: action) {
+            label()
+                .frame(maxWidth: .infinity)
+                .frame(height: 44)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(background)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+    }
 
     /// 片边面板常驻在成片页最上层；用透明遮罩而不是系统 sheet，
     /// 这样预览不会被压暗，也不会被系统 sheet 的灰色蒙层盖住。
@@ -1207,25 +1229,19 @@ struct CameraScreen: View {
                         case .ready(let result):
                             VStack(spacing: 8) {
                                 HStack(spacing: 8) {
-                                    Button {
+                                    directCardButton(background: Color.white.opacity(0.1),
+                                                     disabled: directSaving || directOpeningDevelop) {
                                         MHaptic.light()
                                         retakeDirect(result)
                                     } label: {
                                         Text("重拍")
                                             .font(.mSans(11, .medium))
                                             .foregroundStyle(MColor.text1)
-                                            .frame(maxWidth: .infinity)
-                                            .frame(height: 44)
-                                            .background(
-                                                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                                    .fill(Color.white.opacity(0.1))
-                                            )
                                     }
-                                    .buttonStyle(.plain)
-                                    .disabled(directSaving || directOpeningDevelop)
 
                                     // 显影完成后仍然可以改片边：只重合成预览与成片，不再跑显影。
-                                    Button {
+                                    directCardButton(background: Color.white.opacity(0.1),
+                                                     disabled: directSaving || directOpeningDevelop) {
                                         MHaptic.tick()
                                         withAnimation(Self.directBorderSpring) { directBorderOpen = true }
                                     } label: {
@@ -1238,17 +1254,10 @@ struct CameraScreen: View {
                                                 .minimumScaleFactor(0.8)
                                         }
                                         .foregroundStyle(MColor.brassHigh)
-                                        .frame(maxWidth: .infinity)
-                                        .frame(height: 44)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                                .fill(Color.white.opacity(0.1))
-                                        )
                                     }
-                                    .buttonStyle(.plain)
-                                    .disabled(directSaving || directOpeningDevelop)
 
-                                    Button {
+                                    directCardButton(background: MColor.brass,
+                                                     disabled: directSaving || directOpeningDevelop) {
                                         MHaptic.light()
                                         saveDirectResult(result)
                                     } label: {
@@ -1260,19 +1269,12 @@ struct CameraScreen: View {
                                             }
                                         }
                                         .foregroundStyle(MColor.brassInk)
-                                        .frame(maxWidth: .infinity)
-                                        .frame(height: 44)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                                .fill(MColor.brass)
-                                        )
                                     }
-                                    .buttonStyle(.plain)
-                                    .disabled(directSaving || directOpeningDevelop)
                                 }
 
                                 // 原片带拍摄时的显影 / 调色预设进显影台，不经过这张直出成片。
-                                Button {
+                                directCardButton(background: Color.white.opacity(0.1),
+                                                 disabled: directSaving || directOpeningDevelop) {
                                     MHaptic.light()
                                     openDirectDevelop(result)
                                 } label: {
@@ -1287,15 +1289,7 @@ struct CameraScreen: View {
                                         }
                                     }
                                     .foregroundStyle(MColor.text1)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 40)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                            .fill(Color.white.opacity(0.1))
-                                    )
                                 }
-                                .buttonStyle(.plain)
-                                .disabled(directSaving || directOpeningDevelop)
                             }
                             .frame(width: 300)
 
@@ -1476,6 +1470,7 @@ struct CameraScreen: View {
         directBaseline = MDirectRenderer.makeBaseline(meta: shot.meta)
         directRecipe = recipe
 
+        let renderStart = CFAbsoluteTimeGetCurrent()
         Task.detached(priority: .userInitiated) {
             do {
                 let result = try MDirectRenderer.render(
@@ -1492,30 +1487,18 @@ struct CameraScreen: View {
                         directProgress = value
                     }
                 }
+                // §5.3：显影卡片最短展示 1.2s，小图秒完也不闪卡。
+                // 动画不早于真实完成：这里等的只是渲染返回后的剩余展示时间。
+                let remaining = Self.directCardMinDisplay - (CFAbsoluteTimeGetCurrent() - renderStart)
+                if remaining > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                }
                 await MainActor.run {
                     guard token == directToken, !cancel.isCancelled else {
                         try? FileManager.default.removeItem(at: result.url)
                         return
                     }
-                    withAnimation(MMotion.state) {
-                        directProgress = 1
-                        if let preview = result.preview {
-                            directPreviewCG = preview
-                            directPhoto = MImage.make(cgImage: preview)
-                            directPreviewToken += 1
-                        }
-                        directCard = .ready(result)
-                    }
-                    // 成片页沿用记忆里的片边；没有开启时保持无片边。
-                    refreshDirectBorderPreview()
-                    #if os(iOS)
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    #endif
-                    if let clamped = result.clampedEdge {
-                        showHint("已按内存上限 \(clamped) px 渲染")
-                    } else if result.usedFallback {
-                        showHint("RAW 解码较慢 · 已使用内嵌预览")
-                    }
+                    presentDirectReady(result)
                 }
             } catch MDirectRenderer.RenderError.cancelled {
                 // 用户已经重拍 / 关闭：静默退出，不弹错误卡片。
@@ -1528,6 +1511,30 @@ struct CameraScreen: View {
                     }
                 }
             }
+        }
+    }
+
+    /// 渲染真正完成：进度跳 1.0、切成片卡片、触感与降级提示。
+    @MainActor
+    private func presentDirectReady(_ result: MDirectRenderResult) {
+        withAnimation(MMotion.state) {
+            directProgress = 1
+            if let preview = result.preview {
+                directPreviewCG = preview
+                directPhoto = MImage.make(cgImage: preview)
+                directPreviewToken += 1
+            }
+            directCard = .ready(result)
+        }
+        // 成片页沿用记忆里的片边；没有开启时保持无片边。
+        refreshDirectBorderPreview()
+        #if os(iOS)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        #endif
+        if let clamped = result.clampedEdge {
+            showHint("已按内存上限 \(clamped) px 渲染")
+        } else if result.usedFallback {
+            showHint("RAW 解码较慢 · 已使用内嵌预览")
         }
     }
 

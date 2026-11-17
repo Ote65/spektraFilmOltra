@@ -135,25 +135,31 @@ enum MLayout {
         #endif
     }
 
-    /// 只看当前窗口的长宽谁大：宽>高就分栏，高>宽就单列。
-    /// 不读系统横竖屏状态（台前调度里 iPad 竖着也可能开横窗、横着也可能开竖窗），
-    /// 也不设尺寸门槛——分屏、台前调度、旋转都随窗口尺寸自然切换。
+    /// 横屏且画布放得下三栏时才分栏；接近手机竖屏比例的竖条窗口、
+    /// 以及台前调度那种挤不下左右轨的小横窗，一律退回 iPhone 的单列布局。
+    /// 判断只看当前真实窗口尺寸，不解析机型：分屏、台前调度、旋转都能自然切换。
     /// `--force-split` 为截图验收用：在竖屏窗口上也强制走分栏版式。
     static func usesSplit(_ size: CGSize) -> Bool {
         if DebugLaunch.forceSplit { return true }
         let size = DebugLaunch.windowOverride ?? size
-        return isPad && size.width > size.height
+        guard isPad, size.width > size.height * 1.02 else { return false }
+        // 左轨 + 右栏之外要给画布留出最小宽度，放不下就别硬分。
+        let canvas = size.width - inspectorWidth(for: size) - sideRailWidth(for: size)
+        return size.width >= 800 && size.height >= 640 && canvas >= 470
     }
 
     /// 台前调度窗口最窄形状锁到 iPhone 竖屏比例（393:852）：
     /// 窗口再往窄拖会挤压顶部按钮造成重叠，所以按当前窗口高度反推最小宽度。
     /// 只加宽下限、不锁高度，横竖窗口都按同一条比例线约束。
-    private static var lastWidthFloor: CGFloat = -1
-    static func applyWindowWidthFloor(_ size: CGSize) {
-        guard isPad, size.height > 1 else { return }
-        let minWidth = size.height * (393.0 / 852.0)
-        guard abs(minWidth - lastWidthFloor) > 1 else { return }
-        lastWidthFloor = minWidth
+    /// 纯计算：调用方负责去重，并在布局回调之外（如 `DispatchQueue.main.async`）
+    /// 调用 `applyWindowWidthFloor(_:)`，避免在 SwiftUI 布局事务里改窗口场景。
+    static func windowWidthFloor(for size: CGSize) -> CGFloat? {
+        guard isPad, size.height > 1 else { return nil }
+        return size.height * (393.0 / 852.0)
+    }
+
+    @MainActor
+    static func applyWindowWidthFloor(_ minWidth: CGFloat) {
         guard #available(iOS 16.1, *) else { return }
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first

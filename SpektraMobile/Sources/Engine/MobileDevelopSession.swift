@@ -2015,6 +2015,11 @@ enum ExportEdge {
         var bandCount: Int
         /// 实际输出小于用户选择的尺寸。
         var clamped: Bool
+
+        /// 调色是否走分带：分带显影时必走分带调色；整张显影但长边达到 4096
+        /// （48 MP 级）时，整图 Double 工作缓冲约 1.17 GB，6 GB 机型会被 jetsam，
+        /// 也必须分带。普通导出与直出共用这一条决策，避免两条链路分叉。
+        var usesBandedGrade: Bool { tiled || edge >= 4096 }
     }
 
     /// 用户选定的档位换算成长边，不做内存钳位。
@@ -2246,7 +2251,8 @@ enum MDirectRenderer {
                         ? QuickExposureMapping.presetExposure(
                             absolute: number,
                             savedBaseline: preset.exposureBaselineEV,
-                            currentBaseline: captureBaseline.camera.exposureCompensationEV)
+                            currentBaseline: captureBaseline.camera.exposureCompensationEV,
+                            captureBias: meta.exposureBias)
                         : number
                     MobileDevelopSession.writePro(id, adjusted, into: &edit)
                 case .flag(let flag):
@@ -2386,12 +2392,12 @@ enum MDirectRenderer {
                 return pipeline.processTiled(prepared,
                                              bandPixelBudget: plan.bandPixelBudget) { _, current, total in
                     let fraction = total > 0 ? Double(current) / Double(total) : 0
-                    emit(0.1 + 0.55 * min(1, fraction))
+                    emit(0.1 + 0.6 * min(1, fraction))
                 }
             } else {
                 return pipeline.process(prepared) { _, current, total in
                     let fraction = total > 0 ? Double(current) / Double(total) : 0
-                    emit(0.1 + 0.55 * min(1, fraction))
+                    emit(0.1 + 0.6 * min(1, fraction))
                 }
             }
         }
@@ -2411,7 +2417,7 @@ enum MDirectRenderer {
         GradeEngine.prepareSourceInPlace(&developed)
         // 大图（含 48 MP）走分带调色：整图 Double 工作缓冲在 48 MP 是 1.17 GB，
         // 6 GB 机型会被系统杀掉，分带后只剩整图 Float + 一条带。
-        let bandedGrade = plan.tiled || max(developed.width, developed.height) >= 4096
+        let bandedGrade = plan.usesBandedGrade
         var graded: GradeRenderResult = try autoreleasepool {
             if bandedGrade {
                 return try GradeEngine.renderTiledInPlace(

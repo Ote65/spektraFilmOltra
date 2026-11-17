@@ -1062,8 +1062,6 @@ struct HomeScreen: View {
 
     /// 点开一张照片：已入库直接进显影台，未入库先取回原片再进。
     private func open(_ asset: MLibraryAsset) {
-        NSLog("MOpen tap id=%@ photo=%d ph=%d",
-              asset.id, asset.photo == nil ? 0 : 1, asset.phAsset == nil ? 0 : 1)
         if let photo = asset.photo {
             onOpenDevelop(photo)
             return
@@ -1345,9 +1343,9 @@ private struct MAssetThumb: View {
             return
         }
         let options = PHImageRequestOptions()
-        // 网格只需要缩略图：用 fastFormat 走系统内嵌预览，避免对整库
-        // 大图做高质量解码把主线程和 CPU 拖死（iPad 一屏可见几十格）。
-        options.deliveryMode = .fastFormat
+        // 网格只需要缩略图：opportunistic 先回本地低质量图秒出，
+        // 再渐进补高质量；fastFormat 对纯 iCloud 资源可能不回调留白格。
+        options.deliveryMode = .opportunistic
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         requestID = PHImageManager.default().requestImage(

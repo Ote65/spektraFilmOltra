@@ -742,7 +742,8 @@ final class MobileGradeSession: ObservableObject {
                     var warped = geometry.apply(to: linear)
                     linear = ImageRGB(width: 0, height: 0)
                     // 大图分带调色：48 MP 的整图 Double 工作缓冲是 1.17 GB。
-                    let bandedGrade = plan.tiled || max(warped.width, warped.height) >= 4096
+                    // 决策与直出共用 ExportEdge.Plan，避免两条链路分叉。
+                    let bandedGrade = plan.usesBandedGrade
                     var rendered = bandedGrade
                         ? try GradeEngine.renderTiledInPlace(
                             &warped, recipe: recipe, bandRows: 256)

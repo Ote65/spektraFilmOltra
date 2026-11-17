@@ -175,9 +175,11 @@ enum GradeEngine {
         let (analysis, airlight) = globalStats(image, recipe: recipe)
         // halo 行必须是**未处理**的原始输入：如果直接读回上一条带的成品，
         // 局部滤镜在带边界会看到「已锐化 / 已降噪」与「原始」混在一起的输入，
-        // 结果就是每条带的第一行出现一条接缝。这里共享存储，首次写回时 COW
-        // 才真正分配成品缓冲（多一整图 Float，但 48 MP 也只有 585 MB）。
+        // 结果就是每条带的第一行出现一条接缝。因此源图与成品必须各占一份整图
+        // Float（48 MP 约 585 MB，已计入 ExportEdge 的 gradePeak 预算）；
+        // 成品缓冲显式分配，不靠写回时的隐式 COW 复制。
         let source = image
+        var output = ImageRGB(width: width, height: height)
 
         var top = 0
         var bandIndex = 0
@@ -218,7 +220,8 @@ enum GradeEngine {
                         optics: recipe.optics,
                         rowOffset: bandTop, fullHeight: height,
                         fullShortEdge: fullShortEdge,
-                        seed: 20240101 &+ UInt64(bandIndex &* 7919))
+                        seed: 20240101 &+ UInt64(bandIndex &* 7919),
+                        banded: true)
             let lutError = applyLUT(&data, count: count, path: recipe.lut.path,
                                     strength: recipe.lut.strength)
             postprocess(&data)
@@ -229,9 +232,9 @@ enum GradeEngine {
             }
 
             let coreStart = top - bandTop
-            image.data.withUnsafeMutableBufferPointer { destination in
-                data.withUnsafeBufferPointer { source in
-                    guard let dst = destination.baseAddress, let src = source.baseAddress else { return }
+            output.data.withUnsafeMutableBufferPointer { destination in
+                data.withUnsafeBufferPointer { band in
+                    guard let dst = destination.baseAddress, let src = band.baseAddress else { return }
                     let rowsToCopy = coreRows * width * 3
                     let srcOffset = coreStart * width * 3
                     let dstOffset = top * width * 3
@@ -241,9 +244,8 @@ enum GradeEngine {
             top += coreRows
             bandIndex += 1
         }
-        let result = image
         image = ImageRGB(width: 0, height: 0)
-        return GradeRenderResult(image: result, analysis: analysis)
+        return GradeRenderResult(image: output, analysis: analysis)
     }
 
     /// 分带调色需要向上下多读的行数：覆盖所有局部滤镜的最大半径。
@@ -1303,8 +1305,8 @@ enum GradeEngine {
                                     optics: OpticsRecipe,
                                     rowOffset: Int = 0, fullHeight: Int? = nil,
                                     fullShortEdge: Int? = nil,
-                                    seed: UInt64 = 20240101) {
-        let banded = rowOffset > 0 || fullHeight != nil
+                                    seed: UInt64 = 20240101,
+                                    banded: Bool = false) {
         applyVignette(&data, width: width, height: height, optics: optics,
                       rowOffset: rowOffset, fullHeight: fullHeight)
         applyChromaticAberration(&data, width: width, height: height,

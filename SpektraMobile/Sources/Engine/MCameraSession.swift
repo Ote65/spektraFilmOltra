@@ -151,15 +151,19 @@ final class MCameraSession: NSObject, ObservableObject {
     private var isConfigured = false
     private var captureDelegate: MCaptureDelegate?
     private var maxZoom: CGFloat = 1
-    /// 当前方向的主摄，失败时回退到它。
+    /// 当前方向的主摄，失败时回退到它。主线程专用：configure 的结果经
+    /// pendingWideDevice 在 startSession 发布，flip 在主线程回调里更新。
     private var wideDevice: AVCaptureDevice?
-    /// 焦段 → 物理摄像头。
+    /// 焦段 → 物理摄像头。主线程专用。
     private var lensDevices: [String: AVCaptureDevice] = [:]
     /// 切换失败过的摄像头：后续重建焦段列表时不再出现。
+    /// sessionQueue 专用：failSwitch 异步写入，configure / flip 只在 sessionQueue 读。
     private var failedLensIDs: Set<String> = []
     /// configure 在 sessionQueue 上构建，startSession 再回主线程发布。
     private var pendingLenses: [Lens] = []
     private var pendingLensDevices: [String: AVCaptureDevice] = [:]
+    /// sessionQueue 专用：首次 configure 的主摄，startSession 回主线程发布为 wideDevice。
+    private var pendingWideDevice: AVCaptureDevice?
     /// 镜头切换的代号：超时后作废旧请求，晚到的回调不能再改状态。
     private var lensSwitchToken = 0
     #endif
@@ -252,16 +256,21 @@ final class MCameraSession: NSObject, ObservableObject {
             let lenses = self.pendingLenses
             let lensMap = self.pendingLensDevices
             let currentLens = self.pendingLens(for: self.device)
+            let wide = self.pendingWideDevice
 
             DispatchQueue.main.async {
                 self.rawFormat = format
                 self.rawAvailable = format != nil
                 self.hasFlash = flash
                 self.maxZoom = zoomLimit
-                if firstConfigure, !lenses.isEmpty {
-                    self.availableLenses = lenses
-                    self.lensDevices = lensMap
-                    self.lens = currentLens ?? .placeholder
+                if firstConfigure {
+                    // wideDevice 只在主线程写：sessionQueue 的结果经 pending 值发布过来。
+                    self.wideDevice = wide
+                    if !lenses.isEmpty {
+                        self.availableLenses = lenses
+                        self.lensDevices = lensMap
+                        self.lens = currentLens ?? .placeholder
+                    }
                 }
                 self.isRunning = running
             }
@@ -314,7 +323,7 @@ final class MCameraSession: NSObject, ObservableObject {
         let picked = proRAW ?? formats.first
 
         self.device = device
-        self.wideDevice = device
+        self.pendingWideDevice = device
         let built = Self.makeLenses(position: .back, wide: device,
                                     excluding: failedLensIDs)
         self.pendingLenses = built.lenses
@@ -595,6 +604,7 @@ final class MCameraSession: NSObject, ObservableObject {
         }
     }
 
+    /// 主线程调用：撤销切换、发布失败提示；failedLensIDs 的回写走 sessionQueue。
     private func failSwitch(to lens: Lens) {
         lensSwitchToken += 1
         isSwitchingLens = false
@@ -602,7 +612,7 @@ final class MCameraSession: NSObject, ObservableObject {
             message = "镜头切换失败"
         } else {
             // 失败的光学焦段从列表移除，后续翻转镜头也不再出现。
-            failedLensIDs.insert(lens.id)
+            sessionQueue.async { self.failedLensIDs.insert(lens.id) }
             availableLenses.removeAll { $0.id == lens.id }
             lensDevices[lens.id] = nil
             message = "\(lens.focal)mm 镜头不可用"
