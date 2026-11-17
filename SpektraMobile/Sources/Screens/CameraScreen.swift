@@ -1060,7 +1060,7 @@ struct CameraScreen: View {
 
     private static let directBorderSpring = Animation.spring(response: 0.34, dampingFraction: 0.9)
     /// 直出显影卡片最短展示时长（秒），避免小图一闪而过（§5.3）。
-    private static let directCardMinDisplay: Double = 1.2
+    nonisolated private static let directCardMinDisplay: Double = 1.2
 
     /// 成片卡片按钮统一外壳：44pt 触控目标 + 圆角底，四个按钮共用一套样式。
     private func directCardButton<Label: View>(
