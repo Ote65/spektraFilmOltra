@@ -71,6 +71,32 @@ struct CameraScreen: View {
     @State private var directBorderPanelHeight: CGFloat = 480
     /// 未加片边的成片预览：换片边时只重合成这一张，不重新显影。
     @State private var directPreviewCG: CGImage?
+    /// 直出画幅比例：拍摄仍是 RAW 全幅，渲染时居中裁切，并写进 cropData。
+    @AppStorage("m.directAspect") private var directAspectRaw: String = MDirectAspect.original.rawValue
+    /// 直出分辨率档位：按总像素显示，渲染时按目标长边解码。
+    @AppStorage("m.directResolution") private var directResolutionRaw: String = MDirectResolution.maximum.rawValue
+
+    private var directAspect: MDirectAspect {
+        MDirectAspect(rawValue: directAspectRaw) ?? .original
+    }
+
+    private var directResolution: MDirectResolution {
+        MDirectResolution(rawValue: directResolutionRaw) ?? .maximum
+    }
+
+    /// 传感器撑不起所选档位时（如切到前置）退回 MAX，避免放大出图。
+    private var effectiveResolution: MDirectResolution {
+        let edge = camera.maxPhotoEdge
+        if edge > 0, !directResolution.available(forMaxEdge: edge) { return .maximum }
+        return directResolution
+    }
+
+    /// 分辨率菜单：传感器尺寸未知时先全量展示，就绪后按最大长边过滤。
+    private var selectableResolutions: [MDirectResolution] {
+        let edge = camera.maxPhotoEdge
+        guard edge > 0 else { return MDirectResolution.allCases }
+        return MDirectResolution.allCases.filter { $0.available(forMaxEdge: edge) }
+    }
 
     @State private var flashOpacity: Double = 0
     @State private var focusMark: CGPoint?
@@ -207,7 +233,45 @@ struct CameraScreen: View {
 
                 Spacer()
 
-                rawBadge
+                // 直出模式：RAW 标签换成画幅比例按钮，点击选择裁切比例。
+                if directMode {
+                    Menu {
+                        Section("画幅") {
+                            ForEach(MDirectAspect.allCases) { option in
+                                Button {
+                                    MHaptic.tick()
+                                    directAspectRaw = option.rawValue
+                                } label: {
+                                    if directAspect == option {
+                                        Label(option.label, systemImage: "checkmark")
+                                    } else {
+                                        Text(option.label)
+                                    }
+                                }
+                            }
+                        }
+                        Section("分辨率") {
+                            ForEach(selectableResolutions) { option in
+                                Button {
+                                    MHaptic.tick()
+                                    directResolutionRaw = option.rawValue
+                                } label: {
+                                    if directResolution == option {
+                                        Label(option.label, systemImage: "checkmark")
+                                    } else {
+                                        Text(option.label)
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        aspectBadge
+                    }
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                } else {
+                    rawBadge
+                }
             }
 
             // 工具按钮整体居中，RAW 标签仍在右侧。
@@ -261,6 +325,29 @@ struct CameraScreen: View {
         .frame(height: 28)
         .background(Capsule().fill(Color.white.opacity(0.07)))
         .accessibilityLabel("正在拍 RAW")
+    }
+
+    /// 直出模式的画幅按钮：与 RAW 标签同位同尺寸，显示当前比例。
+    private var aspectBadge: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "crop")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(MColor.brass)
+            Text(directAspect.label)
+                .font(.mSans(10, .semibold))
+                .foregroundStyle(MColor.text1)
+            Text(effectiveResolution.label)
+                .font(.mSans(10, .semibold))
+                .foregroundStyle(MColor.brassHigh)
+            Text("RAW")
+                .font(.mSans(10, .medium))
+                .foregroundStyle(MColor.text4)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 28)
+        .background(Capsule().fill(Color.white.opacity(0.07)))
+        .contentShape(Capsule())
+        .accessibilityLabel("画幅比例 \(directAspect.label)")
     }
 
     private func cameraToolButton(icon: String, active: Bool, badge: String? = nil,
@@ -1461,7 +1548,9 @@ struct CameraScreen: View {
         ui.merge(gradePreset.recipe, groups: groups)
         let lutPath = groups.contains(.lut) ? gradePreset.recipe.lut.path : ""
         let recipe = ui.gradeRecipe(lutPath: lutPath)
-        let settings = MDirectRenderSettings.fromPreferences()
+        var settings = MDirectRenderSettings.fromPreferences()
+        settings.aspect = directAspect
+        settings.resolution = effectiveResolution
         if settings.downgradedFromEXR {
             showHint("相册不支持 EXR，直出已使用 JPEG")
         }
@@ -1594,7 +1683,8 @@ struct CameraScreen: View {
         let request = MDirectSaveRequest(rawURL: raw, renderedURL: result.url,
                                          edit: edit, grade: recipe,
                                          border: directBorder,
-                                         baseline: directBaseline)
+                                         baseline: directBaseline,
+                                         aspect: directAspect)
         Task {
             let outcome = await onDirectSave(request)
             await MainActor.run {
@@ -1632,7 +1722,7 @@ struct CameraScreen: View {
         directOpeningDevelop = true
         let request = MDirectDevelopRequest(
             rawURL: raw, renderedURL: result.url, edit: edit, grade: recipe,
-            baseline: directBaseline)
+            baseline: directBaseline, aspect: directAspect)
         Task {
             let outcome = await onDirectDevelop(request)
             await MainActor.run {

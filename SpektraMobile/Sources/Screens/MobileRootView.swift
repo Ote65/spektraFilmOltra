@@ -333,7 +333,9 @@ struct MobileRootView: View {
         let albumURL = borderedURL ?? request.renderedURL
 
         let outcome: PhotoLibraryExport.Outcome = await withCheckedContinuation { continuation in
-            PhotoLibraryExport.save(albumURL) { continuation.resume(returning: $0) }
+            PhotoLibraryExport.save(albumURL, album: PhotoLibraryExport.albumTitle) {
+                continuation.resume(returning: $0)
+            }
         }
 
         switch outcome {
@@ -372,7 +374,8 @@ struct MobileRootView: View {
             edit: request.edit,
             grade: request.grade,
             baseline: request.baseline,
-            renderedURL: albumURL
+            renderedURL: albumURL,
+            aspect: request.aspect
         )
         return .saved("已保存原图与成片" + sizeNote)
     }
@@ -392,7 +395,8 @@ struct MobileRootView: View {
             edit: request.edit,
             grade: request.grade,
             baseline: request.baseline,
-            renderedURL: request.renderedURL
+            renderedURL: request.renderedURL,
+            aspect: request.aspect
         )
         openDevelop(photoID)
         return .opened

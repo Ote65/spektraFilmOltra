@@ -57,15 +57,26 @@ final class MCameraSession: NSObject, ObservableObject {
         }
     }
 
-    /// 取景器里的焦段按钮：焦距与相对主摄的倍数都从真实摄像头读取，
-    /// 不同机型会得到各自的光学焦段（如 13/26/77 或 13/24/120）。
+    /// 取景器里的焦段按钮：光学焦段从真实摄像头读取，
+    /// 不同机型会得到各自的光学焦段（如 13/26/77 或 13/24/120）；
+    /// 光学档位之间再按主摄裁切补 2×、4× 虚拟焦段（48 MP 机型的 2×
+    /// 与系统相机的原生主摄裁切是同一条路径）。
     struct Lens: Identifiable, Equatable {
-        /// 物理摄像头的 uniqueID。
+        /// 物理摄像头的 uniqueID；裁切焦段用 "crop-倍数" 合成 id。
         let id: String
         /// 35mm 等效焦距。
         let focal: Int
         /// 相对主摄的显示倍数。
         let zoom: CGFloat
+        /// 选中时要在源摄像头上设置的 videoZoomFactor；光学镜头为 1。
+        let crop: CGFloat
+
+        init(id: String, focal: Int, zoom: CGFloat, crop: CGFloat = 1) {
+            self.id = id
+            self.focal = focal
+            self.zoom = zoom
+            self.crop = crop
+        }
 
         static let placeholder = Lens(id: "wide", focal: 26, zoom: 1)
 
@@ -95,8 +106,10 @@ final class MCameraSession: NSObject, ObservableObject {
     @Published private(set) var isCapturing = false
     @Published private(set) var rawAvailable = false
     @Published private(set) var hasFlash = false
-    /// 当前机型真实可用的光学焦段，由 DiscoverySession 枚举生成。
+    /// 光学焦段（DiscoverySession 枚举）+ 主摄裁切焦段（2×/4×）合并后的按钮列表。
     @Published private(set) var availableLenses: [Lens] = [.placeholder]
+    /// 当前摄像头可输出的最大照片长边（含 48 MP 高分辨率模式），直出分辨率档位用。
+    @Published private(set) var maxPhotoEdge: Int = 0
     /// 正在换物理镜头：交换输入期间禁止快门。
     @Published private(set) var isSwitchingLens = false
     @Published private(set) var zoom: CGFloat = 1
@@ -257,12 +270,14 @@ final class MCameraSession: NSObject, ObservableObject {
             let lensMap = self.pendingLensDevices
             let currentLens = self.pendingLens(for: self.device)
             let wide = self.pendingWideDevice
+            let maxEdge = self.device.map(Self.maxPhotoLongEdge) ?? 0
 
             DispatchQueue.main.async {
                 self.rawFormat = format
                 self.rawAvailable = format != nil
                 self.hasFlash = flash
                 self.maxZoom = zoomLimit
+                self.maxPhotoEdge = maxEdge
                 if firstConfigure {
                     // wideDevice 只在主线程写：sessionQueue 的结果经 pending 值发布过来。
                     self.wideDevice = wide
@@ -374,8 +389,35 @@ final class MCameraSession: NSObject, ObservableObject {
             mapping[wide.uniqueID] = wide
         }
 
+        // 在主摄上补裁切变焦：光学档位之间（如 1× 与 3×/5× 之间）插 2×，
+        // 只有主摄的老机型在主摄变焦范围内补到 4×。已有接近倍数的光学镜头就不补。
+        let wideMaxZoom = max(1, wide.activeFormat.videoMaxZoomFactor)
+        let maxOptical = lenses.map { $0.zoom }.max() ?? 1
+        for factor: CGFloat in [2, 4] {
+            let id = "crop-\(Int(factor))"
+            guard factor <= wideMaxZoom, !failed.contains(id) else { continue }
+            guard !lenses.contains(where: { abs($0.zoom - factor) < factor * 0.25 }) else { continue }
+            if maxOptical > 1.25 {
+                // 裁切档位必须明显低于最高的光学档位，否则不如直接用光学。
+                guard factor < maxOptical * 0.8 else { continue }
+            }
+            lenses.append(Lens(id: id, focal: Int((baseFocal * factor).rounded()),
+                               zoom: factor, crop: factor))
+            mapping[id] = wide
+        }
+
         lenses.sort { $0.focal < $1.focal }
         return (lenses, mapping)
+    }
+
+    /// 摄像头可输出的最大照片长边：当前格式支持的尺寸档位取最大
+    /// （48 MP 机型这里会包含 8064×6048，普通机型是 4032×3024）。
+    static func maxPhotoLongEdge(of device: AVCaptureDevice) -> Int {
+        var edge = 0
+        for dims in device.activeFormat.supportedMaxPhotoDimensions {
+            edge = max(edge, max(Int(dims.width), Int(dims.height)))
+        }
+        return edge
     }
 
     /// 用水平视场角折算 35mm 等效焦距：f = 18 / tan(FOV / 2)。
@@ -497,7 +539,7 @@ final class MCameraSession: NSObject, ObservableObject {
         flash = all[(index + 1) % all.count]
     }
 
-    /// 选焦段：每个按钮都对应一颗真实摄像头，切换后使用该镜头的原生倍率。
+    /// 选焦段：光学按钮对应一颗真实摄像头，裁切按钮落在主摄的变焦倍率上。
     func select(_ lens: Lens) {
         #if os(iOS)
         guard !isSwitchingLens, let target = lensDevices[lens.id] else { return }
@@ -513,14 +555,15 @@ final class MCameraSession: NSObject, ObservableObject {
     private func applyNativeZoom(for lens: Lens) {
         guard let device else { return }
         let limit = max(1, device.activeFormat.videoMaxZoomFactor)
+        let factor = min(max(1, lens.crop), limit)
         do {
             try device.lockForConfiguration()
-            device.videoZoomFactor = 1
+            device.videoZoomFactor = factor
             device.unlockForConfiguration()
         } catch {
             return
         }
-        zoom = 1
+        zoom = device.videoZoomFactor
         maxZoom = limit
         self.lens = lens
     }
@@ -582,13 +625,15 @@ final class MCameraSession: NSObject, ObservableObject {
             }
 
             let limit = max(1, target.activeFormat.videoMaxZoomFactor)
+            let factor = min(max(1, lens.crop), limit)
             do {
                 try target.lockForConfiguration()
-                target.videoZoomFactor = 1
+                target.videoZoomFactor = factor
                 target.unlockForConfiguration()
             } catch {
-                // 输入已经切好，倍率保持 1× 也能拍。
+                // 输入已经切好，倍率保持现状也能拍。
             }
+            let appliedZoom = target.videoZoomFactor
 
             DispatchQueue.main.async {
                 guard self.lensSwitchToken == token else { return }
@@ -598,7 +643,8 @@ final class MCameraSession: NSObject, ObservableObject {
                 self.rawAvailable = true
                 self.hasFlash = target.hasFlash
                 self.maxZoom = limit
-                self.zoom = 1
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: target)
+                self.zoom = appliedZoom
                 self.lens = lens
             }
         }
@@ -674,6 +720,7 @@ final class MCameraSession: NSObject, ObservableObject {
                 }
                 self.hasFlash = wide.hasFlash
                 self.maxZoom = limit
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: wide)
                 self.zoom = 1
                 self.applyWideLensState()
             }
@@ -753,6 +800,7 @@ final class MCameraSession: NSObject, ObservableObject {
                 self.rawAvailable = true
                 self.hasFlash = next.hasFlash
                 self.maxZoom = next.activeFormat.videoMaxZoomFactor
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: next)
                 self.availableLenses = built.lenses
                 self.lensDevices = built.devices
                 self.lens = built.lenses.first(where: { $0.id == next.uniqueID }) ?? .placeholder

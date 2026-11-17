@@ -40,6 +40,21 @@ struct MPhotoGeometry: Codable, Equatable {
     var perspectiveH = 0.0
     var crop = Crop.full
 
+    /// 按目标宽高比（宽/高）在画幅上居中裁切的归一化矩形。
+    static func centerCrop(ratio: Double, width: Int, height: Int) -> Crop {
+        guard ratio > 0, width > 0, height > 0 else { return .full }
+        var crop = Crop.full
+        let current = Double(width) / Double(height)
+        if current > ratio {
+            crop.width = min(1, ratio * Double(height) / Double(width))
+        } else {
+            crop.height = min(1, Double(width) / (ratio * Double(height)))
+        }
+        crop.x = (1 - crop.width) / 2
+        crop.y = (1 - crop.height) / 2
+        return crop.clamped
+    }
+
     var isIdentity: Bool {
         quarterTurns % 4 == 0 && !flippedH && !flippedV
             && abs(straighten) < 1e-6

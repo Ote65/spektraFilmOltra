@@ -2038,8 +2038,10 @@ enum ExportEdge {
     static func plan(index: Int, originalLongEdge: Int, params: RuntimePhotoParams,
                      aspect: Double = 0.75, includeGrade: Bool = false,
                      peakLimit: Double? = nil, banded: Bool = false,
-                     encodeBytesPerPixel: Double? = nil) -> Plan {
-        let requestedEdge = requested(index: index, originalLongEdge: originalLongEdge)
+                     encodeBytesPerPixel: Double? = nil,
+                     edgeOverride: Int? = nil) -> Plan {
+        let requestedEdge = edgeOverride ?? requested(index: index,
+                                                      originalLongEdge: originalLongEdge)
         let available = Int(os_proc_available_memory())
         guard available > 0 else {
             return Plan(edge: requestedEdge, tiled: false, bandPixelBudget: 0,
@@ -2156,6 +2158,10 @@ struct MDirectRenderSettings {
     var watermark: Bool
     /// 相册不支持 EXR：直出时自动改用 JPEG，并让相机页给出一次说明。
     var downgradedFromEXR: Bool = false
+    /// 相机页选择的画幅比例：渲染末尾居中裁切，拍摄仍是 RAW 全幅。
+    var aspect: MDirectAspect = .original
+    /// 相机页选择的直出分辨率档位；非 MAX 时覆盖设置页的尺寸档。
+    var resolution: MDirectResolution = .maximum
 
     static func fromPreferences() -> MDirectRenderSettings {
         // 设置页顺序：JPEG / TIFF sRGB / TIFF ProPhoto / EXR；引擎档位：3 / 0 / 1 / 2。
@@ -2338,7 +2344,14 @@ enum MDirectRenderer {
                                    banded: true,
                                    // JPEG 编码峰值低；16-bit TIFF / EXR 会多背一份
                                    // 整图编码缓冲，按默认 36 B/px 保守估计。
-                                   encodeBytesPerPixel: settings.format == 3 ? 8 : nil)
+                                   encodeBytesPerPixel: settings.format == 3 ? 8 : nil,
+                                   // 直出分辨率由相机页档位全权决定：
+                                   // MAX = 原片全尺寸，其余档位不放大到原片之上。
+                                   edgeOverride: settings.resolution == .maximum
+                                       ? originalEdge
+                                       : settings.resolution.longEdge.map {
+                                             min(max(1, $0), originalEdge)
+                                         })
         let requested = plan.edge
         // CIRAWFilter 每次 render 调用都重跑整幅去马赛克：实测 12 MP
         // 整幅 357ms vs 分带 880ms，分带解码对中小图是负优化。
@@ -2440,6 +2453,11 @@ enum MDirectRenderer {
         }
         var output = graded.image
         graded.image = ImageRGB(width: 0, height: 0)
+        // 画幅比例在渲染末尾居中裁切：拍摄永远是 RAW 全幅，片边 / 水印 / 预览
+        // 都作用在裁切后的画幅上，与调色台的裁切是同一构图。
+        if let ratio = settings.aspect.ratio {
+            output = autoreleasepool { Self.centerCrop(output, ratio: ratio) }
+        }
         // 预览必须在转换到导出色彩空间之前生成：ProPhoto / ACES 线性图直接显示会偏色。
         var previewSource = Resize.longEdge(output, maxSize: 1200)
         if settings.watermark {
@@ -2479,5 +2497,38 @@ enum MDirectRenderer {
         return MDirectRenderResult(url: destination, preview: preview,
                                    clampedEdge: plan.clamped ? plan.edge : nil,
                                    usedFallback: usedFallback)
+    }
+
+    /// 居中裁切到目标宽高比（宽/高）。只做像素搬运，不重新采样。
+    private static func centerCrop(_ image: ImageRGB, ratio: Double) -> ImageRGB {
+        let width = image.width
+        let height = image.height
+        guard ratio > 0, width > 1, height > 1 else { return image }
+        let current = Double(width) / Double(height)
+        guard abs(current - ratio) > 0.001 else { return image }
+        let cropWidth: Int
+        let cropHeight: Int
+        if current > ratio {
+            cropHeight = height
+            cropWidth = max(1, min(width, Int((Double(height) * ratio).rounded())))
+        } else {
+            cropWidth = width
+            cropHeight = max(1, min(height, Int((Double(width) / ratio).rounded())))
+        }
+        let left = (width - cropWidth) / 2
+        let top = (height - cropHeight) / 2
+        var output = ImageRGB(width: cropWidth, height: cropHeight)
+        image.data.withUnsafeBufferPointer { source in
+            output.data.withUnsafeMutableBufferPointer { destination in
+                guard let src = source.baseAddress, let dst = destination.baseAddress else { return }
+                let rowFloats = cropWidth * 3
+                let rowBytes = rowFloats * MemoryLayout<Float>.size
+                for y in 0..<cropHeight {
+                    let from = ((top + y) * width + left) * 3
+                    memcpy(dst + y * rowFloats, src + from, rowBytes)
+                }
+            }
+        }
+        return output
     }
 }
