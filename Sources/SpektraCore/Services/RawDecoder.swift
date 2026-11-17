@@ -202,8 +202,10 @@ enum RawDecoder {
         var top = 0
         while top < height {
             let bandHeight = min(rows, height - top)
+            // 带宽按整图像素列数钳位：滤镜链外扩时 extent.width 可能大于
+            // 缓冲行宽（rowBytes），照抄 extent 会逐行越界写。
             let rect = CGRect(x: extent.minX, y: extent.maxY - CGFloat(top + bandHeight),
-                              width: extent.width, height: CGFloat(bandHeight))
+                              width: CGFloat(width), height: CGFloat(bandHeight))
             let band = output.cropped(to: rect)
             var buffer = [Float](repeating: 0, count: width * bandHeight * 4)
             buffer.withUnsafeMutableBytes { raw in
