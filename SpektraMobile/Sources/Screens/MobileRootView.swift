@@ -58,7 +58,7 @@ struct MobileRootView: View {
             HomeScreen(
                 engine: engine,
                 onOpenDevelop: { photo in
-                    openDevelop(photo.id)
+                    openDevelop(photo.id, filename: photo.filename)
                 },
                 onOpenGrade: { photo in
                     openGrade(photo.id, entry: .direct, returningTo: .home)
@@ -402,13 +402,17 @@ struct MobileRootView: View {
         return .opened
     }
 
-    private func openDevelop(_ photoID: String) {
+    private func openDevelop(_ photoID: String, filename: String? = nil) {
         engine.closeGrade()
         resetFlight()
         grade = nil
         // 会话建不出来时不要切 screen：否则主页会被关闭命中测试，
-        // 看起来就是整页点不动。
-        guard let session = engine.openDevelop(photoID: photoID) else { return }
+        // 看起来就是整页点不动。但要给提示——静默 return 会让用户以为是卡片点不动。
+        guard let session = engine.openDevelop(photoID: photoID, filename: filename) else {
+            NSLog("MOpen develop failed id=%@", photoID)
+            showToast("打不开这张照片，请重试或重新导入")
+            return
+        }
         withAnimation(MMotion.push) {
             develop = session
             screen = .develop

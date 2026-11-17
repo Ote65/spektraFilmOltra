@@ -297,7 +297,10 @@ final class MobileEngine: ObservableObject {
             if scope.isOriginFilter,
                let cachedAll = index.entry(.all, allowNonRaw: allowNonRaw),
                cachedAll.generation == index.generation {
-                assets = filterOrigin(cachedAll.assets, for: scope)
+                // 必须先 relink：缓存里的 MPhoto 是上次扫描的快照，库内记录在
+                // App 运行期间可能已变动（导入 / 删除 / 去重）。直接用旧快照挂到
+                // asset.photo 上，点击时会把失效的 photoID 传进 openDevelop 被静默吞掉。
+                apply(filterOrigin(cachedAll.assets, for: scope))
                 index.store(assets, for: scope, allowNonRaw: allowNonRaw,
                             generation: cachedAll.generation)
                 assetPhase = .ready
@@ -961,15 +964,17 @@ final class MobileEngine: ObservableObject {
         // 若把已套用的直出参数当基线，快速滑条回到 0 时无法回到原始曝光 / 亮度。
         photo.quickBaselineData = try? JSONEncoder().encode(baseline ?? PhotoEdit())
         // 相机页选的画幅写进裁切数据：调色台打开就是同一构图，
-        // 后续调色导出沿用裁切。
+        // 后续调色导出沿用裁切。横屏拍摄按横幅取比例（3:4 → 4:3），
+        // 与直出渲染的裁切保持同一构图。
         let size = LibraryStore.pixelSize(url: store.originalURL(for: photo))
         var geometry = MPhotoGeometry()
         if let data = photo.cropData,
            let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
             geometry = decoded
         }
-        geometry.crop = MPhotoGeometry.centerCrop(ratio: aspect.ratio,
-                                                  width: size.width, height: size.height)
+        geometry.crop = MPhotoGeometry.centerCrop(
+            ratio: aspect.ratio(width: size.width, height: size.height),
+            width: size.width, height: size.height)
         photo.cropData = try? JSONEncoder().encode(geometry.normalized())
         try? store.update(photo)
 
@@ -1272,8 +1277,25 @@ final class MobileEngine: ObservableObject {
     // MARK: - 显影会话
 
     @discardableResult
-    func openDevelop(photoID: String) -> MobileDevelopSession? {
-        guard let photo = store.photos.first(where: { $0.id == photoID }) else { return nil }
+    func openDevelop(photoID: String, filename: String? = nil) -> MobileDevelopSession? {
+        var resolved = store.photos.first(where: { $0.id == photoID })
+        // 卡片可能持有 relink 之前的 MPhoto 快照：id 已失效，但文件名稳定
+        // （删除重导会换 id、文件名不变）。优先用入口传来的文件名回查当前记录——
+        // 即使卡片渲染后库已刷新（台前调度 force refresh）也能打开。
+        if resolved == nil, let filename,
+           let current = store.photos.first(where: { $0.filename == filename }) {
+            resolved = current
+        }
+        // 没有 filename 的调用点（相机 / 直出）：从仍持有旧快照的 asset 取文件名兜底。
+        if resolved == nil,
+           let stale = assets.first(where: { $0.photo?.id == photoID })?.filename,
+           let current = store.photos.first(where: { $0.filename == stale }) {
+            resolved = current
+        }
+        guard let photo = resolved else {
+            NSLog("MOpen develop session nil id=%@ filename=%@", photoID, filename ?? "-")
+            return nil
+        }
         transientDevelopSession?.cancel()
         transientDevelopSession = nil
         developSession?.cancel()

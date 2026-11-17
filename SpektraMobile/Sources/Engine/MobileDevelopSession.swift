@@ -2455,7 +2455,13 @@ enum MDirectRenderer {
         graded.image = ImageRGB(width: 0, height: 0)
         // 画幅比例在渲染末尾居中裁切：拍摄永远是 RAW 全幅，片边 / 水印 / 预览
         // 都作用在裁切后的画幅上，与调色台的裁切是同一构图。
-        output = autoreleasepool { Self.centerCrop(output, ratio: settings.aspect.ratio) }
+        // 横屏拍摄时画布是横的：比例取倒数（3:4 → 4:3），输出选定构图
+        // 转过来的完整横幅，而不是把横幅硬裁成竖幅。
+        output = autoreleasepool {
+            Self.centerCrop(output,
+                            ratio: settings.aspect.ratio(width: output.width,
+                                                         height: output.height))
+        }
         // 预览必须在转换到导出色彩空间之前生成：ProPhoto / ACES 线性图直接显示会偏色。
         var previewSource = Resize.longEdge(output, maxSize: 1200)
         if settings.watermark {

@@ -74,7 +74,7 @@ git checkout electron   # 或 iOS / python
 
 系统要求：iPhone（iOS 17 或更高）；构建需要 macOS 与 Xcode。
 
-[Releases](https://github.com/Ote65/spektraFilmOltra/releases) 里有开发签名的内测 IPA（当前 `v0.4.6-ios`）：只有已登记在开发者设备列表里的 iPhone 能直接安装，其他手机请用下面的方式重签。
+[Releases](https://github.com/Ote65/spektraFilmOltra/releases) 里有开发签名的内测 IPA（当前 `v0.4.7-ios`）：只有已登记在开发者设备列表里的 iPhone / iPad 能直接安装，其他手机请用下面的方式重签。
 
 **方式 A：Xcode 直接安装（推荐）**
 

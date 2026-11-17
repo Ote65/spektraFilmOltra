@@ -746,6 +746,13 @@ enum MDirectAspect: String, CaseIterable, Identifiable {
         case .portrait9_16: return 9.0 / 16
         }
     }
+
+    /// 按拍摄朝向取目标宽高比（宽/高）。档位是竖幅语义；
+    /// 横屏拍摄时画布是横的，取倒数得到「选定比例横过来」的完整横幅，
+    /// 而不是把横幅硬裁成竖幅。1:1 两种朝向相同。
+    func ratio(width: Int, height: Int) -> Double {
+        width > height ? 1.0 / ratio : ratio
+    }
 }
 
 /// 直出分辨率档位：按总像素（MP）显示，换算成长边交给导出预算。
