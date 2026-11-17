@@ -863,7 +863,15 @@ final class MobileDevelopSession: ObservableObject {
         edit = next
         for (id, value) in preset.pro {
             switch value {
-            case .number(let number): writePro(id, number)
+            case .number(let number):
+                // 曝光补偿保存的是「保存时基线 + 调整量」，套用时换成当前基线。
+                let adjusted = id == "exposure_compensation_ev"
+                    ? QuickExposureMapping.presetExposure(
+                        absolute: number,
+                        savedBaseline: preset.exposureBaselineEV,
+                        currentBaseline: baseline.camera.exposureCompensationEV)
+                    : number
+                writePro(id, adjusted)
             case .flag(let flag): writeProToggle(id, flag)
             case .option(let option): writeProChoice(id, option)
             }
@@ -1074,8 +1082,8 @@ final class MobileDevelopSession: ObservableObject {
                 var config = watermark
                 // 导出面板的勾选是这次导出的最终决定，覆盖设置里的启用位。
                 config.enabled = true
-                output = MWatermarkRenderer.composite(
-                    image: output, config: config,
+                MWatermarkRenderer.compositeInPlace(
+                    &output, config: config,
                     colorSpace: colorSpace, cctfEncoding: cctf
                 )
             }
@@ -1521,15 +1529,16 @@ final class MobileDevelopSession: ObservableObject {
                                               edit: inout PhotoEdit) {
         switch id {
         case "camera_exposure":
-            edit.camera.exposureCompensationEV = clampValue(
-                baseline.camera.exposureCompensationEV + q, -5, 5)
-            // 原生 quick_controls：拖动拍摄曝光时先关掉印相自动亮度补偿，
-            // 否则补偿会把曝光变化抵消掉（±1 EV 只差 0.01 L），回到 0 时恢复基线。
-            edit.enlarger.printExposureCompensation =
-                abs(q) <= 1e-9 ? baseline.enlarger.printExposureCompensation : false
+            // 基线拍摄曝光非 0 时保留印相自动亮度补偿，改用印相曝光承载 EV 偏移；
+            // 否则关闭补偿会撤掉基线补偿，滑条第一次离开 0 就按基线 EV 跳暗。
+            QuickExposureMapping.apply(
+                cameraExposure: q, baseline: baseline,
+                quickIntents: quickIntents, edit: &edit)
         case "print_brightness":
-            let b = baseline.enlarger.printExposure
-            edit.enlarger.printExposure = clampValue(b * pow(2, -q), 0.25, 4)
+            edit.enlarger.printExposure = QuickExposureMapping.printExposure(
+                baseline: baseline,
+                cameraEV: quickIntents["camera_exposure"] ?? 0,
+                printEV: q)
         case "tonal_contrast":
             let morph = baseline.printRender.densityCurvesMorph
             edit.printRender.densityCurvesMorph.gammaFactor = clampValue(
@@ -2017,9 +2026,13 @@ enum ExportEdge {
         }
     }
 
+    /// - Parameter banded: 解码与调色都按带处理（峰值只跟带高有关），
+    ///   大图不再需要整图 RGBAf 与整图 Double 工作缓冲。
+    /// - Parameter encodeBytesPerPixel: 编码阶段每像素峰值；JPEG 约 8，16-bit TIFF/EXR 约 24。
     static func plan(index: Int, originalLongEdge: Int, params: RuntimePhotoParams,
                      aspect: Double = 0.75, includeGrade: Bool = false,
-                     peakLimit: Double? = nil) -> Plan {
+                     peakLimit: Double? = nil, banded: Bool = false,
+                     encodeBytesPerPixel: Double? = nil) -> Plan {
         let requestedEdge = requested(index: index, originalLongEdge: originalLongEdge)
         let available = Int(os_proc_available_memory())
         guard available > 0 else {
@@ -2048,6 +2061,10 @@ enum ExportEdge {
         }
         func gradePeak(_ edge: Int) -> Double {
             guard includeGrade else { return 0 }
+            // 分带调色：原始输入 + Float 成品各一张整图，Double 工作缓冲按带分配。
+            if banded {
+                return (sourcePixels(edge) + outputPixels(edge)) * 12 + 160 * 1024 * 1024
+            }
             return outputPixels(edge) * gradeBytesPerPixel + 64 * 1024 * 1024
         }
         func singlePassPeak(_ edge: Int) -> Double {
@@ -2055,7 +2072,8 @@ enum ExportEdge {
                 outputPixels(edge) * pipelineBytesPerPixel) + 64 * 1024 * 1024
         }
         func encodePeak(_ edge: Int) -> Double {
-            outputPixels(edge) * encodeBytesPerPixel + 64 * 1024 * 1024
+            outputPixels(edge) * (encodeBytesPerPixel ?? Self.encodeBytesPerPixel)
+                + 64 * 1024 * 1024
         }
         /// 分带方案。`nil` 表示这张图不能分带（柔光镜核太大）或分带也放不下。
         func tiledPlan(_ edge: Int) -> Plan? {
@@ -2079,7 +2097,10 @@ enum ExportEdge {
             guard rows.bandCount > 1 else { return nil }
             let bandArea = (rows.coreRows + 2 * halo) * width
             let peak = fixedBytes + Double(bandArea) * pipelineBytesPerPixel
-            let decodePeak = sourcePixels(edge) * decodeBytesPerPixel + 64 * 1024 * 1024
+            // 分带解码只多一条带的 RGBAf，不再需要整图 44 B/px 的临时缓冲。
+            let decodePeak = banded
+                ? sourcePixels(edge) * 12 + 160 * 1024 * 1024
+                : sourcePixels(edge) * decodeBytesPerPixel + 64 * 1024 * 1024
             guard max(max(max(peak, decodePeak), encodePeak(edge)), gradePeak(edge)) <= budget else {
                 return nil
             }
@@ -2171,9 +2192,8 @@ enum MDirectRenderer {
         }
     }
 
-    /// 直出是手机端「即拍即成」的流程，不追求 34 MP 母版；
-    /// 2400 长边在手机上足够清晰，同时能把 12 MP 原片的显影时间压到几秒。
-    static let maxDirectEdge = 2400
+    /// 直出跟随设置页的默认导出尺寸；原片尺寸读取失败时按 12 MP 兜底。
+    static let fallbackDirectEdge = 4032
 
     /// 直出工程的快速控制基线：拍摄曝光是基线，其它字段保持中性。
     /// 保存原图后再次进入显影台时，快速滑条回到 0 应该回到「拍摄时的曝光」，而不是归零。
@@ -2223,7 +2243,10 @@ enum MDirectRenderer {
                 case .number(let number):
                     // 曝光补偿是「拍摄基线 + 预设调整」，其余参数仍然是预设的绝对值。
                     let adjusted = id == "exposure_compensation_ev"
-                        ? min(max(number + meta.exposureBias, -5), 5)
+                        ? QuickExposureMapping.presetExposure(
+                            absolute: number,
+                            savedBaseline: preset.exposureBaselineEV,
+                            currentBaseline: captureBaseline.camera.exposureCompensationEV)
                         : number
                     MobileDevelopSession.writePro(id, adjusted, into: &edit)
                 case .flag(let flag):
@@ -2291,19 +2314,26 @@ enum MDirectRenderer {
         try checkCancellation()
         let size = LibraryStore.pixelSize(url: sourceURL)
         let originalEdge = (size.width > 0 && size.height > 0)
-            ? max(size.width, size.height)
-            : Self.maxDirectEdge
-        let renderEdge = min(max(originalEdge, 1), Self.maxDirectEdge)
+            ? max(max(size.width, size.height), 1)
+            : Self.fallbackDirectEdge
         let aspect = (size.width > 0 && size.height > 0)
             ? Double(min(size.width, size.height)) / Double(max(size.width, size.height))
             : 0.75
         var params = try edit.runtimeParams()
+        // 解码与调色都按带处理，48 MP 也能把峰值压在一条带 + 整图 Float 上；
+        // 上限从 800 MB 放宽到 1.9 GB，6 GB 机型按可用内存 60% 仍会先触顶。
         let plan = ExportEdge.plan(index: settings.edgeIndex,
-                                   originalLongEdge: renderEdge,
+                                   originalLongEdge: originalEdge,
                                    params: params, aspect: aspect,
                                    includeGrade: true,
-                                   peakLimit: 800 * 1024 * 1024)
+                                   peakLimit: 1900 * 1024 * 1024,
+                                   banded: true,
+                                   // JPEG 编码峰值低；16-bit TIFF / EXR 会多背一份
+                                   // 整图编码缓冲，按默认 36 B/px 保守估计。
+                                   encodeBytesPerPixel: settings.format == 3 ? 8 : nil)
         let requested = plan.edge
+        // 一条带的 RGBAf 控制在 64 MB 内；宽度越大带越矮，48 MP 下约 512 行。
+        let decodeBandRows = max(64, min(512, (64 << 20) / max(1, originalEdge * 16)))
 
         let ext: String
         let bitDepth: Int
@@ -2335,7 +2365,8 @@ enum MDirectRenderer {
                 rotationTurns: edit.rotationTurns, allowEncoded: true,
                 // 直出必须给结果：系统 RAW 支持首次查询可能超时，允许退回内嵌预览，
                 // 否则用户只会看到「原片解码失败」。
-                rawTimeout: 12, allowPreviewFallback: true
+                rawTimeout: 12, allowPreviewFallback: true,
+                bandRows: decodeBandRows
             )
         }) else {
             throw RenderError.decodeFailed
@@ -2378,9 +2409,17 @@ enum MDirectRenderer {
         emit(0.7)
 
         GradeEngine.prepareSourceInPlace(&developed)
+        // 大图（含 48 MP）走分带调色：整图 Double 工作缓冲在 48 MP 是 1.17 GB，
+        // 6 GB 机型会被系统杀掉，分带后只剩整图 Float + 一条带。
+        let bandedGrade = plan.tiled || max(developed.width, developed.height) >= 4096
         var graded: GradeRenderResult = try autoreleasepool {
-            try GradeEngine.renderInPlace(&developed, recipe: grade,
-                                          shouldCancel: isCancelled)
+            if bandedGrade {
+                return try GradeEngine.renderTiledInPlace(
+                    &developed, recipe: grade, bandRows: 256,
+                    shouldCancel: isCancelled)
+            }
+            return try GradeEngine.renderInPlace(&developed, recipe: grade,
+                                                 shouldCancel: isCancelled)
         }
         if let lutError = graded.lutError {
             throw RenderError.lut(lutError.errorDescription ?? "LUT 解析失败")
@@ -2408,8 +2447,8 @@ enum MDirectRenderer {
         if settings.watermark {
             var config = MWatermarkStore.load()
             config.enabled = true
-            output = MWatermarkRenderer.composite(
-                image: output, config: config,
+            MWatermarkRenderer.compositeInPlace(
+                &output, config: config,
                 colorSpace: targetSpace, cctfEncoding: targetCCTF
             )
         }
@@ -2424,7 +2463,7 @@ enum MDirectRenderer {
 
         emit(1.0)
         return MDirectRenderResult(url: destination, preview: preview,
-                                   clampedEdge: plan.clamped ? requested : nil,
+                                   clampedEdge: plan.clamped ? plan.edge : nil,
                                    usedFallback: usedFallback)
     }
 }

@@ -57,27 +57,24 @@ final class MCameraSession: NSObject, ObservableObject {
         }
     }
 
-    /// 取景器里的焦段按钮：数字是 35mm 等效焦距，`zoom` 是折算到设备上的变焦倍数。
-    enum Lens: Int, CaseIterable, Identifiable {
-        case wide = 26
-        case standard = 35
-        case portrait = 50
-        case tele = 77
+    /// 取景器里的焦段按钮：焦距与相对主摄的倍数都从真实摄像头读取，
+    /// 不同机型会得到各自的光学焦段（如 13/26/77 或 13/24/120）。
+    struct Lens: Identifiable, Equatable {
+        /// 物理摄像头的 uniqueID。
+        let id: String
+        /// 35mm 等效焦距。
+        let focal: Int
+        /// 相对主摄的显示倍数。
+        let zoom: CGFloat
 
-        var id: Int { rawValue }
-        var focal: Int { rawValue }
-
-        var zoom: CGFloat {
-            switch self {
-            case .wide: return 1
-            case .standard: return 1.5
-            case .portrait: return 2
-            case .tele: return 3
-            }
-        }
+        static let placeholder = Lens(id: "wide", focal: 26, zoom: 1)
 
         var zoomLabel: String {
-            zoom == zoom.rounded() ? "\(Int(zoom))×" : String(format: "%.1f×", zoom)
+            let rounded = (zoom * 10).rounded() / 10
+            if abs(rounded - rounded.rounded()) < 0.05 {
+                return "\(Int(rounded.rounded()))×"
+            }
+            return String(format: "%.1f×", rounded)
         }
     }
 
@@ -98,6 +95,10 @@ final class MCameraSession: NSObject, ObservableObject {
     @Published private(set) var isCapturing = false
     @Published private(set) var rawAvailable = false
     @Published private(set) var hasFlash = false
+    /// 当前机型真实可用的光学焦段，由 DiscoverySession 枚举生成。
+    @Published private(set) var availableLenses: [Lens] = [.placeholder]
+    /// 正在换物理镜头：交换输入期间禁止快门。
+    @Published private(set) var isSwitchingLens = false
     @Published private(set) var zoom: CGFloat = 1
     @Published private(set) var lastShot: MCameraShot?
     /// 设备 / 环境层面的不可用原因（模拟器、没有摄像头）。
@@ -107,7 +108,7 @@ final class MCameraSession: NSObject, ObservableObject {
 
     @Published var flash: FlashMode = .off
 
-    @Published private(set) var lens: Lens = .wide
+    @Published private(set) var lens: Lens = .placeholder
     @Published private(set) var isFront = false
     @Published private(set) var exposureBias: Double = 0
     /// nil 表示自动白平衡。
@@ -119,7 +120,7 @@ final class MCameraSession: NSObject, ObservableObject {
 
     /// 只有就绪且支持 RAW 时才允许按快门。
     var canCapture: Bool {
-        isRunning && rawAvailable && !isCapturing && unusableReason == nil
+        isRunning && rawAvailable && !isCapturing && !isSwitchingLens && unusableReason == nil
     }
 
     var isRawReady: Bool {
@@ -130,6 +131,7 @@ final class MCameraSession: NSObject, ObservableObject {
     var blockedHint: String {
         if let unusableReason { return unusableReason }
         if permission == .denied { return "没有相机权限，请到系统设置里打开" }
+        if isSwitchingLens { return "正在切换镜头" }
         if isCapturing { return "正在写入 DNG…" }
         if !isRunning { return "相机还在启动" }
         if !rawAvailable { return "这台设备不提供 RAW 拍摄" }
@@ -140,16 +142,6 @@ final class MCameraSession: NSObject, ObservableObject {
 
     var exposureLabel: String { String(format: "%+.1f", exposureBias) }
 
-    /// 只有设备变焦能到的焦段才显示。
-    var availableLenses: [Lens] {
-        #if os(iOS)
-        let limit = max(1, maxZoom)
-        return Lens.allCases.filter { $0.zoom <= limit + 0.05 }
-        #else
-        return [.wide]
-        #endif
-    }
-
     #if os(iOS)
     let session = AVCaptureSession()
     private let photoOutput = AVCapturePhotoOutput()
@@ -159,6 +151,17 @@ final class MCameraSession: NSObject, ObservableObject {
     private var isConfigured = false
     private var captureDelegate: MCaptureDelegate?
     private var maxZoom: CGFloat = 1
+    /// 当前方向的主摄，失败时回退到它。
+    private var wideDevice: AVCaptureDevice?
+    /// 焦段 → 物理摄像头。
+    private var lensDevices: [String: AVCaptureDevice] = [:]
+    /// 切换失败过的摄像头：后续重建焦段列表时不再出现。
+    private var failedLensIDs: Set<String> = []
+    /// configure 在 sessionQueue 上构建，startSession 再回主线程发布。
+    private var pendingLenses: [Lens] = []
+    private var pendingLensDevices: [String: AVCaptureDevice] = [:]
+    /// 镜头切换的代号：超时后作废旧请求，晚到的回调不能再改状态。
+    private var lensSwitchToken = 0
     #endif
 
     override init() {
@@ -225,10 +228,12 @@ final class MCameraSession: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             var format: OSType?
+            var firstConfigure = false
             if !self.isConfigured {
                 do {
                     format = try self.configure()
                     self.isConfigured = true
+                    firstConfigure = true
                 } catch {
                     DispatchQueue.main.async {
                         self.unusableReason = error.localizedDescription
@@ -244,15 +249,28 @@ final class MCameraSession: NSObject, ObservableObject {
             let running = self.session.isRunning
             let flash = self.device?.hasFlash ?? false
             let zoomLimit = self.device?.activeFormat.videoMaxZoomFactor ?? 1
+            let lenses = self.pendingLenses
+            let lensMap = self.pendingLensDevices
+            let currentLens = self.pendingLens(for: self.device)
 
             DispatchQueue.main.async {
                 self.rawFormat = format
                 self.rawAvailable = format != nil
                 self.hasFlash = flash
                 self.maxZoom = zoomLimit
+                if firstConfigure, !lenses.isEmpty {
+                    self.availableLenses = lenses
+                    self.lensDevices = lensMap
+                    self.lens = currentLens ?? .placeholder
+                }
                 self.isRunning = running
             }
         }
+    }
+
+    private func pendingLens(for device: AVCaptureDevice?) -> Lens? {
+        guard let device else { return nil }
+        return pendingLenses.first { $0.id == device.uniqueID }
     }
 
     /// 在 sessionQueue 上调用：装配输入 / 输出 / 竖屏方向，返回可用的 RAW 像素格式。
@@ -296,7 +314,66 @@ final class MCameraSession: NSObject, ObservableObject {
         let picked = proRAW ?? formats.first
 
         self.device = device
+        self.wideDevice = device
+        let built = Self.makeLenses(position: .back, wide: device,
+                                    excluding: failedLensIDs)
+        self.pendingLenses = built.lenses
+        self.pendingLensDevices = built.devices
         return picked
+    }
+
+    /// 枚举当前方向的物理摄像头，用视场角折算等效焦距。
+    /// 不预设任何焦段：机型有什么镜头就生成什么按钮。
+    private static func makeLenses(
+        position: AVCaptureDevice.Position,
+        wide: AVCaptureDevice,
+        excluding failed: Set<String>
+    ) -> (lenses: [Lens], devices: [String: AVCaptureDevice]) {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera],
+            mediaType: .video,
+            position: position
+        )
+        var devices = discovery.devices.filter { $0.isConnected && !$0.isSuspended }
+        if !devices.contains(where: { $0.uniqueID == wide.uniqueID }) {
+            devices.append(wide)
+        }
+
+        let wideFocal = equivalentFocalLength(of: wide)
+        let baseFocal = wideFocal > 0 ? wideFocal : 26
+        var seen = Set<String>()
+        var lenses: [Lens] = []
+        var mapping: [String: AVCaptureDevice] = [:]
+
+        for camera in devices {
+            guard !failed.contains(camera.uniqueID) else { continue }
+            guard seen.insert(camera.uniqueID).inserted else { continue }
+            let focal = equivalentFocalLength(of: camera)
+            guard focal > 0 else { continue }
+            let lens = Lens(id: camera.uniqueID,
+                            focal: Int(focal.rounded()),
+                            zoom: focal / baseFocal)
+            lenses.append(lens)
+            mapping[camera.uniqueID] = camera
+        }
+
+        // 视场角读取失败时至少保留主摄 1×。
+        if !lenses.contains(where: { $0.id == wide.uniqueID }) {
+            lenses.append(Lens(id: wide.uniqueID,
+                               focal: Int(baseFocal.rounded()),
+                               zoom: 1))
+            mapping[wide.uniqueID] = wide
+        }
+
+        lenses.sort { $0.focal < $1.focal }
+        return (lenses, mapping)
+    }
+
+    /// 用水平视场角折算 35mm 等效焦距：f = 18 / tan(FOV / 2)。
+    private static func equivalentFocalLength(of device: AVCaptureDevice) -> CGFloat {
+        let fov = CGFloat(device.activeFormat.videoFieldOfView)
+        guard fov > 1, fov < 179 else { return 0 }
+        return 18 / tan(fov * .pi / 360)
     }
     #endif
 
@@ -411,27 +488,199 @@ final class MCameraSession: NSObject, ObservableObject {
         flash = all[(index + 1) % all.count]
     }
 
-    /// 选焦段：把 35mm 等效焦距折算成设备变焦倍数。
+    /// 选焦段：每个按钮都对应一颗真实摄像头，切换后使用该镜头的原生倍率。
     func select(_ lens: Lens) {
         #if os(iOS)
+        guard !isSwitchingLens, let target = lensDevices[lens.id] else { return }
+        if device === target {
+            applyNativeZoom(for: lens)
+        } else {
+            switchInput(to: lens, target: target)
+        }
+        #endif
+    }
+
+    #if os(iOS)
+    private func applyNativeZoom(for lens: Lens) {
         guard let device else { return }
-        let target = min(lens.zoom, max(1, maxZoom))
+        let limit = max(1, device.activeFormat.videoMaxZoomFactor)
         do {
             try device.lockForConfiguration()
-            device.videoZoomFactor = target
+            device.videoZoomFactor = 1
             device.unlockForConfiguration()
         } catch {
             return
         }
-        zoom = device.videoZoomFactor
+        zoom = 1
+        maxZoom = limit
         self.lens = lens
-        #endif
     }
+
+    /// 换物理镜头：重挂输入后重新确认 RAW 格式，失败就退回主摄。
+    private func switchInput(to lens: Lens, target: AVCaptureDevice) {
+        isSwitchingLens = true
+        lensSwitchToken += 1
+        let token = lensSwitchToken
+
+        // 坏镜头可能在换输入时卡住：超时直接移除该焦段并恢复 UI，主线程始终不等它。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self, self.lensSwitchToken == token, self.isSwitchingLens else { return }
+            self.failSwitch(to: lens)
+        }
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            guard let previous = self.session.inputs.compactMap({ $0 as? AVCaptureDeviceInput }).first,
+                  let next = try? AVCaptureDeviceInput(device: target) else {
+                DispatchQueue.main.async { self.failSwitch(to: lens) }
+                return
+            }
+
+            self.session.beginConfiguration()
+            self.session.removeInput(previous)
+            guard self.session.canAddInput(next) else {
+                self.session.addInput(previous)
+                self.session.commitConfiguration()
+                DispatchQueue.main.async { self.failSwitch(to: lens) }
+                return
+            }
+            self.session.addInput(next)
+            if self.photoOutput.isAppleProRAWSupported, !self.photoOutput.isAppleProRAWEnabled {
+                self.photoOutput.isAppleProRAWEnabled = true
+            }
+            self.session.commitConfiguration()
+
+            let formats = self.photoOutput.availableRawPhotoPixelFormatTypes
+            guard let raw = formats.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) ?? formats.first else {
+                self.session.beginConfiguration()
+                self.session.removeInput(next)
+                if self.session.canAddInput(previous) {
+                    self.session.addInput(previous)
+                }
+                self.session.commitConfiguration()
+                DispatchQueue.main.async { self.failSwitch(to: lens) }
+                return
+            }
+
+            if let connection = self.photoOutput.connection(with: .video) {
+                if #available(iOS 17.0, *) {
+                    if connection.isVideoRotationAngleSupported(90) {
+                        connection.videoRotationAngle = 90
+                    }
+                } else if connection.isVideoOrientationSupported {
+                    connection.videoOrientation = .portrait
+                }
+            }
+
+            let limit = max(1, target.activeFormat.videoMaxZoomFactor)
+            do {
+                try target.lockForConfiguration()
+                target.videoZoomFactor = 1
+                target.unlockForConfiguration()
+            } catch {
+                // 输入已经切好，倍率保持 1× 也能拍。
+            }
+
+            DispatchQueue.main.async {
+                guard self.lensSwitchToken == token else { return }
+                self.isSwitchingLens = false
+                self.device = target
+                self.rawFormat = raw
+                self.rawAvailable = true
+                self.hasFlash = target.hasFlash
+                self.maxZoom = limit
+                self.zoom = 1
+                self.lens = lens
+            }
+        }
+    }
+
+    private func failSwitch(to lens: Lens) {
+        lensSwitchToken += 1
+        isSwitchingLens = false
+        if lens.id == wideDevice?.uniqueID {
+            message = "镜头切换失败"
+        } else {
+            // 失败的光学焦段从列表移除，后续翻转镜头也不再出现。
+            failedLensIDs.insert(lens.id)
+            availableLenses.removeAll { $0.id == lens.id }
+            lensDevices[lens.id] = nil
+            message = "\(lens.focal)mm 镜头不可用"
+        }
+        restoreWideInput()
+    }
+
+    /// 失败后回到当前方向的主摄 1×。
+    private func restoreWideInput() {
+        guard let wide = wideDevice else { return }
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            guard let current = self.session.inputs.compactMap({ $0 as? AVCaptureDeviceInput }).first else { return }
+            if current.device === wide {
+                do {
+                    try wide.lockForConfiguration()
+                    wide.videoZoomFactor = 1
+                    wide.unlockForConfiguration()
+                } catch {}
+                DispatchQueue.main.async {
+                    self.zoom = 1
+                    self.applyWideLensState()
+                }
+                return
+            }
+            guard let input = try? AVCaptureDeviceInput(device: wide) else { return }
+
+            self.session.beginConfiguration()
+            self.session.removeInput(current)
+            if self.session.canAddInput(input) {
+                self.session.addInput(input)
+            }
+            self.session.commitConfiguration()
+
+            if let connection = self.photoOutput.connection(with: .video) {
+                if #available(iOS 17.0, *) {
+                    if connection.isVideoRotationAngleSupported(90) {
+                        connection.videoRotationAngle = 90
+                    }
+                } else if connection.isVideoOrientationSupported {
+                    connection.videoOrientation = .portrait
+                }
+            }
+
+            let formats = self.photoOutput.availableRawPhotoPixelFormatTypes
+            let raw = formats.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) ?? formats.first
+            let limit = max(1, wide.activeFormat.videoMaxZoomFactor)
+            do {
+                try wide.lockForConfiguration()
+                wide.videoZoomFactor = 1
+                wide.unlockForConfiguration()
+            } catch {}
+
+            DispatchQueue.main.async {
+                self.device = wide
+                if let raw {
+                    self.rawFormat = raw
+                    self.rawAvailable = true
+                }
+                self.hasFlash = wide.hasFlash
+                self.maxZoom = limit
+                self.zoom = 1
+                self.applyWideLensState()
+            }
+        }
+    }
+
+    private func applyWideLensState() {
+        guard let wide = wideDevice,
+              let wideLens = availableLenses.first(where: { $0.id == wide.uniqueID }) else { return }
+        lens = wideLens
+    }
+    #endif
 
     /// 前后摄像头切换。前置多数机型不提供 RAW，切不过去时退回后置并给出提示。
     func flip() {
         #if os(iOS)
-        guard isRunning, !isCapturing, let current = device else { return }
+        guard isRunning, !isCapturing, !isSwitchingLens, let current = device else { return }
         let target: AVCaptureDevice.Position = current.position == .front ? .back : .front
         guard let next = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: target),
               let input = try? AVCaptureDeviceInput(device: next) else {
@@ -483,15 +732,21 @@ final class MCameraSession: NSObject, ObservableObject {
                 }
             }
 
+            let built = Self.makeLenses(position: target, wide: next,
+                                        excluding: self.failedLensIDs)
+
             DispatchQueue.main.async {
                 self.device = next
+                self.wideDevice = next
                 self.isFront = target == .front
                 self.rawFormat = picked
                 self.rawAvailable = true
                 self.hasFlash = next.hasFlash
                 self.maxZoom = next.activeFormat.videoMaxZoomFactor
+                self.availableLenses = built.lenses
+                self.lensDevices = built.devices
+                self.lens = built.lenses.first(where: { $0.id == next.uniqueID }) ?? .placeholder
                 self.zoom = 1
-                self.lens = .wide
                 self.exposureBias = 0
                 self.temperature = nil
                 self.isExposureLocked = false

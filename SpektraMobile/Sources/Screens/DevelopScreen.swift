@@ -1403,7 +1403,7 @@ struct DevelopScreen: View {
                             y: padYBinding,
                             width: max(1, geo.size.width),
                             height: 96,
-                            isEnabled: !scanFilmMode
+                            isEnabled: !scanFilmMode && !temperatureFrozen
                         )
                     }
                     .frame(height: 96)
@@ -1412,11 +1412,11 @@ struct DevelopScreen: View {
                     HStack(spacing: 6) {
                         Text("冷暖 \(ccText(session.padX))")
                             .font(.mSans(8, .medium).monospacedDigit())
-                            .foregroundStyle(abs(session.padX) > 0.5 && !scanFilmMode ? MColor.brass : MColor.text3)
+                            .foregroundStyle(abs(session.padX) > 0.5 && !scanFilmMode && !temperatureFrozen ? MColor.brass : MColor.text3)
                         Spacer(minLength: 0)
                         Text("品红 \(ccText(session.padY))")
                             .font(.mSans(8, .medium).monospacedDigit())
-                            .foregroundStyle(abs(session.padY) > 0.5 && !scanFilmMode ? MColor.brass : MColor.text3)
+                            .foregroundStyle(abs(session.padY) > 0.5 && !scanFilmMode && !temperatureFrozen ? MColor.brass : MColor.text3)
                     }
                     .padding(.top, 6)
 
@@ -1709,6 +1709,11 @@ struct DevelopScreen: View {
         session.proToggles["scan_film"] ?? false
     }
 
+    /// 印相冷暖已被专业模式接管：色盘与冷暖滑条一样置灰并停止手势。
+    private var temperatureFrozen: Bool {
+        session.frozenQuickAxes.contains("temperature")
+    }
+
     /// 与参考 `PRINT_ONLY_AXES` 对齐：印相明暗、影调反差、高光柔和（色盘 Y/M 单独处理）。
     private var printOnlyQuickAxes: Set<String> {
         ["print_brightness", "tonal_contrast", "highlight_softening"]
@@ -1991,13 +1996,15 @@ private struct MDevelopPresetSaveSheet: View {
         let pro = Dictionary(items
             .filter { selected.contains($0.id) && !Self.excluded.contains($0.id) }
             .map { ($0.id, $0.value) }, uniquingKeysWith: { _, last in last })
-        let preset = MUserDevelopPreset(
+        var preset = MUserDevelopPreset(
             name: trimmedName,
             filmID: session.filmID,
             paperID: session.paperID,
             monochrome: session.isMonochrome,
             pro: pro
         )
+        // 记录保存时的拍摄曝光基线，套用到别的照片时换算成当前基线 + 同一调整量。
+        preset.exposureBaselineEV = session.proBaseline("exposure_compensation_ev")
         let saved = MDevelopPresetStore.shared.save(preset)
         MHaptic.light()
         onSaved(saved)

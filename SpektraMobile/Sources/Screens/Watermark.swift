@@ -137,15 +137,24 @@ enum MWatermarkStore {
 enum MWatermarkRenderer {
     static func composite(image: ImageRGB, config raw: MWatermarkConfig,
                           colorSpace: String, cctfEncoding: Bool) -> ImageRGB {
+        var output = image
+        compositeInPlace(&output, config: raw, colorSpace: colorSpace,
+                         cctfEncoding: cctfEncoding)
+        return output
+    }
+
+    /// 原地合成：48 MP 下不再为了水印多复制一张整图。
+    static func compositeInPlace(_ image: inout ImageRGB, config raw: MWatermarkConfig,
+                                 colorSpace: String, cctfEncoding: Bool) {
         let config = raw.normalized()
-        guard config.enabled, config.opacity > 0 else { return image }
+        guard config.enabled, config.opacity > 0 else { return }
         let text = config.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let kind = config.kindValue
-        if kind == .text, text.isEmpty { return image }
+        if kind == .text, text.isEmpty { return }
         let markImage: CGImage?
         if kind == .image {
             markImage = ImageBridge.cgImage(contentsOf: MWatermarkStore.imageURL(for: config.imagePath))
-            if markImage == nil { return image }
+            if markImage == nil { return }
         } else {
             markImage = nil
         }
@@ -158,7 +167,7 @@ enum MWatermarkRenderer {
                 bitsPerComponent: 8, bytesPerRow: width * 4,
                 space: space,
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              ) else { return image }
+              ) else { return }
 
         context.clear(CGRect(x: 0, y: 0, width: width, height: height))
         context.interpolationQuality = .high
@@ -193,8 +202,8 @@ enum MWatermarkRenderer {
         }
         context.restoreGState()
 
-        return blend(context: context, width: width, height: height,
-                     into: image, colorSpace: colorSpace, cctfEncoding: cctfEncoding)
+        blendInPlace(context: context, width: width, height: height,
+                     into: &image, colorSpace: colorSpace, cctfEncoding: cctfEncoding)
     }
 
     // MARK: 文本
@@ -268,18 +277,17 @@ enum MWatermarkRenderer {
 
     // MARK: 叠加
 
-    private static func blend(context: CGContext, width: Int, height: Int,
-                              into image: ImageRGB, colorSpace: String,
-                              cctfEncoding: Bool) -> ImageRGB {
-        guard let buffer = context.data else { return image }
+    private static func blendInPlace(context: CGContext, width: Int, height: Int,
+                                     into image: inout ImageRGB, colorSpace: String,
+                                     cctfEncoding: Bool) {
+        guard let buffer = context.data else { return }
         let pixels = buffer.bindMemory(to: UInt8.self, capacity: width * height * 4)
         let needsConversion = !(colorSpace == "sRGB" && cctfEncoding)
         let sRGBKind = ColorMath.cctfKind(for: "sRGB")
         let outKind = ColorMath.cctfKind(for: colorSpace)
         var cache: [UInt32: Vec3] = [:]
-        var output = image
 
-        output.data.withUnsafeMutableBufferPointer { destination in
+        image.data.withUnsafeMutableBufferPointer { destination in
             guard let dst = destination.baseAddress else { return }
             for index in 0..<(width * height) {
                 let alpha = Double(pixels[index * 4 + 3]) / 255.0
@@ -324,7 +332,6 @@ enum MWatermarkRenderer {
                 dst[target + 2] = Float(converted.z * alpha + Double(dst[target + 2]) * keep)
             }
         }
-        return output
     }
 }
 

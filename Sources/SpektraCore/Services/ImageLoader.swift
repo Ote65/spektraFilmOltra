@@ -84,10 +84,12 @@ enum ImageLoader {
                      rotationTurns: Int = 0,
                      allowEncoded: Bool = false,
                      rawTimeout: TimeInterval = 12,
-                     allowPreviewFallback: Bool = true) throws -> LoadedImage {
+                     allowPreviewFallback: Bool = true,
+                     bandRows: Int? = nil) throws -> LoadedImage {
         var loaded = try decode(url: url, maxSize: maxSize, rawOptions: rawOptions,
                                 allowEncoded: allowEncoded, rawTimeout: rawTimeout,
-                                allowPreviewFallback: allowPreviewFallback)
+                                allowPreviewFallback: allowPreviewFallback,
+                                bandRows: bandRows)
         let turns = ((rotationTurns % 4) + 4) % 4
         if turns != 0 {
             loaded.image = loaded.image.rotatedClockwise(turns)
@@ -119,7 +121,8 @@ enum ImageLoader {
                                rawOptions: RawDecoder.Options,
                                allowEncoded: Bool,
                                rawTimeout: TimeInterval,
-                               allowPreviewFallback: Bool) throws -> LoadedImage {
+                               allowPreviewFallback: Bool,
+                               bandRows: Int? = nil) throws -> LoadedImage {
         let detected = detectColorSpace(url: url)
         let suffix = url.pathExtension.lowercased()
         if !allowEncoded, rejectedSuffixes.contains(suffix) {
@@ -140,6 +143,7 @@ enum ImageLoader {
                 var options = rawOptions
                 options.outputColorSpace = detected.space
                 options.maxSize = maxSize
+                options.bandRows = bandRows
                 let image = try RawDecoder.decodeWithTimeout(
                     url: url, options: options, timeout: rawTimeout)
                 return LoadedImage(image: image, colorSpace: detected.space,

@@ -135,17 +135,29 @@ enum MLayout {
         #endif
     }
 
-    /// 横屏且画布放得下三栏时才分栏；接近手机竖屏比例的竖条窗口、
-    /// 以及台前调度那种挤不下左右轨的小横窗，一律退回 iPhone 的单列布局。
-    /// 判断只看当前真实窗口尺寸，不解析机型：分屏、台前调度、旋转都能自然切换。
+    /// 只看当前窗口的长宽谁大：宽>高就分栏，高>宽就单列。
+    /// 不读系统横竖屏状态（台前调度里 iPad 竖着也可能开横窗、横着也可能开竖窗），
+    /// 也不设尺寸门槛——分屏、台前调度、旋转都随窗口尺寸自然切换。
     /// `--force-split` 为截图验收用：在竖屏窗口上也强制走分栏版式。
     static func usesSplit(_ size: CGSize) -> Bool {
         if DebugLaunch.forceSplit { return true }
         let size = DebugLaunch.windowOverride ?? size
-        guard isPad, size.width > size.height * 1.02 else { return false }
-        // 左轨 + 右栏之外要给画布留出最小宽度，放不下就别硬分。
-        let canvas = size.width - inspectorWidth(for: size) - sideRailWidth(for: size)
-        return size.width >= 800 && size.height >= 640 && canvas >= 470
+        return isPad && size.width > size.height
+    }
+
+    /// 台前调度窗口最窄形状锁到 iPhone 竖屏比例（393:852）：
+    /// 窗口再往窄拖会挤压顶部按钮造成重叠，所以按当前窗口高度反推最小宽度。
+    /// 只加宽下限、不锁高度，横竖窗口都按同一条比例线约束。
+    private static var lastWidthFloor: CGFloat = -1
+    static func applyWindowWidthFloor(_ size: CGSize) {
+        guard isPad, size.height > 1 else { return }
+        let minWidth = size.height * (393.0 / 852.0)
+        guard abs(minWidth - lastWidthFloor) > 1 else { return }
+        lastWidthFloor = minWidth
+        guard #available(iOS 16.1, *) else { return }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        scene?.sizeRestrictions?.minimumSize = CGSize(width: minWidth, height: 0)
     }
 
     /// 分栏右栏宽度：随屏宽增长，但给画布留足空间。
@@ -158,13 +170,8 @@ enum MLayout {
         min(320, max(250, size.width * 0.21))
     }
 
-    /// 主页网格列数：按可用宽度决定，iPad 横屏不再固定两列。
-    /// 列数随窗口宽度渐进增减：窗口缩小时列数变少、卡片保持体量，
-    /// 而不是整排卡片被挤扁。iPhone 一律保持两列横幅卡片。
-    static func gridColumns(for width: CGFloat) -> Int {
-        guard isPad else { return 2 }
-        return max(1, min(5, Int((width - 28) / 190)))
-    }
+    /// 主页网格卡片的最小宽度：低于它就减少每行数量。iPhone 不用这个值。
+    static let gridMinCardWidth: CGFloat = 220
 }
 
 /// 真实屏幕度量：整屏尺寸 + 安全区。
@@ -174,15 +181,13 @@ enum MLayout {
 enum MScreenMetrics {
     static func current() -> MSafeInsets {
         #if os(iOS)
-        let window = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first(where: { $0.isKeyWindow })
-            ?? UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }
-                .flatMap { $0.windows }
-                .first
-        guard let window else { return .fallback }
+        // 台前调度 / 窗口化时，别的 Scene 或系统窗口也可能在主线程里，
+        // 必须锁到当前 App 所在的前台 Scene 的 keyWindow，否则会拿到整块虚拟画布。
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        guard let window = scene?.keyWindow ?? scene?.windows.first(where: { $0.isKeyWindow }) else {
+            return .fallback
+        }
         let insets = window.safeAreaInsets
         return MSafeInsets(top: insets.top, bottom: insets.bottom, size: window.bounds.size)
         #else
@@ -389,6 +394,9 @@ enum DebugLaunch {
 
     /// 验收用：直出成片页启动时展开片边面板。
     static var directBorderPanel: Bool { args.contains("--border-panel") }
+
+    /// 验收用：直出成片页启动后自动走一次「进入显影台」（配合 --direct-image）。
+    static var directDevelop: Bool { args.contains("--direct-develop") }
 
     /// 验收用：相机页启动时展开直出预设面板。
     static var directPicker: Bool { args.contains("--direct-picker") }

@@ -346,6 +346,8 @@ final class MobileEngine: ObservableObject {
             uniquingKeysWith: { first, _ in first }
         )
         let visible = scanned.filter { $0.included }
+        NSLog("MAssets scanned=%d visible=%d allowNonRaw=%d",
+              scanned.count, visible.count, allowNonRaw ? 1 : 0)
         for item in visible {
             phAssetByFilename[item.filename] = item.asset
         }
@@ -677,15 +679,22 @@ final class MobileEngine: ObservableObject {
     /// 点开一张还没入库的相册照片：取回原片（iCloud 上也允许下载）→ 入库。
     /// 返回可用的 photoID；失败返回 nil。
     func importAsset(assetID: String) async -> String? {
-        guard importingAssetID == nil else { return nil }
+        guard importingAssetID == nil else {
+            NSLog("MImport skip busy id=%@", assetID)
+            return nil
+        }
         if let existing = assets.first(where: { $0.id == assetID })?.photo {
             return existing.id
         }
         guard let asset = PHAsset.fetchAssets(
             withLocalIdentifiers: [assetID], options: nil
-        ).firstObject else { return nil }
+        ).firstObject else {
+            NSLog("MImport no phasset id=%@", assetID)
+            return nil
+        }
         guard let info = Self.displayResource(for: asset,
                                               allowNonRaw: MobileSettings.allowNonRaw) else {
+            NSLog("MImport no resource id=%@", assetID)
             return nil
         }
         let resource = info.resource
@@ -748,6 +757,7 @@ final class MobileEngine: ObservableObject {
 
         // 这张照片本来就来自系统相册，入库即可，不要再写回相册制造副本。
         let report = await importPhotos([named], publishToAlbum: false)
+        NSLog("MImport stored id=%@ firstID=%@", assetID, report.firstID ?? "nil")
         return report.firstID
     }
 

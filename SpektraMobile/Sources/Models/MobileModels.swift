@@ -627,6 +627,9 @@ struct MUserDevelopPreset: Identifiable, Codable, Hashable {
     var paperID: String
     var monochrome: Bool
     var pro: [String: MProValue]
+    /// 保存预设时的拍摄曝光基线；曝光补偿的 pro 值按「基线 + 调整量」解释。
+    /// 旧预设没有该字段，仍按绝对值套用，避免误加拍摄曝光。
+    var exposureBaselineEV: Double? = nil
     var schema: Int = 1
 }
 
@@ -738,6 +741,20 @@ struct MDirectSaveRequest {
 enum MDirectSaveOutcome {
     case saved(String)
     case denied
+    case failed(String)
+}
+
+/// 直出成片页「进入显影台」请求：把原始 DNG 入库，并沿用拍摄时选择的显影 / 调色预设。
+struct MDirectDevelopRequest {
+    let rawURL: URL
+    let renderedURL: URL
+    let edit: PhotoEdit
+    let grade: GradeRecipe
+    var baseline: PhotoEdit? = nil
+}
+
+enum MDirectDevelopOutcome {
+    case opened
     case failed(String)
 }
 

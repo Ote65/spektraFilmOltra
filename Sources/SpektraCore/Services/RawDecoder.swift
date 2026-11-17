@@ -18,6 +18,9 @@ enum RawDecoder {
         var lensCorrection: Bool = true
         /// 长边上限；nil 表示全分辨率。
         var maxSize: Int? = nil
+        /// 按行分带渲染：大图不再一次要一整张 RGBAf，峰值只跟带高有关。
+        /// 48 MP 下整图 RGBAf 约 780 MB，分 256 行后只要约 30 MB。
+        var bandRows: Int? = nil
         /// 草稿模式：跳过高质量去马赛克，模拟器上避免等待 MobileAsset 相机描述。
         var draftMode: Bool = false
     }
@@ -144,19 +147,25 @@ enum RawDecoder {
 
         let linearSRGB = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
             ?? CGColorSpaceCreateDeviceRGB()
-        var buffer = [Float](repeating: 0, count: width * height * 4)
         let context = CIContext(options: [.workingColorSpace: linearSRGB])
-        buffer.withUnsafeMutableBytes { raw in
-            context.render(
-                output, toBitmap: raw.baseAddress!, rowBytes: width * 4 * MemoryLayout<Float>.size,
-                bounds: extent, format: .RGBAf, colorSpace: linearSRGB
-            )
-        }
+        var image: ImageRGB
+        if let bandRows = options.bandRows, bandRows > 0, height > bandRows {
+            image = renderBanded(output, width: width, height: height, bandRows: bandRows,
+                                 context: context, colorSpace: linearSRGB)
+        } else {
+            var buffer = [Float](repeating: 0, count: width * height * 4)
+            buffer.withUnsafeMutableBytes { raw in
+                context.render(
+                    output, toBitmap: raw.baseAddress!, rowBytes: width * 4 * MemoryLayout<Float>.size,
+                    bounds: extent, format: .RGBAf, colorSpace: linearSRGB
+                )
+            }
 
-        // 直接从 RGBAf 收成 RGB Float，随后立刻释放 RGBA 缓冲；
-        // 34 MP 下比旧实现（RGBAf + Double RGB + Float RGB 三份并存）少约 1.3 GB。
-        var image = ImageRGB(width: width, height: height, rgbaFloat: buffer)
-        buffer = []
+            // 直接从 RGBAf 收成 RGB Float，随后立刻释放 RGBA 缓冲；
+            // 34 MP 下比旧实现（RGBAf + Double RGB + Float RGB 三份并存）少约 1.3 GB。
+            image = ImageRGB(width: width, height: height, rgbaFloat: buffer)
+            buffer = []
+        }
         if options.outputColorSpace != "sRGB" {
             let target = options.outputColorSpace
             image.mapInPlace { pixel in
@@ -174,6 +183,53 @@ enum RawDecoder {
             }
         }
         image.sanitizeNonFinite()
+        return image
+    }
+
+    /// 按行分带渲染进整图。
+    ///
+    /// Core Image 的坐标原点在左下角，而 `ImageRGB` 的第 0 行是画面顶部：
+    /// 顶部第 `top` 行对应 CI 的 `height - top - rows`。整图缓冲只分配一次，
+    /// 每条带的 RGBAf 缓冲渲染完立刻释放，峰值 = 整图 RGB + 一条带。
+    private static func renderBanded(
+        _ output: CIImage, width: Int, height: Int, bandRows: Int,
+        context: CIContext, colorSpace: CGColorSpace
+    ) -> ImageRGB {
+        var image = ImageRGB(width: width, height: height)
+        let rows = max(16, bandRows)
+        var top = 0
+        while top < height {
+            let bandHeight = min(rows, height - top)
+            let rect = CGRect(x: 0, y: height - top - bandHeight,
+                              width: width, height: bandHeight)
+            let band = output.cropped(to: rect)
+            var buffer = [Float](repeating: 0, count: width * bandHeight * 4)
+            buffer.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                context.render(
+                    band, toBitmap: base,
+                    rowBytes: width * 4 * MemoryLayout<Float>.size,
+                    bounds: rect, format: .RGBAf, colorSpace: colorSpace
+                )
+            }
+            image.data.withUnsafeMutableBufferPointer { destination in
+                guard let dst = destination.baseAddress else { return }
+                buffer.withUnsafeBufferPointer { source in
+                    guard let src = source.baseAddress else { return }
+                    var srcIndex = 0
+                    var dstIndex = top * width * 3
+                    for _ in 0..<(width * bandHeight) {
+                        dst[dstIndex] = src[srcIndex]
+                        dst[dstIndex + 1] = src[srcIndex + 1]
+                        dst[dstIndex + 2] = src[srcIndex + 2]
+                        srcIndex += 4
+                        dstIndex += 3
+                    }
+                }
+            }
+            buffer = []
+            top += bandHeight
+        }
         return image
     }
 

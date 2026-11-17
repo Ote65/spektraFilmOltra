@@ -76,6 +76,9 @@ struct MobileRootView: View {
                              },
                              onDirectSave: { request in
                                  await saveDirect(request)
+                             },
+                             onDirectDevelop: { request in
+                                 await openDirectDevelop(request)
                              })
                     .transition(.opacity)
                     .zIndex(3)
@@ -187,13 +190,17 @@ struct MobileRootView: View {
             guard abs(size.width - metrics.width) > 1 || abs(size.height - metrics.height) > 1 else { return }
             let current = MScreenMetrics.current()
             metrics = MSafeInsets(top: current.top, bottom: current.bottom, size: size)
+            MLayout.applyWindowWidthFloor(size)
         }
         .task {
             guard !debugOpened else { return }
             debugOpened = true
-            // 窗口就绪后再取真实安全区：此时 UIWindow 已经完成第一次布局。
+            // 窗口尺寸只认 GeometryReader 实测：台前调度 / 窗口化时
+            // UIWindow.bounds 可能是整块虚拟画布，拿它排网格会把列数算错。
             let current = MScreenMetrics.current()
-            if current != metrics { metrics = current }
+            if current.top != metrics.top || current.bottom != metrics.bottom {
+                metrics = MSafeInsets(top: current.top, bottom: current.bottom, size: metrics.size)
+            }
             if DebugLaunch.probeGeometry {
                 let housing = MDeviceHousing.resolved(housingSetting)
                 let opening = MDeviceHousing.opening(kind: housing, insets: current)
@@ -357,12 +364,37 @@ struct MobileRootView: View {
         return .saved("已保存原图与成片")
     }
 
+    /// 直出成片页「进入显影台」：原片入库后写回拍摄时的显影 / 调色参数，再打开显影台。
+    @MainActor
+    private func openDirectDevelop(_ request: MDirectDevelopRequest) async -> MDirectDevelopOutcome {
+        let report = await engine.importPhotos([request.rawURL], publishToAlbum: true,
+                                               generateThumbnails: false)
+        guard let photoID = report.firstID else {
+            return .failed(report.reason.isEmpty ? "原片没能入库" : report.reason)
+        }
+        await engine.applyDirectResult(
+            photoID: photoID,
+            edit: request.edit,
+            grade: request.grade,
+            baseline: request.baseline,
+            renderedURL: request.renderedURL
+        )
+        openDevelop(photoID)
+        return .opened
+    }
+
     private func openDevelop(_ photoID: String) {
         engine.closeGrade()
         resetFlight()
         grade = nil
+        // 会话建不出来时不要切 screen：否则主页会被关闭命中测试，
+        // 看起来就是整页点不动。
+        guard let session = engine.openDevelop(photoID: photoID) else {
+            NSLog("MOpen develop session nil id=%@", photoID)
+            return
+        }
         withAnimation(MMotion.push) {
-            develop = engine.openDevelop(photoID: photoID)
+            develop = session
             screen = .develop
         }
     }
@@ -388,10 +420,11 @@ struct MobileRootView: View {
     }
 
     private func openGrade(_ photoID: String, entry: MGradeEntry, returningTo target: MScreen) {
+        guard let session = engine.openGrade(photoID: photoID, entry: entry) else { return }
         withAnimation(MMotion.push) {
             gradeEntry = entry
             gradeReturn = target
-            grade = engine.openGrade(photoID: photoID, entry: entry)
+            grade = session
             screen = .grade
         }
     }

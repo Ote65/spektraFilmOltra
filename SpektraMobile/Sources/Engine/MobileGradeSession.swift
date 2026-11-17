@@ -741,7 +741,12 @@ final class MobileGradeSession: ObservableObject {
                     GradeEngine.prepareSourceInPlace(&linear)
                     var warped = geometry.apply(to: linear)
                     linear = ImageRGB(width: 0, height: 0)
-                    var rendered = try GradeEngine.renderInPlace(&warped, recipe: recipe)
+                    // 大图分带调色：48 MP 的整图 Double 工作缓冲是 1.17 GB。
+                    let bandedGrade = plan.tiled || max(warped.width, warped.height) >= 4096
+                    var rendered = bandedGrade
+                        ? try GradeEngine.renderTiledInPlace(
+                            &warped, recipe: recipe, bandRows: 256)
+                        : try GradeEngine.renderInPlace(&warped, recipe: recipe)
                     if let lutError = rendered.lutError { throw lutError }
                     var output = rendered.image
                     // 把 result 里的引用也清掉，convertForExport 原地写回时才是唯一所有权。
@@ -753,8 +758,8 @@ final class MobileGradeSession: ObservableObject {
                         var config = watermark
                         // 导出面板的勾选是这次导出的最终决定，覆盖设置里的启用位。
                         config.enabled = true
-                        output = MWatermarkRenderer.composite(
-                            image: output, config: config,
+                        MWatermarkRenderer.compositeInPlace(
+                            &output, config: config,
                             colorSpace: targetSpace, cctfEncoding: targetCCTF
                         )
                     }

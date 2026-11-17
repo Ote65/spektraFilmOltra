@@ -22,6 +22,8 @@ struct CameraScreen: View {
     let onCaptured: (URL, Bool, MCameraCaptureMeta) -> Void
     /// 直出保存：根视图决定是否保留 RAW 工程，并写系统相册。
     let onDirectSave: (MDirectSaveRequest) async -> MDirectSaveOutcome
+    /// 直出成片页进入显影台：原片入库，并沿用拍摄时选择的显影 / 调色预设。
+    let onDirectDevelop: (MDirectDevelopRequest) async -> MDirectDevelopOutcome
 
     @StateObject private var camera = MCameraSession()
     @StateObject private var level = MLevelMonitor()
@@ -55,6 +57,8 @@ struct CameraScreen: View {
     /// 快速控制基线（拍摄曝光）；保存原图时写进库记录。
     @State private var directBaseline: PhotoEdit?
     @State private var directSaving = false
+    /// 正在把原片入库并打开显影台：按钮显示进度，避免重复点击。
+    @State private var directOpeningDevelop = false
     @State private var directToken = 0
     /// 取消令牌：关闭相机 / 重拍时立刻停止后台显影，避免继续占用内存与 CPU。
     @State private var directCancel: MDirectRenderToken?
@@ -1201,69 +1205,97 @@ struct CameraScreen: View {
                             .frame(height: 52)
 
                         case .ready(let result):
-                            HStack(spacing: 8) {
-                                Button {
-                                    MHaptic.light()
-                                    retakeDirect(result)
-                                } label: {
-                                    Text("重拍")
-                                        .font(.mSans(11, .medium))
-                                        .foregroundStyle(MColor.text1)
+                            VStack(spacing: 8) {
+                                HStack(spacing: 8) {
+                                    Button {
+                                        MHaptic.light()
+                                        retakeDirect(result)
+                                    } label: {
+                                        Text("重拍")
+                                            .font(.mSans(11, .medium))
+                                            .foregroundStyle(MColor.text1)
+                                            .frame(maxWidth: .infinity)
+                                            .frame(height: 44)
+                                            .background(
+                                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                    .fill(Color.white.opacity(0.1))
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(directSaving || directOpeningDevelop)
+
+                                    // 显影完成后仍然可以改片边：只重合成预览与成片，不再跑显影。
+                                    Button {
+                                        MHaptic.tick()
+                                        withAnimation(Self.directBorderSpring) { directBorderOpen = true }
+                                    } label: {
+                                        VStack(spacing: 1) {
+                                            Image(systemName: "square.dashed")
+                                                .font(.system(size: 12, weight: .medium))
+                                            Text(directBorder.enabled ? directBorderName : "片边")
+                                                .font(.mSans(8.5, .medium))
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.8)
+                                        }
+                                        .foregroundStyle(MColor.brassHigh)
                                         .frame(maxWidth: .infinity)
                                         .frame(height: 44)
                                         .background(
                                             RoundedRectangle(cornerRadius: 9, style: .continuous)
                                                 .fill(Color.white.opacity(0.1))
                                         )
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(directSaving)
-
-                                // 显影完成后仍然可以改片边：只重合成预览与成片，不再跑显影。
-                                Button {
-                                    MHaptic.tick()
-                                    withAnimation(Self.directBorderSpring) { directBorderOpen = true }
-                                } label: {
-                                    VStack(spacing: 1) {
-                                        Image(systemName: "square.dashed")
-                                            .font(.system(size: 12, weight: .medium))
-                                        Text(directBorder.enabled ? directBorderName : "片边")
-                                            .font(.mSans(8.5, .medium))
-                                            .lineLimit(1)
-                                            .minimumScaleFactor(0.8)
                                     }
-                                    .foregroundStyle(MColor.brassHigh)
+                                    .buttonStyle(.plain)
+                                    .disabled(directSaving || directOpeningDevelop)
+
+                                    Button {
+                                        MHaptic.light()
+                                        saveDirectResult(result)
+                                    } label: {
+                                        Group {
+                                            if directSaving {
+                                                ProgressView().controlSize(.small).tint(MColor.brassInk)
+                                            } else {
+                                                Text("保存").font(.mSans(11, .semibold))
+                                            }
+                                        }
+                                        .foregroundStyle(MColor.brassInk)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: 44)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                .fill(MColor.brass)
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(directSaving || directOpeningDevelop)
+                                }
+
+                                // 原片带拍摄时的显影 / 调色预设进显影台，不经过这张直出成片。
+                                Button {
+                                    MHaptic.light()
+                                    openDirectDevelop(result)
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        if directOpeningDevelop {
+                                            ProgressView().controlSize(.small).tint(MColor.text1)
+                                        } else {
+                                            Image(systemName: "slider.horizontal.3")
+                                                .font(.system(size: 11, weight: .medium))
+                                            Text("进入显影台")
+                                                .font(.mSans(11, .medium))
+                                        }
+                                    }
+                                    .foregroundStyle(MColor.text1)
                                     .frame(maxWidth: .infinity)
-                                    .frame(height: 44)
+                                    .frame(height: 40)
                                     .background(
                                         RoundedRectangle(cornerRadius: 9, style: .continuous)
                                             .fill(Color.white.opacity(0.1))
                                     )
                                 }
                                 .buttonStyle(.plain)
-                                .disabled(directSaving)
-
-                                Button {
-                                    MHaptic.light()
-                                    saveDirectResult(result)
-                                } label: {
-                                    Group {
-                                        if directSaving {
-                                            ProgressView().controlSize(.small).tint(MColor.brassInk)
-                                        } else {
-                                            Text("保存").font(.mSans(11, .semibold))
-                                        }
-                                    }
-                                    .foregroundStyle(MColor.brassInk)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 44)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                            .fill(MColor.brass)
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(directSaving)
+                                .disabled(directSaving || directOpeningDevelop)
                             }
                             .frame(width: 300)
 
@@ -1379,10 +1411,26 @@ struct CameraScreen: View {
         directPhoto = MImage.make(cgImage: cg)
         directPreviewCG = cg
         directCard = .ready(MDirectRenderResult(url: url, preview: cg, clampedEdge: nil))
+        // 验收「进入显影台」时也要有可入库的原片与拍摄预设。
+        directRawURL = url
+        directBaseline = MDirectRenderer.makeBaseline(meta: MCameraCaptureMeta())
+        let user = selectedDevelopUser
+        directEdit = MDirectRenderer.makeEdit(builtin: user == nil ? selectedDevelopBuiltin : nil, user: user)
+        if let gradePreset = selectedGradePreset {
+            var ui = MGradeRecipe()
+            let groups = gradePreset.appliedGroups
+            ui.merge(gradePreset.recipe, groups: groups)
+            directRecipe = ui.gradeRecipe(lutPath: groups.contains(.lut) ? gradePreset.recipe.lut.path : "")
+        }
         refreshDirectBorderPreview()
         if DebugLaunch.directBorderPanel {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 withAnimation(Self.directBorderSpring) { directBorderOpen = true }
+            }
+        }
+        if DebugLaunch.directDevelop, case .ready(let result) = directCard {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                openDirectDevelop(result)
             }
         }
     }
@@ -1484,7 +1532,7 @@ struct CameraScreen: View {
     }
 
     private func retakeDirect(_ result: MDirectRenderResult?) {
-        guard !directSaving else { return }
+        guard !directSaving, !directOpeningDevelop else { return }
         directCancel?.cancel()
         directCancel = nil
         directToken += 1
@@ -1517,7 +1565,7 @@ struct CameraScreen: View {
     }
 
     private func cancelDirectAndClose() {
-        guard !directSaving else { return }
+        guard !directSaving, !directOpeningDevelop else { return }
         directCancel?.cancel()
         directCancel = nil
         directToken += 1
@@ -1531,7 +1579,7 @@ struct CameraScreen: View {
     }
 
     private func saveDirectResult(_ result: MDirectRenderResult) {
-        guard !directSaving,
+        guard !directSaving, !directOpeningDevelop,
               let raw = directRawURL,
               let edit = directEdit,
               let recipe = directRecipe else { return }
@@ -1562,6 +1610,27 @@ struct CameraScreen: View {
                 case .denied:
                     showHint("无法写入相册，请在设置中允许访问")
                 case .failed(let message):
+                    showHint(message)
+                }
+            }
+        }
+    }
+
+    /// 直出成片页「进入显影台」：原片入库，并沿用拍摄时选择的显影 / 调色预设。
+    private func openDirectDevelop(_ result: MDirectRenderResult) {
+        guard !directSaving, !directOpeningDevelop,
+              let raw = directRawURL,
+              let edit = directEdit,
+              let recipe = directRecipe else { return }
+        directOpeningDevelop = true
+        let request = MDirectDevelopRequest(
+            rawURL: raw, renderedURL: result.url, edit: edit, grade: recipe,
+            baseline: directBaseline)
+        Task {
+            let outcome = await onDirectDevelop(request)
+            await MainActor.run {
+                directOpeningDevelop = false
+                if case .failed(let message) = outcome {
                     showHint(message)
                 }
             }

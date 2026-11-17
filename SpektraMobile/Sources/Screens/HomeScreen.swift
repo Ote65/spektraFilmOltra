@@ -382,11 +382,22 @@ struct HomeScreen: View {
 
     // MARK: - 网格
 
+    /// iPad 用自适应列：由容器真实宽度决定，卡片保持最小宽度，
+    /// 窗口变窄时自动减少每行数量（台前调度 / 分屏都不会被挤小）。
+    /// iPhone 保持两列横幅卡片。
+    private var gridColumns: [GridItem] {
+        if MLayout.isPad {
+            return [GridItem(.adaptive(minimum: MLayout.gridMinCardWidth), spacing: 12, alignment: .top)]
+        }
+        return [
+            GridItem(.flexible(), spacing: 12),
+            GridItem(.flexible(), spacing: 12)
+        ]
+    }
+
     private var photoGrid: some View {
         LazyVGrid(
-            columns: (0..<MLayout.gridColumns(for: insets.width)).map { _ in
-                GridItem(.flexible(), spacing: 12)
-            },
+            columns: gridColumns,
             alignment: .leading,
             spacing: 18
         ) {
@@ -1051,6 +1062,8 @@ struct HomeScreen: View {
 
     /// 点开一张照片：已入库直接进显影台，未入库先取回原片再进。
     private func open(_ asset: MLibraryAsset) {
+        NSLog("MOpen tap id=%@ photo=%d ph=%d",
+              asset.id, asset.photo == nil ? 0 : 1, asset.phAsset == nil ? 0 : 1)
         if let photo = asset.photo {
             onOpenDevelop(photo)
             return
@@ -1332,12 +1345,14 @@ private struct MAssetThumb: View {
             return
         }
         let options = PHImageRequestOptions()
-        options.deliveryMode = .highQualityFormat
+        // 网格只需要缩略图：用 fastFormat 走系统内嵌预览，避免对整库
+        // 大图做高质量解码把主线程和 CPU 拖死（iPad 一屏可见几十格）。
+        options.deliveryMode = .fastFormat
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         requestID = PHImageManager.default().requestImage(
             for: asset,
-            targetSize: CGSize(width: 360, height: 360),
+            targetSize: CGSize(width: 480, height: 480),
             contentMode: .aspectFill,
             options: options
         ) { result, info in
@@ -1348,7 +1363,7 @@ private struct MAssetThumb: View {
                 image = result
                 if !degraded {
                     MAssetThumbCache.shared.setObject(
-                        result, forKey: key, cost: 360 * 360 * 4)
+                        result, forKey: key, cost: 480 * 480 * 4)
                 }
             }
         }
