@@ -150,11 +150,12 @@ enum GradeEngine {
                                   analyze: analyze, shouldCancel: shouldCancel)
     }
 
-    /// 分带调色：整图只保留 Float 成品，工作缓冲按带分配。
+    /// 分带调色：整图只保留 Float 成品，工作缓冲按带分配，带与带并行跑。
     ///
     /// 48 MP 的整图 Double 工作缓冲是 1.17 GB，加辅助 Float 图会到 1.6 GB，
     /// 6 GB 机型直接被 jetsam；这里改成逐带读 Double、逐带写回 Float，
-    /// 峰值 = 整图 Float + 一条带（含重叠行）。
+    /// 峰值 = 整图 Float + 并发带。带间完全独立（颗粒按带号播种、halo 重叠
+    /// 只读未处理的源图），所以直接并发，默认最多 3 条带同时在算。
     /// 局部滤镜按整图短边算半径，靠 `halo` 行重叠保证带与带之间没有接缝；
     /// 暗角 / 色差 / 颗粒用绝对行号，避免每条带各自重新居中。
     @discardableResult
@@ -162,6 +163,7 @@ enum GradeEngine {
         _ image: inout ImageRGB,
         recipe: GradeRecipe,
         bandRows: Int = 512,
+        maxConcurrentBands: Int = 3,
         shouldCancel: (() -> Bool)? = nil
     ) throws -> GradeRenderResult {
         guard image.width > 0, image.height > 0 else {
@@ -181,68 +183,84 @@ enum GradeEngine {
         let source = image
         var output = ImageRGB(width: width, height: height)
 
-        var top = 0
-        var bandIndex = 0
-        while top < height {
-            if shouldCancel?() == true { throw GradeCancelled.cancelled }
-            let coreRows = min(rows, height - top)
-            let bandTop = max(0, top - halo)
-            let bandBottom = min(height, top + coreRows + halo)
-            let bandHeight = bandBottom - bandTop
-            let count = width * bandHeight
-            var data = [Double](repeating: 0, count: count * 3)
-            source.data.withUnsafeBufferPointer { raw in
-                data.withUnsafeMutableBufferPointer { destination in
-                    guard let src = raw.baseAddress, let dst = destination.baseAddress else { return }
-                    let start = bandTop * width * 3
-                    for i in 0..<(count * 3) { dst[i] = Double(src[start + i]) }
-                }
-            }
+        let bandCount = (height + rows - 1) / rows
+        let state = GradeBandState()
+        let slots = DispatchSemaphore(value: max(1, min(maxConcurrentBands, bandCount)))
+        let queue = DispatchQueue(label: "spektra.grade.bands", attributes: .concurrent)
+        let group = DispatchGroup()
+        // 指针只在 withUnsafe… 作用域内有效：提交与等待都写在作用域内部，
+        // 数组在整个并发段里没有结构变更，基址稳定，各带只写互不重叠的行段。
+        source.data.withUnsafeBufferPointer { srcRaw in
+            output.data.withUnsafeMutableBufferPointer { dstRaw in
+                guard let src = srcRaw.baseAddress, let dst = dstRaw.baseAddress else { return }
+                for bandIndex in 0..<bandCount {
+                    if state.cancelled { break }
+                    group.enter()
+                    slots.wait()
+                    queue.async {
+                        defer { slots.signal(); group.leave() }
+                        if state.cancelled { return }
+                        if shouldCancel?() == true { state.markCancelled(); return }
+                        let top = bandIndex * rows
+                        let coreRows = min(rows, height - top)
+                        let bandTop = max(0, top - halo)
+                        let bandBottom = min(height, top + coreRows + halo)
+                        let bandHeight = bandBottom - bandTop
+                        let count = width * bandHeight
+                        var data = [Double](repeating: 0, count: count * 3)
+                        data.withUnsafeMutableBufferPointer { destination in
+                            guard let out = destination.baseAddress else { return }
+                            let start = bandTop * width * 3
+                            for i in 0..<(count * 3) { out[i] = Double(src[start + i]) }
+                        }
 
-            applyExposureWB(&data, count: count,
-                            exposure: recipe.light.exposure,
-                            temperature: recipe.color.temperature,
-                            tint: recipe.color.tint)
-            srgbEncode(&data, count: count)
-            applyTone(&data, width: width, height: bandHeight, light: recipe.light)
-            applyColor(&data, count: count, color: recipe.color)
-            applyTransparency(&data, count: count, recipe: recipe.transparency, analysis: analysis)
-            applyClarityStructure(&data, width: width, height: bandHeight,
-                                  quality: recipe.quality, fullShortEdge: fullShortEdge)
-            applyDehaze(&data, width: width, height: bandHeight,
-                        amount: recipe.quality.dehaze, fullShortEdge: fullShortEdge,
-                        airlight: airlight)
-            applyNoiseReduction(&data, width: width, height: bandHeight,
-                                quality: recipe.quality, fullShortEdge: fullShortEdge)
-            applySharpening(&data, width: width, height: bandHeight,
-                            quality: recipe.quality, fullShortEdge: fullShortEdge)
-            applyOptics(&data, width: width, height: bandHeight,
-                        optics: recipe.optics,
-                        rowOffset: bandTop, fullHeight: height,
-                        fullShortEdge: fullShortEdge,
-                        seed: 20240101 &+ UInt64(bandIndex &* 7919),
-                        banded: true)
-            let lutError = applyLUT(&data, count: count, path: recipe.lut.path,
-                                    strength: recipe.lut.strength)
-            postprocess(&data)
-            if lutError != nil {
-                image = ImageRGB(width: 0, height: 0)
-                return GradeRenderResult(image: ImageRGB(width: 0, height: 0),
-                                         analysis: analysis, lutError: lutError)
-            }
+                        applyExposureWB(&data, count: count,
+                                        exposure: recipe.light.exposure,
+                                        temperature: recipe.color.temperature,
+                                        tint: recipe.color.tint)
+                        srgbEncode(&data, count: count)
+                        applyTone(&data, width: width, height: bandHeight, light: recipe.light)
+                        applyColor(&data, count: count, color: recipe.color)
+                        applyTransparency(&data, count: count, recipe: recipe.transparency,
+                                          analysis: analysis)
+                        applyClarityStructure(&data, width: width, height: bandHeight,
+                                              quality: recipe.quality, fullShortEdge: fullShortEdge)
+                        applyDehaze(&data, width: width, height: bandHeight,
+                                    amount: recipe.quality.dehaze, fullShortEdge: fullShortEdge,
+                                    airlight: airlight)
+                        applyNoiseReduction(&data, width: width, height: bandHeight,
+                                            quality: recipe.quality, fullShortEdge: fullShortEdge)
+                        applySharpening(&data, width: width, height: bandHeight,
+                                        quality: recipe.quality, fullShortEdge: fullShortEdge)
+                        applyOptics(&data, width: width, height: bandHeight,
+                                    optics: recipe.optics,
+                                    rowOffset: bandTop, fullHeight: height,
+                                    fullShortEdge: fullShortEdge,
+                                    seed: 20240101 &+ UInt64(bandIndex &* 7919),
+                                    banded: true)
+                        let lutError = applyLUT(&data, count: count, path: recipe.lut.path,
+                                                strength: recipe.lut.strength)
+                        postprocess(&data)
+                        if let lutError { state.recordLUTError(lutError); return }
 
-            let coreStart = top - bandTop
-            output.data.withUnsafeMutableBufferPointer { destination in
-                data.withUnsafeBufferPointer { band in
-                    guard let dst = destination.baseAddress, let src = band.baseAddress else { return }
-                    let rowsToCopy = coreRows * width * 3
-                    let srcOffset = coreStart * width * 3
-                    let dstOffset = top * width * 3
-                    for i in 0..<rowsToCopy { dst[dstOffset + i] = Float(src[srcOffset + i]) }
+                        let coreStart = top - bandTop
+                        data.withUnsafeBufferPointer { band in
+                            guard let bandBase = band.baseAddress else { return }
+                            let rowsToCopy = coreRows * width * 3
+                            let srcOffset = coreStart * width * 3
+                            let dstOffset = top * width * 3
+                            for i in 0..<rowsToCopy { dst[dstOffset + i] = Float(band[srcOffset + i]) }
+                        }
+                    }
                 }
+                group.wait()
             }
-            top += coreRows
-            bandIndex += 1
+        }
+        if state.cancelled { throw GradeCancelled.cancelled }
+        if let lutError = state.lutError {
+            image = ImageRGB(width: 0, height: 0)
+            return GradeRenderResult(image: ImageRGB(width: 0, height: 0),
+                                     analysis: analysis, lutError: lutError)
         }
         image = ImageRGB(width: 0, height: 0)
         return GradeRenderResult(image: output, analysis: analysis)
@@ -1452,5 +1470,37 @@ enum GradeEngine {
             }
         }
         return nil
+    }
+}
+
+/// 分带并行的共享状态：取消标记与首个 LUT 错误，用锁保护。
+/// 带与带只写互不重叠的行段，像素本身不需要加锁；这里只收敛跨带共享的控制信号。
+private final class GradeBandState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _cancelled = false
+    private var _lutError: LUTParseError?
+
+    var cancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _cancelled
+    }
+
+    func markCancelled() {
+        lock.lock()
+        _cancelled = true
+        lock.unlock()
+    }
+
+    func recordLUTError(_ error: LUTParseError) {
+        lock.lock()
+        if _lutError == nil { _lutError = error }
+        lock.unlock()
+    }
+
+    var lutError: LUTParseError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lutError
     }
 }
