@@ -164,7 +164,8 @@ enum GradeEngine {
         recipe: GradeRecipe,
         bandRows: Int = 512,
         maxConcurrentBands: Int = 3,
-        shouldCancel: (() -> Bool)? = nil
+        shouldCancel: (() -> Bool)? = nil,
+        onProgress: ((Double) -> Void)? = nil
     ) throws -> GradeRenderResult {
         guard image.width > 0, image.height > 0 else {
             return GradeRenderResult(image: image, analysis: .neutral)
@@ -250,6 +251,9 @@ enum GradeEngine {
                             let srcOffset = coreStart * width * 3
                             let dstOffset = top * width * 3
                             for i in 0..<rowsToCopy { dst[dstOffset + i] = Float(band[srcOffset + i]) }
+                        }
+                        if let onProgress {
+                            onProgress(Double(state.noteBandDone()) / Double(bandCount))
                         }
                     }
                 }
@@ -1502,5 +1506,15 @@ private final class GradeBandState: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return _lutError
+    }
+
+    /// 每带写回后自增，返回新的完成数：驱动真实进度。
+    private var bandsDone = 0
+    func noteBandDone() -> Int {
+        lock.lock()
+        bandsDone += 1
+        let value = bandsDone
+        lock.unlock()
+        return value
     }
 }

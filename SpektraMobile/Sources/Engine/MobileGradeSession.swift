@@ -34,6 +34,9 @@ final class MobileGradeSession: ObservableObject {
     @Published private(set) var phaseProgress: Double = 0
     /// 导出独立文案，避免被「调色代理 / 调色精修」这类预览阶段覆盖。
     @Published private(set) var exportLabel = ""
+    /// 导出渲染进度 0...1：交接 0.3、调色按带完成数 0.3–0.85、
+    /// 转换 / 水印 / 片边 / 编码收尾到 1.0。导出面板用它驱动百分比动画。
+    @Published private(set) var exportProgress: Double = 0
     @Published private(set) var errorMessage: String?
     /// 交接图生成失败的用户可读原因；非 nil 且 sourceReady == false 时界面展示失败态与重试。
     @Published private(set) var sourceFailure: String?
@@ -721,6 +724,7 @@ final class MobileGradeSession: ObservableObject {
         phaseLabel = "导出调色"
         exportLabel = exportNote
         phaseProgress = 0
+        exportProgress = 0
         handoff(maxEdge: edge, tiled: plan.tiled, bandPixelBudget: plan.bandPixelBudget) { [weak self] image in
             guard let self else { return }
             guard var image else {
@@ -733,6 +737,14 @@ final class MobileGradeSession: ObservableObject {
             }
             let exportPhotoID = self.photoID
             self.gradeQueue.async {
+                // 进度只前进不回退，且必须带 exportToken 守卫：
+                // 迟到的旧导出进度不能覆盖新导出。
+                func setProgress(_ value: Double) {
+                    Task { @MainActor [weak self] in
+                        guard let self, self.exportToken == current else { return }
+                        if value > self.exportProgress { self.exportProgress = value }
+                    }
+                }
                 do {
                     // 交接图只在 prepare 阶段用一次；原地转换后立刻释放引用，
                     // 34 MP 下能省掉一整张 400 MB 的 COW 副本。
@@ -741,18 +753,22 @@ final class MobileGradeSession: ObservableObject {
                     GradeEngine.prepareSourceInPlace(&linear)
                     var warped = geometry.apply(to: linear)
                     linear = ImageRGB(width: 0, height: 0)
+                    setProgress(0.3)
                     // 大图分带调色：48 MP 的整图 Double 工作缓冲是 1.17 GB。
                     // 决策与直出共用 ExportEdge.Plan，避免两条链路分叉。
                     let bandedGrade = plan.usesBandedGrade
                     var rendered = bandedGrade
                         ? try GradeEngine.renderTiledInPlace(
-                            &warped, recipe: recipe, bandRows: 256)
+                            &warped, recipe: recipe, bandRows: 256,
+                            onProgress: { fraction in setProgress(0.3 + 0.55 * fraction) })
                         : try GradeEngine.renderInPlace(&warped, recipe: recipe)
+                    if !bandedGrade { setProgress(0.85) }
                     if let lutError = rendered.lutError { throw lutError }
                     var output = rendered.image
                     // 把 result 里的引用也清掉，convertForExport 原地写回时才是唯一所有权。
                     rendered.image = ImageRGB(width: 0, height: 0)
                     Self.convertForExport(&output, colorSpace: targetSpace, cctfEncoding: targetCCTF)
+                    setProgress(0.88)
                     // 水印属于照片本身：先压进画面，再合成片边，避免盖到片基与边字上。
                     if watermarkEnabled {
                         Task { @MainActor in self.exportLabel = "合成水印" }
@@ -763,6 +779,7 @@ final class MobileGradeSession: ObservableObject {
                             &output, config: config,
                             colorSpace: targetSpace, cctfEncoding: targetCCTF
                         )
+                        setProgress(0.92)
                     }
                     if borderConfig.enabled {
                         Task { @MainActor in self.exportLabel = "合成片边" }
@@ -772,6 +789,7 @@ final class MobileGradeSession: ObservableObject {
                             colorSpace: targetSpace, cctfEncoding: targetCCTF,
                             dateLabel: dateLabel, timeLabel: timeLabel
                         )
+                        setProgress(0.95)
                     }
                     try FileManager.default.createDirectory(
                         at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -783,6 +801,7 @@ final class MobileGradeSession: ObservableObject {
                         self.isExporting = false
                         self.exportLabel = ""
                         self.phaseProgress = 0
+                        self.exportProgress = 1
                         self.lastSavedURL = destination
                         completion(.success(destination))
                     }

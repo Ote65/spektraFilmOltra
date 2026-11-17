@@ -3,10 +3,13 @@ import SwiftUI
 // MARK: - 导出面板
 
 /// 导出面板：居中浮卡、四个圆角、无顶部横条。
-/// 选项按参考图排成「标签 + 下拉行」；保存动画只走「转圈 → 对勾」两拍，不显示进度条。
+/// 选项按参考图排成「标签 + 下拉行」；保存动画走「百分比 → 对勾」两拍。
+/// 传入 `progress` 时进行中显示滚动的 N%；不传（显影台）保持系统转圈。
 struct MExportSheet: View {
     let filename: String
     let phaseLabel: String
+    /// 渲染进度 0...1；nil 表示调用方没有进度数据，退回转圈。
+    var progress: Double? = nil
     /// 原图真实长边，用于「最大可用尺寸」的具体像素数。
     var originalLongEdge: Int = 0
     /// 原片还没读完时不能导出：`session.export` 会以 `.busy` 立刻失败。
@@ -31,8 +34,6 @@ struct MExportSheet: View {
     @State private var watermarkAvailable = MWatermarkStore.load().enabled
     @State private var showMore = false
     @State private var phase: MExportPhase = .idle
-    /// 完成对勾的入场动画开关。
-    @State private var donePop = false
     @Environment(\.mSafeInsets) private var insets
 
     private enum MExportPhase {
@@ -397,34 +398,46 @@ struct MExportSheet: View {
         }
     }
 
-    /// 保存动画只走两拍：转圈 → 对勾。不放进度条，也不再展开选项行。
+    /// 保存动画只走两拍：滚动的 N% → 白色对勾。不放进度条，也不再展开选项行。
+    /// 百分比用系统 numericText 内容转场：数字上下滚动渐隐渐显，曲线非线性；
+    /// 对勾不再垫黄铜圆底，用 SF Symbols 原生 bounce 入场。
     private var statusBlock: some View {
         Group {
             switch phase {
             case .exporting:
-                ProgressView()
-                    .tint(MColor.text2)
-                    .scaleEffect(1.15)
-                    .transition(.opacity.combined(with: .scale(0.7)))
+                if let progress {
+                    rollingPercent(progress)
+                } else {
+                    ProgressView()
+                        .tint(MColor.text2)
+                        .scaleEffect(1.15)
+                        .transition(.opacity.combined(with: .scale(0.7)))
+                }
             case .done:
                 Image(systemName: "checkmark")
-                    .font(.system(size: 24, weight: .bold))
-                    .foregroundStyle(MColor.brassInk)
-                    .frame(width: 52, height: 52)
-                    .background(Circle().fill(MColor.brass))
-                    .scaleEffect(donePop ? 1 : 0.55)
-                    .opacity(donePop ? 1 : 0)
-                    .onAppear {
-                        withAnimation(.spring(response: 0.4, dampingFraction: 0.6)) {
-                            donePop = true
-                        }
-                    }
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .symbolEffect(.bounce, options: .speed(1.05))
+                    .transition(.opacity)
             case .idle:
                 EmptyView()
             }
         }
         .frame(maxWidth: .infinity)
+        .frame(minHeight: 40)
         .padding(.vertical, 40)
+    }
+
+    /// 整数位变化才触发动画，避免亚像素级进度抖动把滚动动画切碎。
+    private func rollingPercent(_ progress: Double) -> some View {
+        let percent = Int((min(max(progress, 0), 1) * 100).rounded(.down))
+        return Text("\(percent)%")
+            .font(.system(size: 26, weight: .semibold, design: .rounded))
+            .monospacedDigit()
+            .foregroundStyle(MColor.text1)
+            .contentTransition(.numericText(countsDown: false))
+            .animation(.smooth(duration: 0.34), value: percent)
+            .transition(.opacity.combined(with: .scale(0.7)))
     }
 
     // MARK: 组件
@@ -503,7 +516,6 @@ struct MExportSheet: View {
     private func beginExport() {
         guard phase == .idle, canExport else { return }
         MHaptic.medium()
-        donePop = false
         withAnimation(MMotion.state) { phase = .exporting }
         let quality = isJPEG ? Double(qualityValues[min(qualityIndex, qualityValues.count - 1)]) / 100 : 0.95
         onExport(format.id, edgeIndex, quality, addWatermark && watermarkAvailable) { result in
