@@ -6,7 +6,8 @@
     <img src="https://img.shields.io/badge/iOS-17%2B-0a84ff?style=flat-square" alt="iOS 17+">
     <img src="https://img.shields.io/badge/SwiftUI-native-1d9bf0?style=flat-square" alt="SwiftUI">
     <img src="https://img.shields.io/badge/100%25-offline-2ea44f?style=flat-square" alt="Offline">
-    <img src="https://img.shields.io/badge/license-GPLv3-555555?style=flat-square" alt="GPLv3">
+    <img src="https://img.shields.io/badge/license-GPLv3%20(engine)-555555?style=flat-square" alt="GPLv3 engine">
+    <img src="https://img.shields.io/badge/license%20(frontend)-CC%20BY--NC--SA%204.0-555555?style=flat-square" alt="CC BY-NC-SA frontend">
   </p>
   <p>
     <a href="https://spektra.ote.asia">官网 / Website</a> ·
@@ -201,6 +202,10 @@ spektrafilm
 
 ## 许可与致谢
 
-本项目沿用上游 [spektrafilm](https://github.com/andreavolpato/spektrafilm) 的 **GPLv3** 许可，源码见 [LICENSE](LICENSE)。胶片/相纸数据来自公开技术资料；JSON profile 与 LUT 遵循上游的 CC BY-SA 4.0 与自定义 LUT 许可，详见 `SPEKTRAFILM_LICENSE.txt`。
+本项目采用**分层许可**：
+
+- **引擎**（`src/spektrafilm/`、Swift 移植 `Sources/SpektraCore/`）：上游 [spektrafilm](https://github.com/andreavolpato/spektrafilm) 的移植与衍生，沿用上游 **GPLv3**，源码见 [LICENSE](LICENSE)。
+- **前端**（`src/spektrafilm_gui/` 改造部分、`SpektraMobile/`、`SpektraMobileApp/`、`electron/`）：本项目原创，按 **CC BY-NC-SA 4.0** 授权——**禁止商用**；任何使用或改动了前端代码的分发，**必须以同许可开源完整源代码**并署名。详见 [LICENSE.FRONTEND](LICENSE.FRONTEND)。
+- **数据**：胶片/相纸 JSON profile 与 LUT 遵循上游的 CC BY-SA 4.0 与自定义 LUT 许可，详见 `SPEKTRAFILM_LICENSE.txt`。
 
 感谢 Andrea Volpato 与 spektrafilm 社区提供的光谱胶片模拟参考实现。
