@@ -2016,10 +2016,11 @@ enum ExportEdge {
         /// 实际输出小于用户选择的尺寸。
         var clamped: Bool
 
-        /// 调色是否走分带：分带显影时必走分带调色；整张显影但长边达到 4096
-        /// （48 MP 级）时，整图 Double 工作缓冲约 1.17 GB，6 GB 机型会被 jetsam，
-        /// 也必须分带。普通导出与直出共用这一条决策，避免两条链路分叉。
-        var usesBandedGrade: Bool { tiled || edge >= 4096 }
+        /// 调色是否走分带：分带显影时必走分带调色；整张显影但长边达到 2800
+        /// （约 5 MP 起）也走分带——分带调色现在按带并行，比整幅串行快得多，
+        /// 内存峰值还更低。阈值以下小图串行整幅更划算。
+        /// 普通导出与直出共用这一条决策，避免两条链路分叉。
+        var usesBandedGrade: Bool { tiled || edge >= 2800 }
     }
 
     /// 用户选定的档位换算成长边，不做内存钳位。
@@ -2066,9 +2067,10 @@ enum ExportEdge {
         }
         func gradePeak(_ edge: Int) -> Double {
             guard includeGrade else { return 0 }
-            // 分带调色：原始输入 + Float 成品各一张整图，Double 工作缓冲按带分配。
+            // 分带调色：原始输入 + Float 成品各一张整图，Double 工作缓冲按带分配；
+            // 最多 3 条带并行，每条带含 halo 重叠的 Double + 辅助缓冲留 96 MB。
             if banded {
-                return (sourcePixels(edge) + outputPixels(edge)) * 12 + 160 * 1024 * 1024
+                return (sourcePixels(edge) + outputPixels(edge)) * 12 + 3 * 96 * 1024 * 1024
             }
             return outputPixels(edge) * gradeBytesPerPixel + 64 * 1024 * 1024
         }
@@ -2338,8 +2340,14 @@ enum MDirectRenderer {
                                    // 整图编码缓冲，按默认 36 B/px 保守估计。
                                    encodeBytesPerPixel: settings.format == 3 ? 8 : nil)
         let requested = plan.edge
-        // 一条带的 RGBAf 控制在 64 MB 内；宽度越大带越矮，48 MP 下约 512 行。
-        let decodeBandRows = max(64, min(512, (64 << 20) / max(1, originalEdge * 16)))
+        // CIRAWFilter 每次 render 调用都重跑整幅去马赛克：实测 12 MP
+        // 整幅 357ms vs 分带 880ms，分带解码对中小图是负优化。
+        // 解码输出 ≤24 MP 时整幅一次渲染；只有 RGBA Float 整图缓冲
+        // 过大（≥24 MP，>380 MB）才分带压峰值。
+        let decodedPixels = Double(requested * requested) * aspect
+        let decodeBandRows = decodedPixels > 24_000_000
+            ? max(64, min(512, (64 << 20) / max(1, requested * 16)))
+            : nil
 
         let ext: String
         let bitDepth: Int

@@ -346,11 +346,16 @@ struct MobileRootView: View {
             break
         }
 
+        // 保存成功的提示带上实际输出长边：设置页的尺寸档位是否生效一眼可证。
+        let savedSize = LibraryStore.pixelSize(url: albumURL)
+        let savedEdge = max(savedSize.width, savedSize.height)
+        let sizeNote = savedEdge > 0 ? " · 长边 \(savedEdge) px" : ""
+
         guard MobileSettings.cameraDirectSaveOriginal else {
             // 关闭保存原图：不生成工程、不写 RAW，只保留渲染成片。
             try? FileManager.default.removeItem(at: request.rawURL)
             try? FileManager.default.removeItem(at: request.renderedURL)
-            return .saved("成片已保存到相册")
+            return .saved("成片已保存到相册" + sizeNote)
         }
 
         defer {
@@ -369,7 +374,7 @@ struct MobileRootView: View {
             baseline: request.baseline,
             renderedURL: albumURL
         )
-        return .saved("已保存原图与成片")
+        return .saved("已保存原图与成片" + sizeNote)
     }
 
     /// 直出成片页「进入显影台」：原片入库后写回拍摄时的显影 / 调色参数，再打开显影台。

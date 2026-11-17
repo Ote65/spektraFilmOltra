@@ -321,6 +321,13 @@ struct SettingsScreen: View {
                 guard let value = Int(raw) else { return }
                 exportEdge = value
             }
+            // 尺寸档位只缩小、不放大：原图长边不足所选值时按原图输出，
+            // 所以 12 MP 原机上 4096 档与最大可用尺寸输出相同——保存成功提示里
+            // 会带实际长边，可当场核对。
+            Text("档位只缩小不放大：原图长边不足所选值时按原图输出")
+                .font(.mSans(9))
+                .foregroundStyle(MColor.text4)
+                .padding(.top, 2)
 
             MChoiceRow(label: "图像品质",
                        value: isJPEGExport ? exportQualityTitle : "无损",
