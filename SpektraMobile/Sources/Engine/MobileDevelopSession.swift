@@ -2160,6 +2160,9 @@ struct MDirectRenderSettings {
     var downgradedFromEXR: Bool = false
     /// 相机页选择的画幅比例：渲染末尾居中裁切，拍摄仍是 RAW 全幅。
     var aspect: MDirectAspect = .portrait3_4
+    /// 快门瞬间的握持方向，决定画幅比例是否旋转（横拍 9:16 → 16:9）。
+    /// 来自 meta 的真实朝向；调试直达等无拍摄流程时 fallback 按 output 像素判断。
+    var capturedLandscape: Bool? = nil
     /// 相机页选择的直出分辨率档位；非 MAX 时覆盖设置页的尺寸档。
     var resolution: MDirectResolution = .maximum
 
@@ -2455,12 +2458,12 @@ enum MDirectRenderer {
         graded.image = ImageRGB(width: 0, height: 0)
         // 画幅比例在渲染末尾居中裁切：拍摄永远是 RAW 全幅，片边 / 水印 / 预览
         // 都作用在裁切后的画幅上，与调色台的裁切是同一构图。
-        // 横屏拍摄时画布是横的：比例取倒数（3:4 → 4:3），输出选定构图
-        // 转过来的完整横幅，而不是把横幅硬裁成竖幅。
+        // 横拍时输出「选定比例转过来」的完整横幅（9:16 → 16:9）：朝向优先用
+        // 快门瞬间的真实值，缺失时才退回按解码像素判断（EXIF 转正会让后者失准，
+        // 这正是之前横拍仍被裁成竖幅的原因）。
+        let landscape = settings.capturedLandscape ?? (output.width > output.height)
         output = autoreleasepool {
-            Self.centerCrop(output,
-                            ratio: settings.aspect.ratio(width: output.width,
-                                                         height: output.height))
+            Self.centerCrop(output, ratio: settings.aspect.ratio(landscape: landscape))
         }
         // 预览必须在转换到导出色彩空间之前生成：ProPhoto / ACES 线性图直接显示会偏色。
         var previewSource = Resize.longEdge(output, maxSize: 1200)

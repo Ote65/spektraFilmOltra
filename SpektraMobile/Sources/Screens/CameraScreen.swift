@@ -9,6 +9,11 @@ private enum MDirectCardPhase {
     case developing
     case ready(MDirectRenderResult)
     case failed(String)
+
+    var isDeveloping: Bool {
+        if case .developing = self { return true }
+        return false
+    }
 }
 
 /// 拍摄页：4:3 取景 + iOS 风格快门。
@@ -49,6 +54,18 @@ struct CameraScreen: View {
     @State private var directLongPressed = false
     @State private var directCard: MDirectCardPhase?
     @State private var directProgress: Double = 0
+    /// 显影进度条的丝滑显示值：真实进度分段跳变时向目标缓动，避免细条瞬跳。
+    @State private var directEasedProgress: Double = 0
+    /// 缓动任务句柄：切卡片 / 重拍时取消，避免旧任务回调覆盖新一次显影。
+    @State private var directEaseTask: Task<Void, Never>?
+    /// 上一次给过触感的百分比位：数字每滚过一格（每 1%）轻点一次，像拨轮滚动。
+    @State private var directHapticPercent: Int = 0
+    /// 复用的最轻选择触感发生器：频繁触发时必须持有实例，否则每次新建会被系统丢弃不振动。
+    #if os(iOS)
+    private static let progressHaptic = UISelectionFeedbackGenerator()
+    #endif
+    /// 本次直出快门瞬间的握持方向：横拍为 true，驱动成片与 cropData 的画幅旋转。
+    @State private var directCapturedLandscape: Bool = false
     @State private var directPhoto: MPlatformImage?
     @State private var directPreviewToken = 0
     @State private var directRawURL: URL?
@@ -259,6 +276,10 @@ struct CameraScreen: View {
             default: badgeAngle = 0
             }
         }
+        .onChange(of: directProgress) { _, value in
+            easeDirectProgress(to: value)
+        }
+        .onDisappear { directEaseTask?.cancel() }
     }
 
     // MARK: - 顶栏
@@ -623,6 +644,18 @@ struct CameraScreen: View {
             Color.black
 
             preview
+                // 黑白预设时取景框实时去色：纯 GPU 显示滤镜，不碰 RAW、不烧录，
+                // 切回彩色预设立刻恢复。只作用于画面，覆盖层（网格/水平仪/对焦框）保持原色。
+                .grayscale(directPresetIsMono ? 1 : 0)
+                .animation(.easeInOut(duration: 0.25), value: directPresetIsMono)
+
+            // 预设色彩参考：一层极淡的代表色罩，给色调方向感（纯屏幕合成，不烧录）。
+            // 放在画面之上、UI 覆盖层之下，网格/水平仪/对焦框不被染色。
+            if let tint = directPresetTint {
+                tint
+                    .allowsHitTesting(false)
+                    .animation(.easeInOut(duration: 0.25), value: directPresetIsMono)
+            }
 
             if gridEnabled {
                 gridOverlay
@@ -1047,6 +1080,45 @@ struct CameraScreen: View {
         MDevelopPresetStore.shared.preset(id: directDevelopID)
     }
 
+    /// 直出当前选的显影预设是否为黑白：用于取景框实时去色预览（纯显示滤镜，不烧录）。
+    private var directPresetIsMono: Bool {
+        guard directMode else { return false }
+        if let user = selectedDevelopUser { return user.monochrome }
+        return selectedDevelopBuiltin?.monochrome == true
+    }
+
+    /// 取景框的预设色彩参考：一层很淡的代表色罩，只给色调方向感，不是精确成片色。
+    /// 纯 GPU 屏幕合成，不碰 RAW、不烧录。黑白预设返回 nil（已单独去色）。
+    private var directPresetTint: Color? {
+        guard directMode, !directPresetIsMono else { return nil }
+        let filmID: String
+        var temperature: Double = 0
+        if let user = selectedDevelopUser {
+            filmID = user.filmID
+            // 用户预设的色温若存在，作为暖/冷微调。
+            if case .number(let t)? = user.pro["temperature"] { temperature = t }
+        } else if let builtin = selectedDevelopBuiltin {
+            filmID = builtin.filmID
+            temperature = builtin.quick["temperature"] ?? 0
+        } else {
+            return nil
+        }
+        // 色温优先：明显暖/冷时按色温给色罩，否则按胶片的典型倾向。
+        if temperature >= 8 {
+            return Color(hex: 0xE8A765).opacity(0.13)     // 暖：淡橙
+        }
+        if temperature <= -6 {
+            return Color(hex: 0x7FB8C4).opacity(0.12)     // 冷：淡青
+        }
+        switch filmID {
+        case "kodak_vision3_500t": return Color(hex: 0x6F9E8E).opacity(0.13)  // 电影夜色：青绿
+        case "kodak_portra_400", "kodak_portra_800": return Color(hex: 0xE0B185).opacity(0.10)  // 波特拉：暖
+        case "kodak_ektar_100": return Color(hex: 0xE6C48A).opacity(0.10)      // 伊克塔：鲜艳偏暖
+        case "fujifilm_pro_400h": return Color(hex: 0x9FC3C0).opacity(0.10)    // 富士：冷净
+        default: return nil
+        }
+    }
+
     private var selectedGradePreset: GradePreset? {
         GradePresetStore.shared.all.first { $0.id == directGradeID }
             ?? GradePresetStore.shared.preset(id: "builtin:neutral")
@@ -1426,16 +1498,26 @@ struct CameraScreen: View {
                     VStack(spacing: 12) {
                         switch phase {
                         case .developing:
-                            VStack(spacing: 8) {
-                                ProgressView(value: min(max(directProgress, 0), 1))
-                                    .progressViewStyle(.linear)
-                                    .tint(MColor.brass)
-                                    .frame(width: 176)
-                                Text("正在显影 \(Int(min(max(directProgress, 0), 1) * 100))%")
-                                    .font(.mSans(10, .medium).monospacedDigit())
-                                    .foregroundStyle(MColor.text2)
+                            // 照搬调色台导出的两拍动效：大号滚动百分比 → 白色对勾。
+                            // 不显示进度条。整数位变化才滚动，完成瞬间切对勾 bounce。
+                            Group {
+                                if directDisplayPercent >= 100 {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 30, weight: .semibold))
+                                        .foregroundStyle(.white)
+                                        .symbolEffect(.bounce, options: .speed(1.05))
+                                        .transition(.opacity)
+                                } else {
+                                    Text("\(directDisplayPercent)%")
+                                        .font(.system(size: 34, weight: .semibold, design: .rounded))
+                                        .monospacedDigit()
+                                        .foregroundStyle(MColor.text1)
+                                        .contentTransition(.numericText(countsDown: false))
+                                        .animation(.smooth(duration: 0.28), value: directDisplayPercent)
+                                        .transition(.opacity.combined(with: .scale(0.8)))
+                                }
                             }
-                            .frame(height: 52)
+                            .frame(height: 48)
 
                         case .ready(let result):
                             VStack(spacing: 8) {
@@ -1565,6 +1647,18 @@ struct CameraScreen: View {
         }
     }
 
+    /// 相纸相框尺寸：跟随成片画幅，横拍显示横幅相纸、竖拍保持竖幅。
+    /// 这样显影预览图与最终成片是同一构图，不再"预览竖、成片横"。
+    private var directCardSize: (width: CGFloat, height: CGFloat) {
+        let ratio = directAspect.ratio(landscape: directCapturedLandscape)
+        let longSide: CGFloat = 344
+        if ratio >= 1 {  // 横幅：宽固定 344，高 = 宽 / 比例（4:3→258、16:9→193.5）
+            return (longSide, max(120, min(longSide, longSide / CGFloat(ratio))))
+        }
+        // 竖幅：高固定 344，宽 = 高 × 比例（3:4→258、9:16→193.5）
+        return (max(120, min(longSide, longSide * CGFloat(ratio))), longSide)
+    }
+
     /// 白色相纸卡：显影阶段盖一层逐渐褪去的白雾，不打断相机页的其他状态。
     /// 一旦启用片边，就撤掉白色卡纸与内边距，让带片边的画面完整显示，不再被白框遮住。
     private func directPhotoCard(_ phase: MDirectCardPhase) -> some View {
@@ -1572,24 +1666,31 @@ struct CameraScreen: View {
             if case .ready = phase { return directBorder.enabled }
             return false
         }()
+        let card = directCardSize
+        let developing = phase.isDeveloping
+        // 黑白预设时预览也去色，避免显影时显示彩色、成品却是黑白的违和感。
+        let mono = directEdit?.monochrome == true
         return ZStack {
             if let directPhoto {
                 MImage.swiftUI(directPhoto)
                     .resizable()
-                    .aspectRatio(contentMode: framed ? .fit : .fill)
+                    // 缩略图已按成片比例裁好、最终 preview 也是成片比例，用 fit 完整呈现。
+                    .aspectRatio(contentMode: .fit)
+                    .grayscale(mono ? 1 : 0)
                     .id(directPreviewToken)
                     .transition(.opacity)
+
+                if developing {
+                    // 从暗到明：白雾随显影进度褪去，影像逐渐浮现。
+                    Color.white.opacity(max(0.04, 0.92 - directProgress * 0.88))
+                }
             } else {
                 Color(white: 0.93)
-            }
-
-            if case .developing = phase {
-                Color.white.opacity(max(0.05, 0.95 - directProgress * 0.9))
             }
         }
         .animation(MMotion.state, value: directPreviewToken)
         .animation(.linear(duration: 0.16), value: directProgress)
-        .frame(width: framed ? 316 : 258, height: framed ? 380 : 344)
+        .frame(width: framed ? 316 : card.width, height: framed ? 380 : card.height)
         .clipped()
         .padding(.horizontal, framed ? 0 : 9)
         .padding(.top, framed ? 0 : 9)
@@ -1640,6 +1741,46 @@ struct CameraScreen: View {
         }
     }
 
+    /// 显影百分比：只随整数位变化，配合 numericText 滚动，避免亚像素抖动切碎动画。
+    private var directDisplayPercent: Int {
+        Int((min(max(directEasedProgress, 0), 1) * 100).rounded(.down))
+    }
+
+    /// 真实进度按 10% 粗粒度跳变（渲染分段 + 1% 节流），在相邻跳点之间补伪过渡：
+    /// 小步、每步带 ±30% 随机微抖、越接近越慢，让数字一格一格平滑爬过去，
+    /// 而不是从 10% 硬跳到 20%。节奏与调色台导出的 creep 伪进度一致。
+    @MainActor
+    private func easeDirectProgress(to target: Double) {
+        directEaseTask?.cancel()
+        let goal = min(max(target, 0), 1)
+        guard goal - directEasedProgress > 0.002 else {
+            directEasedProgress = max(directEasedProgress, goal)
+            return
+        }
+        directEaseTask = Task { @MainActor in
+            while !Task.isCancelled {
+                let remaining = goal - directEasedProgress
+                if remaining <= 0.002 { directEasedProgress = goal; break }
+                // 每步最多约 1.5 个百分点，数字一格一格地滚，触感与数字严格同步；
+                // 越接近目标越慢 + 随机抖动，走出细微不匀速的滚轮手感。
+                let raw = max(0.0025, remaining * 0.1) * Double.random(in: 0.7...1.3)
+                let step = min(raw, 0.015)
+                directEasedProgress = min(goal, directEasedProgress + step)
+                // 像 iOS 拨轮：数字每往前滚一格就给一次最轻的选择触感，
+                // 持续细密反馈（55ms 一步），而不是每 10% 才点一下。
+                let percent = Int((directEasedProgress * 100).rounded(.down))
+                if percent > directHapticPercent {
+                    directHapticPercent = percent
+                    #if os(iOS)
+                    Self.progressHaptic.selectionChanged()
+                    Self.progressHaptic.prepare()
+                    #endif
+                }
+                try? await Task.sleep(nanoseconds: 42_000_000)
+            }
+        }
+    }
+
     private func beginDirect(_ shot: MCameraShot) {
         guard let gradePreset = selectedGradePreset else {
             showHint("直出预设不可用，请长按直出按钮重新选择")
@@ -1649,14 +1790,27 @@ struct CameraScreen: View {
         let token = directToken
         directSaving = false
         directProgress = 0
+        directEaseTask?.cancel()
+        directEasedProgress = 0
+        directHapticPercent = 0
+        #if os(iOS)
+        Self.progressHaptic.prepare()
+        #endif
+        directCapturedLandscape = shot.meta.capturedLandscape
         // 显影是独立页面：立刻停相机与水平仪，把 CPU / 内存留给显影管线。
         camera.stop()
         level.stop()
         directCancel?.cancel()
         let cancel = MDirectRenderToken()
         directCancel = cancel
+        // 显影预览图从一开始就按成片画幅裁好：横拍 9:16 先裁成 16:9 横幅，
+        // 与最终渲染成片同一构图，避免显影全程显示竖幅取景图、完成后才跳成横幅。
+        let targetRatio = directAspect.ratio(landscape: shot.meta.capturedLandscape)
+        let previewThumb = shot.thumbnail?.cgImage?
+            .centerCropped(toAspect: targetRatio).map(MImage.make(cgImage:))
+            ?? shot.thumbnail
         withAnimation(MMotion.state) {
-            directPhoto = shot.thumbnail
+            directPhoto = previewThumb
             directPreviewToken += 1
             directPreviewCG = nil
             directRawURL = shot.url
@@ -1674,6 +1828,8 @@ struct CameraScreen: View {
         let recipe = ui.gradeRecipe(lutPath: lutPath)
         var settings = MDirectRenderSettings.fromPreferences()
         settings.aspect = directAspect
+        // 快门瞬间的真实朝向是画幅旋转的权威信号，不依赖解码后像素方向。
+        settings.capturedLandscape = shot.meta.capturedLandscape
         settings.resolution = effectiveResolution
         if settings.downgradedFromEXR {
             showHint("相册不支持 EXR，直出已使用 JPEG")
@@ -1727,27 +1883,45 @@ struct CameraScreen: View {
         }
     }
 
-    /// 渲染真正完成：进度跳 1.0、切成片卡片、触感与降级提示。
+    /// 渲染真正完成：进度跳 1.0、先显示对勾一拍、再切成片卡片。
     @MainActor
     private func presentDirectReady(_ result: MDirectRenderResult) {
+        let token = directToken
         withAnimation(MMotion.state) {
+            // 完成时取消逐格爬升，直接对齐 100%；数字靠 numericText 的 0.28s
+            // 动画滚到 100%，随后 developing 分支自动切出对勾。
+            directEaseTask?.cancel()
+            directEasedProgress = 1
             directProgress = 1
-            if let preview = result.preview {
-                directPreviewCG = preview
-                directPhoto = MImage.make(cgImage: preview)
-                directPreviewToken += 1
-            }
-            directCard = .ready(result)
         }
-        // 成片页沿用记忆里的片边；没有开启时保持无片边。
-        refreshDirectBorderPreview()
-        #if os(iOS)
-        UINotificationFeedbackGenerator().notificationOccurred(.success)
-        #endif
-        if let clamped = result.clampedEdge {
-            showHint("已按内存上限 \(clamped) px 渲染")
-        } else if result.usedFallback {
-            showHint("RAW 解码较慢 · 已使用内嵌预览")
+        // 成功触感分两段：先一记轻点收束进度滚动，再在对勾出现时给成功确认。
+        MHaptic.light()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 280_000_000)
+            guard token == directToken, directCard != nil else { return }
+            #if os(iOS)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            #endif
+        }
+        // 百分比滚到 100% + 对勾各占一拍，共约 0.85s 再切成片卡片。
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 850_000_000)
+            guard token == directToken, directCard != nil else { return }
+            withAnimation(MMotion.state) {
+                if let preview = result.preview {
+                    directPreviewCG = preview
+                    directPhoto = MImage.make(cgImage: preview)
+                    directPreviewToken += 1
+                }
+                directCard = .ready(result)
+            }
+            // 成片页沿用记忆里的片边；没有开启时保持无片边。
+            refreshDirectBorderPreview()
+            if let clamped = result.clampedEdge {
+                showHint("已按内存上限 \(clamped) px 渲染")
+            } else if result.usedFallback {
+                showHint("RAW 解码较慢 · 已使用内嵌预览")
+            }
         }
     }
 
@@ -1756,6 +1930,9 @@ struct CameraScreen: View {
         directCancel?.cancel()
         directCancel = nil
         directToken += 1
+        directEaseTask?.cancel()
+        directEasedProgress = 0
+        directHapticPercent = 0
         if let result { try? FileManager.default.removeItem(at: result.url) }
         if let raw = directRawURL { try? FileManager.default.removeItem(at: raw) }
         withAnimation(MMotion.state) {
@@ -1808,7 +1985,8 @@ struct CameraScreen: View {
                                          edit: edit, grade: recipe,
                                          border: directBorder,
                                          baseline: directBaseline,
-                                         aspect: directAspect)
+                                         aspect: directAspect,
+                                         capturedLandscape: directCapturedLandscape)
         Task {
             let outcome = await onDirectSave(request)
             await MainActor.run {
@@ -1846,7 +2024,8 @@ struct CameraScreen: View {
         directOpeningDevelop = true
         let request = MDirectDevelopRequest(
             rawURL: raw, renderedURL: result.url, edit: edit, grade: recipe,
-            baseline: directBaseline, aspect: directAspect)
+            baseline: directBaseline, aspect: directAspect,
+            capturedLandscape: directCapturedLandscape)
         Task {
             let outcome = await onDirectDevelop(request)
             await MainActor.run {

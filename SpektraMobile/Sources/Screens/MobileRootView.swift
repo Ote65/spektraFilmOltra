@@ -61,7 +61,8 @@ struct MobileRootView: View {
                     openDevelop(photo.id, filename: photo.filename)
                 },
                 onOpenGrade: { photo in
-                    openGrade(photo.id, entry: .direct, returningTo: .home)
+                    openGrade(photo.id, filename: photo.filename,
+                              entry: .direct, returningTo: .home)
                 },
                 onOpenCamera: openCamera,
                 onOpenSettings: openSettings,
@@ -375,7 +376,8 @@ struct MobileRootView: View {
             grade: request.grade,
             baseline: request.baseline,
             renderedURL: albumURL,
-            aspect: request.aspect
+            aspect: request.aspect,
+            capturedLandscape: request.capturedLandscape
         )
         return .saved("已保存原图与成片" + sizeNote)
     }
@@ -396,7 +398,8 @@ struct MobileRootView: View {
             grade: request.grade,
             baseline: request.baseline,
             renderedURL: request.renderedURL,
-            aspect: request.aspect
+            aspect: request.aspect,
+            capturedLandscape: request.capturedLandscape
         )
         openDevelop(photoID)
         return .opened
@@ -439,8 +442,14 @@ struct MobileRootView: View {
         }
     }
 
-    private func openGrade(_ photoID: String, entry: MGradeEntry, returningTo target: MScreen) {
-        guard let session = engine.openGrade(photoID: photoID, entry: entry) else { return }
+    private func openGrade(_ photoID: String, filename: String? = nil,
+                           entry: MGradeEntry, returningTo target: MScreen) {
+        guard let session = engine.openGrade(photoID: photoID, filename: filename,
+                                             entry: entry) else {
+            NSLog("MOpen grade failed id=%@ filename=%@", photoID, filename ?? "-")
+            showToast("打不开这张照片，请重试或重新导入")
+            return
+        }
         withAnimation(MMotion.push) {
             gradeEntry = entry
             gradeReturn = target
@@ -453,8 +462,10 @@ struct MobileRootView: View {
     private func switchGradePhoto(_ photoID: String) {
         guard photoID != grade?.photoID else { return }
         engine.closeGrade()
+        // 胶片条 id 可能来自 relink 前的快照，带文件名兜底避免切图静默失败。
+        let filename = engine.photos.first(where: { $0.id == photoID })?.filename
         withAnimation(MMotion.push) {
-            grade = engine.openGrade(photoID: photoID, entry: gradeEntry)
+            grade = engine.openGrade(photoID: photoID, filename: filename, entry: gradeEntry)
             // 换图后旧的显影会话仍属于上一张，不能再作为返回目标；回主页重新进入。
             if gradeReturn == .develop {
                 engine.closeDevelop()

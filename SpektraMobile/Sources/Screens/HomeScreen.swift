@@ -1,5 +1,6 @@
 import SwiftUI
 import Photos
+import PhotosUI
 import UniformTypeIdentifiers
 
 struct HomeScreen: View {
@@ -40,6 +41,7 @@ struct HomeScreen: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 0) {
                         sectionHead
+                        limitedAccessBanner
                         photoGrid
                         emptyHint
                     }
@@ -890,6 +892,54 @@ struct HomeScreen: View {
         .frame(height: 50)
     }
 
+    /// 有限访问提示：只显示部分照片时说明原因，并给出系统管理入口。
+    @ViewBuilder
+    private var limitedAccessBanner: some View {
+        if engine.isPhotoAccessLimited {
+            Button {
+                presentLimitedPhotoPicker()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("仅显示你允许的照片 · 点此管理")
+                        .font(.mSans(10.5, .medium))
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .foregroundStyle(MColor.text2)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(MColor.surface1)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+        }
+    }
+
+    /// 拉起系统的「有限访问照片」选择器；iPad 上系统按 presenting VC 自动定位弹层。
+    private func presentLimitedPhotoPicker() {
+        guard let vc = Self.topViewController() else { return }
+        PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: vc)
+    }
+
+    private static func topViewController(
+        base: UIViewController? = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .flatMap({ $0.windows })
+            .first(where: { $0.isKeyWindow })?.rootViewController
+    ) -> UIViewController? {
+        if let nav = base as? UINavigationController { return topViewController(base: nav.visibleViewController) }
+        if let tab = base as? UITabBarController, let sel = tab.selectedViewController {
+            return topViewController(base: sel)
+        }
+        if let presented = base?.presentedViewController { return topViewController(base: presented) }
+        return base
+    }
+
     /// 空态：没权限 / 没可显影的照片 / 还在扫描，三种情况说清下一步。
     @ViewBuilder
     private var emptyHint: some View {
@@ -1070,7 +1120,8 @@ struct HomeScreen: View {
         Task {
             guard let photoID = await engine.importAsset(assetID: asset.id),
                   let photo = engine.photos.first(where: { $0.id == photoID }) else {
-                onToast("这张 RAW 没能取回：可能还在 iCloud 且网络不可用")
+                // 用引擎给出的精确原因（iCloud 超时/离线/无原片），不再笼统一句。
+                onToast(engine.importFailureMessage ?? "这张 RAW 没能取回，请检查网络后重试")
                 return
             }
             onOpenDevelop(photo)
@@ -1313,6 +1364,8 @@ private struct MAssetThumb: View {
     @State private var image: UIImage?
     @State private var requested = false
     @State private var requestID: PHImageRequestID?
+    /// iCloud 缩略图下载失败：空占位分不清"在下载"还是"失败"，显式给个图标。
+    @State private var loadFailed = false
 
     var body: some View {
         ZStack {
@@ -1321,6 +1374,10 @@ private struct MAssetThumb: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
+            } else if loadFailed {
+                Image(systemName: "icloud.slash")
+                    .font(.system(size: 20, weight: .light))
+                    .foregroundStyle(MColor.text4)
             }
         }
         .onAppear(perform: request)
@@ -1331,6 +1388,7 @@ private struct MAssetThumb: View {
                 self.requestID = nil
             }
             requested = false
+            loadFailed = false
         }
     }
 
@@ -1354,14 +1412,22 @@ private struct MAssetThumb: View {
             contentMode: .aspectFill,
             options: options
         ) { result, info in
-            guard let result else { return }
             let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            // result 为 nil：区分 iCloud 下载失败 / 还在下载。
+            // 有 error 才是真失败；纯 in-cloud 且无 error 视为仍在下载，不标失败。
+            let hasError = info?[PHImageErrorKey] != nil
             DispatchQueue.main.async {
                 guard requested else { return }
-                image = result
-                if !degraded {
-                    MAssetThumbCache.shared.setObject(
-                        result, forKey: key, cost: 480 * 480 * 4)
+                if let result {
+                    image = result
+                    loadFailed = false
+                    if !degraded {
+                        MAssetThumbCache.shared.setObject(
+                            result, forKey: key, cost: 480 * 480 * 4)
+                    }
+                } else if hasError {
+                    // 下载失败（离线/资源不可用）：显式图标，别让用户以为是空照片。
+                    loadFailed = true
                 }
             }
         }

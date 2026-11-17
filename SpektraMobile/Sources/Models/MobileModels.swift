@@ -748,10 +748,16 @@ enum MDirectAspect: String, CaseIterable, Identifiable {
     }
 
     /// 按拍摄朝向取目标宽高比（宽/高）。档位是竖幅语义；
-    /// 横屏拍摄时画布是横的，取倒数得到「选定比例横过来」的完整横幅，
+    /// 横屏拍摄时取倒数得到「选定比例横过来」的完整横幅（9:16 → 16:9），
     /// 而不是把横幅硬裁成竖幅。1:1 两种朝向相同。
+    /// 优先用快门瞬间的真实朝向，避免依赖解码后像素方向（EXIF 转正不可靠）。
+    func ratio(landscape: Bool) -> Double {
+        landscape ? 1.0 / ratio : ratio
+    }
+
+    /// 兼容旧调用：没有朝向信息时退回按画布像素宽高判断。
     func ratio(width: Int, height: Int) -> Double {
-        width > height ? 1.0 / ratio : ratio
+        ratio(landscape: width > height)
     }
 }
 
@@ -795,6 +801,8 @@ struct MDirectSaveRequest {
     var baseline: PhotoEdit? = nil
     /// 相机页选择的画幅比例；保存时写进 cropData，与调色台裁切共用。
     var aspect: MDirectAspect = .portrait3_4
+    /// 快门瞬间的握持方向，决定 cropData 的画幅是否旋转（横拍 9:16 → 16:9）。
+    var capturedLandscape: Bool = false
 }
 
 enum MDirectSaveOutcome {
@@ -812,6 +820,8 @@ struct MDirectDevelopRequest {
     var baseline: PhotoEdit? = nil
     /// 相机页选择的画幅比例；入库时写进 cropData，调色台裁切直接呈现同一构图。
     var aspect: MDirectAspect = .portrait3_4
+    /// 快门瞬间的握持方向，决定 cropData 的画幅是否旋转（横拍 9:16 → 16:9）。
+    var capturedLandscape: Bool = false
 }
 
 enum MDirectDevelopOutcome {

@@ -158,6 +158,26 @@ struct MPhotoThumbnail: View {
 }
 
 extension CGImage {
+    /// 按目标宽高比居中裁切：只取中间区域，不改像素内容。
+    /// 用于显影预览图提前呈现成片的画幅（横拍 16:9 / 竖拍 9:16）。
+    func centerCropped(toAspect target: Double) -> CGImage? {
+        let current = Double(width) / Double(height)
+        guard target > 0, width > 1, height > 1 else { return self }
+        let cropW: Int
+        let cropH: Int
+        if current > target {
+            cropH = height
+            cropW = max(1, min(width, Int((Double(height) * target).rounded())))
+        } else {
+            cropW = width
+            cropH = max(1, min(height, Int((Double(width) / target).rounded())))
+        }
+        let rect = CGRect(
+            x: (width - cropW) / 2, y: (height - cropH) / 2,
+            width: cropW, height: cropH)
+        return cropping(to: rect)
+    }
+
     /// 顺时针旋转 90°：纯几何重排，不插值。
     var quarterTurnedClockwise: CGImage? {
         let targetWidth = height

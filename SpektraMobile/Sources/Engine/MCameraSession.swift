@@ -13,6 +13,9 @@ struct MCameraCaptureMeta: Equatable {
     var exposureBias: Double = 0
     /// nil 表示自动白平衡。
     var temperature: Int?
+    /// 快门瞬间的握持方向：横拍为 true。成片画幅据此决定，
+    /// 不依赖解码后像素的宽高（RAW 的 EXIF 转正会让像素方向判断失准）。
+    var capturedLandscape: Bool = false
 }
 
 /// 一次 RAW 拍摄的结果：临时 DNG 文件 + 取景器里用的缩略图。
@@ -446,16 +449,19 @@ final class MCameraSession: NSObject, ObservableObject {
             }
         }
 
+        // 拍摄瞬间的重力方向决定出片朝向：横屏拍的 DNG 在快门那一刻就按重力转正，
+        // 显影台拿到的是正图，不需要再手动旋转。
+        let angle = Self.captureRotationAngle(for: UIDevice.current.orientation)
+        // 横拍（0° / 180°）记为横向，成片画幅据此把所选比例旋转过来：
+        // 9:16 横拍输出 16:9 横幅。竖向只认 90°/270°，flat 等中间态回退竖幅。
+        let capturedLandscape = angle == 0 || angle == 180
         let delegate = MCaptureDelegate(
-            meta: MCameraCaptureMeta(exposureBias: exposureBias, temperature: temperature)
+            meta: MCameraCaptureMeta(exposureBias: exposureBias, temperature: temperature,
+                                     capturedLandscape: capturedLandscape)
         ) { [weak self] result in
             DispatchQueue.main.async { self?.finish(result) }
         }
         captureDelegate = delegate
-
-        // 拍摄瞬间的重力方向决定出片朝向：横屏拍的 DNG 在快门那一刻就按重力转正，
-        // 显影台拿到的是正图，不需要再手动旋转。
-        let angle = Self.captureRotationAngle(for: UIDevice.current.orientation)
         sessionQueue.async { [photoOutput] in
             if let connection = photoOutput.connection(with: .video) {
                 if #available(iOS 17.0, *) {
