@@ -33,7 +33,7 @@ final class PrintingStage {
         colorReference.logRawPrintBlack = filmCMYToPrintLogRaw(ImageRGB(width: 1, height: 1, data: cmyBlackData))
         colorReference.logRawPrintWhite = filmCMYToPrintLogRaw(ImageRGB(width: 1, height: 1, data: cmyWhiteData))
 
-        let logRaw = lutService.computeEnlarger(
+        var raw = lutService.computeEnlarger(
             cmyData: cmyFilmDensity,
             function: { [unowned self] image in self.filmCMYToPrintLogRaw(image) },
             dataMin: cmyBlackData,
@@ -41,15 +41,16 @@ final class PrintingStage {
             useLUT: settings.useEnlargerLUT,
             key: enlargerCacheKey(dataMin: cmyBlackData, dataMax: cmyWhiteData)
         )
-        var raw = logRaw.map {
+        raw.mapInPlace {
             Vec3(ImageMath.pow10Fast($0.x), ImageMath.pow10Fast($0.y), ImageMath.pow10Fast($0.z))
         }
         let exposure = enlarger.printExposure
-        raw = raw.map { $0 * exposure }
+        raw.mapInPlace { $0 * exposure }
         let correction = colorReference.blackWhitePrintingExposureCorrection()
-        raw = raw.map { $0 * correction }
+        raw.mapInPlace { $0 * correction }
         raw = applyDiffusion(raw, params: enlarger.diffusionFilter, pixelSizeUM: pixelSizeUM)
-        return raw.map { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        raw.mapInPlace { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        return raw
     }
 
     func develop(logRaw: ImageRGB) -> ImageRGB {
@@ -119,7 +120,7 @@ final class PrintingStage {
         )
         let pixelCount = cmyFilmDensity.width * cmyFilmDensity.height
         let factor = computeExposureFactorMidgray(sensitivity: sensitivity, printIlluminant: printIlluminant)
-        raw = raw.map { $0 * factor }
+        raw.mapInPlace { $0 * factor }
         if enlarger.preflashExposure > 0 {
             let lightSource = (try? Illuminants.standard(enlarger.illuminant)) ?? []
             let preflashIlluminant = enlargerService.preflashIlluminant(lightSource)
@@ -135,7 +136,8 @@ final class PrintingStage {
                 }
             }
         }
-        return raw.map { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        raw.mapInPlace { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        return raw
     }
 
     private func computeExposureFactorMidgray(sensitivity: [[Double]], printIlluminant: [Double]) -> Double {
@@ -189,6 +191,58 @@ final class PrintingStage {
 
     private func applyDiffusion(_ image: ImageRGB, params: DiffusionFilterParams, pixelSizeUM: Double) -> ImageRGB {
         SpatialEffects.diffusionFilter(image, params: params, pixelSizeUM: pixelSizeUM)
+    }
+}
+
+/// 快速「拍摄曝光」轴与印相自动亮度补偿的联动规则。
+///
+/// 补偿开启时，拍摄曝光的变化会被印相补偿归一化。原生 quick_controls 因此在拖动
+/// 拍摄曝光时关闭补偿，让曝光变化可见；但如果基线本身带着非 0 拍摄曝光（相机的
+/// -1 EV / -2 EV），关闭补偿会把基线的补偿一并撤掉，画面第一帧就按基线 EV 突变。
+/// 这里在基线 EV 非 0 时保留补偿，改用印相曝光承载快速轴的 EV 偏移，保证滑条
+/// 从 0 起步时亮度连续；基线 EV 为 0 时仍按原生行为关补偿。
+enum QuickExposureMapping {
+    /// 关补偿会撤掉非 0 的基线补偿，需要改用印相曝光承载。
+    static func keepsPrintCompensation(baseline: PhotoEdit) -> Bool {
+        baseline.enlarger.printExposureCompensation
+            && abs(baseline.camera.exposureCompensationEV) > 1e-9
+    }
+
+    /// 印相曝光 = 基线印相曝光 × 2^-(快速曝光偏移 + 印相明暗偏移)。
+    /// 两条快速轴共用 printExposure，必须一起计算，后拖动的轴不能覆盖另一条轴的偏移。
+    static func printExposure(baseline: PhotoEdit, cameraEV: Double,
+                              printEV: Double) -> Double {
+        let carried = keepsPrintCompensation(baseline: baseline) ? cameraEV : 0
+        let value = baseline.enlarger.printExposure * pow(2, -(carried + printEV))
+        return min(max(value, 0.25), 4)
+    }
+
+    /// 把「拍摄曝光」的 q 写进 edit：EV 恒为基线 + q；补偿与印相曝光按上面的规则联动。
+    static func apply(cameraExposure q: Double, baseline: PhotoEdit,
+                      quickIntents: [String: Double], edit: inout PhotoEdit) {
+        edit.camera.exposureCompensationEV = min(
+            max(baseline.camera.exposureCompensationEV + q, -5), 5)
+        if keepsPrintCompensation(baseline: baseline) {
+            edit.enlarger.printExposureCompensation =
+                baseline.enlarger.printExposureCompensation
+            edit.enlarger.printExposure = printExposure(
+                baseline: baseline,
+                cameraEV: q,
+                printEV: quickIntents["print_brightness"] ?? 0)
+        } else {
+            edit.enlarger.printExposureCompensation =
+                abs(q) <= 1e-9 ? baseline.enlarger.printExposureCompensation : false
+        }
+    }
+
+    /// 用户预设里的曝光补偿按「相对保存时基线的调整量」复现。
+    /// 旧预设没有保存基线：直出沿用原行为「绝对值 + 本次拍摄曝光补偿」，
+    /// 显影台套用传 captureBias = 0，即按绝对值覆盖，避免误加拍摄曝光。
+    static func presetExposure(absolute value: Double, savedBaseline: Double?,
+                               currentBaseline: Double,
+                               captureBias: Double = 0) -> Double {
+        guard let savedBaseline else { return min(max(value + captureBias, -5), 5) }
+        return min(max(value - savedBaseline + currentBaseline, -5), 5)
     }
 }
 

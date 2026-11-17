@@ -18,6 +18,9 @@ enum RawDecoder {
         var lensCorrection: Bool = true
         /// 长边上限；nil 表示全分辨率。
         var maxSize: Int? = nil
+        /// 按行分带渲染：大图不再一次要一整张 RGBAf，峰值只跟带高有关。
+        /// 48 MP 下整图 RGBAf 约 780 MB，分 256 行后只要约 30 MB。
+        var bandRows: Int? = nil
         /// 草稿模式：跳过高质量去马赛克，模拟器上避免等待 MobileAsset 相机描述。
         var draftMode: Bool = false
     }
@@ -25,13 +28,72 @@ enum RawDecoder {
     enum DecodeError: Error, CustomStringConvertible {
         case unsupported(String)
         case renderFailed(String)
+        case timeout(String)
 
         var description: String {
             switch self {
             case .unsupported(let message): return "RAW decode unsupported: \(message)"
             case .renderFailed(let message): return "RAW render failed: \(message)"
+            case .timeout(let message): return "RAW decode timeout: \(message)"
             }
         }
+    }
+
+    /// CIRAWFilter 首次初始化会查询系统 RAW 支持（MobileAsset）。系统或 App
+    /// 刚更新、网络不可用时，这个查询可能长时间不返回；解码必须放在独立并发
+    /// 队列并加超时，不能占住显影台的串行 loadQueue。
+    private final class ResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var result: Result<ImageRGB, Error>?
+
+        func set(_ value: Result<ImageRGB, Error>) {
+            lock.lock()
+            result = value
+            lock.unlock()
+        }
+
+        func get() -> Result<ImageRGB, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            return result
+        }
+    }
+
+    private static let decodeQueue = DispatchQueue(
+        label: "spektrafilm.raw.decode", qos: .userInitiated, attributes: .concurrent)
+    /// 最多允许两个解码卡在 MobileAsset 查询上；再多就直接走预览兜底。
+    private static let decodeSlots = DispatchSemaphore(value: 2)
+
+    static func decodeWithTimeout(url: URL, options: Options = Options(),
+                                  timeout: TimeInterval = 12) throws -> ImageRGB {
+        try decodeWithTimeout(url: url, options: options, timeout: timeout) { url, options in
+            try decode(url: url, options: options)
+        }
+    }
+
+    static func decodeWithTimeout(url: URL, options: Options, timeout: TimeInterval,
+                                  decoder: @escaping (URL, Options) throws -> ImageRGB) throws -> ImageRGB {
+        guard decodeSlots.wait(timeout: .now()) == .success else {
+            throw DecodeError.timeout("decoder busy")
+        }
+        let box = ResultBox()
+        let done = DispatchSemaphore(value: 0)
+        decodeQueue.async {
+            defer { decodeSlots.signal() }
+            do {
+                box.set(.success(try decoder(url, options)))
+            } catch {
+                box.set(.failure(error))
+            }
+            done.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            throw DecodeError.timeout("exceeded \(timeout)s")
+        }
+        guard let result = box.get() else {
+            throw DecodeError.renderFailed("no decode result")
+        }
+        return try result.get()
     }
 
     static func decode(url: URL, options: Options = Options()) throws -> ImageRGB {
@@ -85,28 +147,34 @@ enum RawDecoder {
 
         let linearSRGB = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
             ?? CGColorSpaceCreateDeviceRGB()
-        var buffer = [Float](repeating: 0, count: width * height * 4)
         let context = CIContext(options: [.workingColorSpace: linearSRGB])
-        buffer.withUnsafeMutableBytes { raw in
-            context.render(
-                output, toBitmap: raw.baseAddress!, rowBytes: width * 4 * MemoryLayout<Float>.size,
-                bounds: extent, format: .RGBAf, colorSpace: linearSRGB
-            )
-        }
+        var image: ImageRGB
+        if let bandRows = options.bandRows, bandRows > 0, height > bandRows {
+            image = renderBanded(output, width: width, height: height, bandRows: bandRows,
+                                 context: context, colorSpace: linearSRGB)
+        } else {
+            var buffer = [Float](repeating: 0, count: width * height * 4)
+            buffer.withUnsafeMutableBytes { raw in
+                context.render(
+                    output, toBitmap: raw.baseAddress!, rowBytes: width * 4 * MemoryLayout<Float>.size,
+                    bounds: extent, format: .RGBAf, colorSpace: linearSRGB
+                )
+            }
 
-        var values = [Double](repeating: 0, count: width * height * 3)
-        for i in 0..<(width * height) {
-            for c in 0..<3 { values[i * 3 + c] = Double(buffer[i * 4 + c]) }
+            // 直接从 RGBAf 收成 RGB Float，随后立刻释放 RGBA 缓冲；
+            // 34 MP 下比旧实现（RGBAf + Double RGB + Float RGB 三份并存）少约 1.3 GB。
+            image = ImageRGB(width: width, height: height, rgbaFloat: buffer)
+            buffer = []
         }
-        var image = ImageRGB(width: width, height: height, data: values)
         if options.outputColorSpace != "sRGB" {
-            image = image.map { pixel in
-                ColorMath.rgbToRGB(pixel, from: "sRGB", to: options.outputColorSpace)
+            let target = options.outputColorSpace
+            image.mapInPlace { pixel in
+                ColorMath.rgbToRGB(pixel, from: "sRGB", to: target)
             }
         }
         if options.outputCCTFEncoding {
             let kind = ColorMath.cctfKind(for: options.outputColorSpace)
-            image = image.map { pixel in
+            image.mapInPlace { pixel in
                 Vec3(
                     ColorMath.cctfEncode(pixel.x, kind: kind),
                     ColorMath.cctfEncode(pixel.y, kind: kind),
@@ -114,7 +182,58 @@ enum RawDecoder {
                 )
             }
         }
-        return image.sanitizedNonFinite()
+        image.sanitizeNonFinite()
+        return image
+    }
+
+    /// 按行分带渲染进整图。
+    ///
+    /// Core Image 的坐标原点在左下角，而 `ImageRGB` 的第 0 行是画面顶部：
+    /// 顶部第 `top` 行对应 CI 的 `extent.maxY - top - rows`。整图缓冲只分配一次，
+    /// 每条带的 RGBAf 缓冲渲染完立刻释放，峰值 = 整图 RGB + 一条带。
+    private static func renderBanded(
+        _ output: CIImage, width: Int, height: Int, bandRows: Int,
+        context: CIContext, colorSpace: CGColorSpace
+    ) -> ImageRGB {
+        var image = ImageRGB(width: width, height: height)
+        let rows = max(16, bandRows)
+        // 滤镜链的 extent 原点不保证是 (0,0)，带矩形必须按 extent 反推。
+        let extent = output.extent
+        var top = 0
+        while top < height {
+            let bandHeight = min(rows, height - top)
+            let rect = CGRect(x: extent.minX, y: extent.maxY - CGFloat(top + bandHeight),
+                              width: extent.width, height: CGFloat(bandHeight))
+            let band = output.cropped(to: rect)
+            var buffer = [Float](repeating: 0, count: width * bandHeight * 4)
+            buffer.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                context.render(
+                    band, toBitmap: base,
+                    rowBytes: width * 4 * MemoryLayout<Float>.size,
+                    bounds: rect, format: .RGBAf, colorSpace: colorSpace
+                )
+            }
+            image.data.withUnsafeMutableBufferPointer { destination in
+                guard let dst = destination.baseAddress else { return }
+                buffer.withUnsafeBufferPointer { source in
+                    guard let src = source.baseAddress else { return }
+                    // RGBA→RGB 步长不同（4→3），无法整行 memcpy，按行推进指针。
+                    for row in 0..<bandHeight {
+                        let srcRow = src + row * width * 4
+                        let dstRow = dst + (top + row) * width * 3
+                        for x in 0..<width {
+                            dstRow[x * 3] = srcRow[x * 4]
+                            dstRow[x * 3 + 1] = srcRow[x * 4 + 1]
+                            dstRow[x * 3 + 2] = srcRow[x * 4 + 2]
+                        }
+                    }
+                }
+            }
+            buffer = []
+            top += bandHeight
+        }
+        return image
     }
 
     /// 模拟器专用回退：`CIRAWFilter` 在 iOS 模拟器上会卡住（MobileAsset 拿不到相机描述）。
@@ -169,11 +288,10 @@ enum RawDecoder {
                 format: .RGBAf, colorSpace: linearSRGB
             )
         }
-        var values = [Double](repeating: 0, count: width * height * 3)
-        for i in 0..<(width * height) {
-            for c in 0..<3 { values[i * 3 + c] = Double(buffer[i * 4 + c]) }
-        }
-        return ImageRGB(width: width, height: height, data: values).sanitizedNonFinite()
+        var image = ImageRGB(width: width, height: height, rgbaFloat: buffer)
+        buffer = []
+        image.sanitizeNonFinite()
+        return image
     }
 
     /// 基础 EXIF（相机 / 镜头 / 焦距 / 光圈），供导出与界面显示使用。

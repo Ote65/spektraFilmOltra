@@ -232,4 +232,27 @@ enum FastGaussian {
     static func exponentialFilter(_ image: ImageRGB, decay: Double, nGaussians: Int = 3) -> ImageRGB {
         exponentialFilter(image, decay: [decay, decay, decay], nGaussians: nGaussians)
     }
+
+    /// 单通道指数滤波。语义与 `filter(image, sigma: decay)` 逐通道调用完全一致，
+    /// 只是不再为另外两个通道各留一张整图缓冲。
+    /// 返回的是已经按 Float 量化的通道（与原实现 `ImageRGB` 的写回精度一致）。
+    static func exponentialFilterChannel(_ input: [Double], width: Int, height: Int,
+                                         decay: Double, nGaussians: Int = 3) -> [Float] {
+        let fits = nGaussians == 2 ? exponentialFits2 : exponentialFits3
+        var result = [Float](repeating: 0, count: input.count)
+        for (index, fit) in fits.enumerated() {
+            let component = filterChannel(input, width: width, height: height,
+                                          sigma: decay * fit.1)
+            if index == 0 {
+                for i in 0..<result.count {
+                    result[i] = Float(fit.0 * component[i])
+                }
+            } else {
+                for i in 0..<result.count {
+                    result[i] += Float(fit.0 * component[i])
+                }
+            }
+        }
+        return result
+    }
 }

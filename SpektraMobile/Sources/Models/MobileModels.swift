@@ -151,6 +151,17 @@ enum MCaptureClassifier {
         "5712x4284", "4284x5712", "8064x6048", "6048x8064",
     ]
 
+    /// 正则只编译一次。整库扫描时每个资产都临时编译正则会产生大量分配，
+    /// 冷启动/安装后首次扫描会被拖成几十秒，表现就是「App 点了没反应」。
+    private static let hashedNameRegex = try! NSRegularExpression(pattern: #"^[0-9a-f]{16,}"#)
+    private static let imgNameRegex = try! NSRegularExpression(pattern: #"^img_\d{4,5}$"#)
+    private static let cameraNameRegex = try! NSRegularExpression(
+        pattern: #"^(dsc|dscf|dscn|pxl|mvimg|gopr|dji|_mg|l100|p\d{7})[_-]?\d*$"#)
+
+    private static func matches(_ regex: NSRegularExpression, _ string: String) -> Bool {
+        regex.firstMatch(in: string, range: NSRange(string.startIndex..., in: string)) != nil
+    }
+
     /// 基于 PHAsset 的零 IO 判定：子类型与 RAW 直接给结论，其余交给文件名规则。
     static func classify(asset: PHAsset, filename: String, isRaw: Bool) -> Verdict {
         if isRaw { return Verdict(isCaptured: true, confident: true) }
@@ -194,19 +205,16 @@ enum MCaptureClassifier {
         // iPhone 相机不产 PNG；相册里的 PNG 基本是截图或保存图。
         if ext == "png" { return Verdict(isCaptured: false, confident: true) }
         let base = (name as NSString).deletingPathExtension
-        if base.range(of: #"^[0-9a-f]{16,}"#, options: .regularExpression) != nil {
+        if matches(Self.hashedNameRegex, base) {
             return Verdict(isCaptured: false, confident: true)
         }
-        if base.range(of: #"^img_\d{4,5}$"#, options: .regularExpression) != nil {
+        if matches(Self.imgNameRegex, base) {
             if ext == "heic" || ext == "dng" || isStandardCameraSize(pixelWidth, pixelHeight) {
                 return Verdict(isCaptured: true, confident: true)
             }
             return Verdict(isCaptured: true, confident: false)
         }
-        if base.range(
-            of: #"^(dsc|dscf|dscn|pxl|mvimg|gopr|dji|_mg|l100|p\d{7})[_-]?\d*$"#,
-            options: .regularExpression
-        ) != nil {
+        if matches(Self.cameraNameRegex, base) {
             return Verdict(isCaptured: true, confident: true)
         }
         // 未知命名先看尺寸：标准相机尺寸更像拍摄，其余先归保存；两者都交给 EXIF 精修。
@@ -449,6 +457,59 @@ struct MGradeRecipe: Equatable {
     }
 
     init() {}
+
+    /// 按组覆盖调色配方：只写入选中的组，未选中的组保持当前值。
+    /// LUT 名称由会话按路径解析，这里只同步强度。
+    mutating func merge(_ grade: GradeRecipe, groups: Set<MGradeGroupKey>) {
+        if groups.contains(.light) {
+            exposure = grade.light.exposure
+            contrast = grade.light.contrast
+            highlights = grade.light.highlights
+            shadows = grade.light.shadows
+            whites = grade.light.whites
+            blacks = grade.light.blacks
+            midtones = grade.light.midtones
+            highlightRolloff = grade.light.highlightRolloff
+            curveHighlights = grade.light.curveHighlights
+            curveLights = grade.light.curveLights
+            curveDarks = grade.light.curveDarks
+            curveShadows = grade.light.curveShadows
+        }
+        if groups.contains(.color) {
+            temperature = grade.color.temperature
+            tint = grade.color.tint
+            saturation = grade.color.saturation
+            vibrance = grade.color.vibrance
+            colorDensity = grade.color.colorDensity
+            hslBands = (0..<8).map { index in
+                index < grade.color.hsl.count ? grade.color.hsl[index] : HslBand()
+            }
+            grading = grade.color.grading
+        }
+        if groups.contains(.optics) {
+            vignette = grade.optics.vignetteAmount
+            vignetteMidpoint = grade.optics.vignetteMidpoint
+            vignetteRoundness = grade.optics.vignetteRoundness
+            vignetteFeather = grade.optics.vignetteFeather
+            grain = grade.optics.grainAmount
+            grainSize = grade.optics.grainSize
+            grainRoughness = grade.optics.grainRoughness
+            chromaticAberration = grade.optics.chromaticAberration
+        }
+        if groups.contains(.quality) {
+            clarity = grade.quality.clarity
+            texture = grade.quality.texture
+            dehaze = grade.quality.dehaze
+            sharpenAmount = grade.quality.sharpenAmount
+            sharpenRadius = grade.quality.sharpenRadius
+            sharpenThreshold = grade.quality.sharpenThreshold
+            noiseLuminance = grade.quality.noiseLuminance
+            noiseColor = grade.quality.noiseColor
+        }
+        if groups.contains(.lut) {
+            lutStrength = grade.lut.strength
+        }
+    }
 }
 
 // MARK: - 显影预设
@@ -521,12 +582,186 @@ enum MobileDevelopPresets {
     ]
 }
 
+// MARK: - 用户显影预设
+
+/// 专业参数值：滑块 / 开关 / 下拉统一编码。
+enum MProValue: Codable, Hashable {
+    case number(Double)
+    case flag(Bool)
+    case option(String)
+
+    private enum CodingKeys: String, CodingKey { case kind, number, flag, option }
+    private enum Kind: String, Codable { case number, flag, option }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(Kind.self, forKey: .kind) {
+        case .number: self = .number(try c.decode(Double.self, forKey: .number))
+        case .flag: self = .flag(try c.decode(Bool.self, forKey: .flag))
+        case .option: self = .option(try c.decode(String.self, forKey: .option))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .number(let value):
+            try c.encode(Kind.number, forKey: .kind)
+            try c.encode(value, forKey: .number)
+        case .flag(let value):
+            try c.encode(Kind.flag, forKey: .kind)
+            try c.encode(value, forKey: .flag)
+        case .option(let value):
+            try c.encode(Kind.option, forKey: .kind)
+            try c.encode(value, forKey: .option)
+        }
+    }
+}
+
+/// 用户保存的显影预设：胶片组合 + 勾选的专业参数。
+struct MUserDevelopPreset: Identifiable, Codable, Hashable {
+    var id: String = UUID().uuidString
+    var name: String
+    var createdAt: Date = Date()
+    var filmID: String
+    var paperID: String
+    var monochrome: Bool
+    var pro: [String: MProValue]
+    /// 保存预设时的拍摄曝光基线；曝光补偿的 pro 值按「基线 + 调整量」解释。
+    /// 旧预设没有该字段，仍按绝对值套用，避免误加拍摄曝光。
+    var exposureBaselineEV: Double? = nil
+    var schema: Int = 1
+}
+
+/// 用户显影预设存储：与调色预设一致，落在 Application Support/Spektrafilm 的 JSON 文件里。
+final class MDevelopPresetStore {
+    static let shared = MDevelopPresetStore()
+
+    private(set) var userPresets: [MUserDevelopPreset] = []
+    private let directory: URL
+    private var presetsURL: URL { directory.appendingPathComponent("develop_presets.json") }
+
+    private struct Envelope: Codable {
+        var schema: Int = 1
+        var presets: [MUserDevelopPreset]
+    }
+
+    init(directory: URL? = nil) {
+        let base = directory ?? FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first?.appendingPathComponent("Spektrafilm") ?? URL(fileURLWithPath: NSHomeDirectory())
+        self.directory = base
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        load()
+    }
+
+    func reload() {
+        load()
+    }
+
+    func isNameTaken(_ name: String, excluding id: String? = nil) -> Bool {
+        let target = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !target.isEmpty else { return false }
+        if MobileDevelopPresets.all.contains(where: {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target
+        }) { return true }
+        return userPresets.contains {
+            $0.id != id && $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target
+        }
+    }
+
+    @discardableResult
+    func save(_ preset: MUserDevelopPreset) -> MUserDevelopPreset {
+        var resolved = preset
+        resolved.name = resolved.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if resolved.name.isEmpty { resolved.name = "未命名预设" }
+        userPresets.append(resolved)
+        persist()
+        return resolved
+    }
+
+    @discardableResult
+    func delete(id: String) -> Bool {
+        guard let index = userPresets.firstIndex(where: { $0.id == id }) else { return false }
+        userPresets.remove(at: index)
+        persist()
+        return true
+    }
+
+    func restore(_ preset: MUserDevelopPreset, at index: Int? = nil) {
+        guard !userPresets.contains(where: { $0.id == preset.id }) else { return }
+        if let index, index >= 0, index <= userPresets.count {
+            userPresets.insert(preset, at: index)
+        } else {
+            userPresets.append(preset)
+        }
+        persist()
+    }
+
+    func preset(id: String) -> MUserDevelopPreset? {
+        userPresets.first { $0.id == id }
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: presetsURL),
+              let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
+            userPresets = []
+            return
+        }
+        userPresets = envelope.presets
+    }
+
+    private func persist() {
+        let envelope = Envelope(presets: userPresets)
+        guard let data = try? JSONEncoder().encode(envelope) else { return }
+        try? data.write(to: presetsURL, options: .atomic)
+    }
+}
+
 enum MScreen: Hashable {
     case home
     case camera
     case develop
     case grade
     case settings
+}
+
+/// 直出保存请求：根视图负责决定是否保留 RAW 与工程。
+struct MDirectSaveRequest {
+    let rawURL: URL
+    let renderedURL: URL
+    let edit: PhotoEdit
+    let grade: GradeRecipe
+    /// 直出成片页选择的片边；保存时在后台合成到成片，不重新显影。
+    var border = MFilmBorderConfig()
+    /// 快速控制基线（含拍摄曝光）；重新打开显影台时快速滑条回到 0 不会丢掉拍摄曝光。
+    var baseline: PhotoEdit? = nil
+}
+
+enum MDirectSaveOutcome {
+    case saved(String)
+    case denied
+    case failed(String)
+}
+
+/// 直出成片页「进入显影台」请求：把原始 DNG 入库，并沿用拍摄时选择的显影 / 调色预设。
+struct MDirectDevelopRequest {
+    let rawURL: URL
+    let renderedURL: URL
+    let edit: PhotoEdit
+    let grade: GradeRecipe
+    var baseline: PhotoEdit? = nil
+}
+
+enum MDirectDevelopOutcome {
+    case opened
+    case failed(String)
+}
+
+/// 全局 Toast 的可选操作（例如删除预设后的“撤销”）。
+struct MToastAction {
+    let title: String
+    let handler: () -> Void
 }
 
 enum MGradeEntry: Hashable {

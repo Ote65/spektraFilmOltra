@@ -47,6 +47,117 @@ struct CoreSmoke {
         log("library index ordering \(libraryReport)")
         let rawSize = try runRawDimensionSmoke()
         log("raw dimension \(rawSize)")
+        let rawTimeout = try runRawTimeoutSmoke()
+        log("raw timeout \(rawTimeout)")
+        let quickExposure = try runQuickExposureSmoke()
+        log("quick exposure \(quickExposure)")
+    }
+
+    /// 回归：拍摄曝光非 0 时，快速轴第一次离开 0 不能因为关闭印相补偿而按基线 EV 跳变。
+    private static func runQuickExposureSmoke() throws -> String {
+        var baseline = PhotoEdit()
+        baseline.enlarger.printExposureCompensation = true
+        baseline.enlarger.printExposure = 1
+        baseline.camera.exposureCompensationEV = -2
+
+        // 基线 EV 非 0：保留补偿，用印相曝光承载 0.1 EV 的小幅偏移。
+        var edit = baseline
+        QuickExposureMapping.apply(
+            cameraExposure: -0.1, baseline: baseline,
+            quickIntents: ["camera_exposure": -0.1], edit: &edit)
+        guard edit.enlarger.printExposureCompensation else {
+            throw smokeError(11, "capture baseline dropped print compensation")
+        }
+        guard abs(edit.camera.exposureCompensationEV + 2.1) < 1e-9 else {
+            throw smokeError(12, "camera exposure \(edit.camera.exposureCompensationEV)")
+        }
+        // 印相曝光只应变化 2^0.1，而不是补偿撤掉后的 2^|基线 EV|。
+        let expected = pow(2.0, 0.1)
+        guard abs(edit.enlarger.printExposure - expected) < 1e-9 else {
+            throw smokeError(13, "print exposure \(edit.enlarger.printExposure) != \(expected)")
+        }
+
+        // 回到 0 逐位恢复基线。
+        QuickExposureMapping.apply(
+            cameraExposure: 0, baseline: baseline,
+            quickIntents: ["camera_exposure": 0], edit: &edit)
+        guard edit.enlarger.printExposureCompensation,
+              abs(edit.camera.exposureCompensationEV + 2) < 1e-9,
+              abs(edit.enlarger.printExposure - 1) < 1e-9 else {
+            throw smokeError(14, "zero did not restore baseline")
+        }
+
+        // 基线 EV 为 0：仍按原生行为关闭补偿，让曝光变化可见。
+        var zeroBaseline = baseline
+        zeroBaseline.camera.exposureCompensationEV = 0
+        var zeroEdit = zeroBaseline
+        QuickExposureMapping.apply(
+            cameraExposure: -0.1, baseline: zeroBaseline,
+            quickIntents: ["camera_exposure": -0.1], edit: &zeroEdit)
+        guard !zeroEdit.enlarger.printExposureCompensation else {
+            throw smokeError(15, "zero baseline should disable compensation")
+        }
+
+        // 两条快速轴共用印相曝光：偏移必须叠加，后拖动不能覆盖前一条。
+        let combined = QuickExposureMapping.printExposure(
+            baseline: baseline, cameraEV: -1, printEV: 0.5)
+        guard abs(combined - pow(2.0, 0.5)) < 1e-9 else {
+            throw smokeError(16, "camera and print offsets did not combine")
+        }
+
+        // 用户预设按保存时基线换算：-1 EV 保存的预设套到当前 -1 EV，仍是 -1 EV。
+        let repeated = QuickExposureMapping.presetExposure(
+            absolute: -1, savedBaseline: -1, currentBaseline: -1)
+        guard abs(repeated + 1) < 1e-9 else {
+            throw smokeError(17, "preset double counted exposure \(repeated)")
+        }
+        // 旧预设没有基线字段：保持原来的绝对覆盖。
+        let legacy = QuickExposureMapping.presetExposure(
+            absolute: -1, savedBaseline: nil, currentBaseline: -1)
+        guard abs(legacy + 1) < 1e-9 else {
+            throw smokeError(18, "legacy preset changed \(legacy)")
+        }
+        return "ok"
+    }
+
+    private static func smokeError(_ code: Int, _ message: String) -> NSError {
+        NSError(domain: "smoke", code: code, userInfo: [
+            NSLocalizedDescriptionKey: message
+        ])
+    }
+
+    /// 回归：CIRAWFilter 首次查询可能长时间不返回。超时必须在限定时间内抛出，
+    /// 让 ImageLoader 走预览兜底，而不是把显影台卡在「读取 RAW」。
+    private static func runRawTimeoutSmoke() throws -> String {
+        let url = URL(fileURLWithPath: "/tmp/spektra-raw-timeout.dng")
+        let start = Date()
+        do {
+            _ = try RawDecoder.decodeWithTimeout(url: url, options: .init(), timeout: 0.2) { _, _ in
+                Thread.sleep(forTimeInterval: 1.0)
+                return ImageRGB(width: 2, height: 2,
+                                data: [Double](repeating: 0, count: 12))
+            }
+            throw NSError(domain: "smoke", code: 9, userInfo: [
+                NSLocalizedDescriptionKey: "expected RAW timeout"
+            ])
+        } catch {
+            let elapsed = Date().timeIntervalSince(start)
+            guard elapsed < 0.8 else {
+                throw NSError(domain: "smoke", code: 10, userInfo: [
+                    NSLocalizedDescriptionKey: "timeout waited \(elapsed)s"
+                ])
+            }
+        }
+        let image = try RawDecoder.decodeWithTimeout(url: url, options: .init(), timeout: 1.0) { _, _ in
+            ImageRGB(width: 3, height: 2,
+                     data: [Double](repeating: 0, count: 18))
+        }
+        guard image.width == 3, image.height == 2 else {
+            throw NSError(domain: "smoke", code: 11, userInfo: [
+                NSLocalizedDescriptionKey: "timeout wrapper returned wrong image"
+            ])
+        }
+        return "pass"
     }
 
     /// 回归：iOS ImageIO 会把部分 ARW 的 index 0 报成内嵌预览（1616×1080）。

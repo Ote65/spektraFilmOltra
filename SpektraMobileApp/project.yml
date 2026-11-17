@@ -9,6 +9,11 @@ settings:
     SWIFT_VERSION: "5.0"
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     CODE_SIGN_STYLE: Automatic
+  configs:
+    # 显影是重计算：-Onone 下 12 MP 直出会慢 20 倍以上，看起来像卡死。
+    # Debug 也用 -O，保留调试符号，只牺牲部分变量可视化。
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
 targets:
   SpektraMobile:
     type: application
@@ -32,8 +37,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: Spektrafilm
-        CFBundleShortVersionString: 0.4.1
-        CFBundleVersion: 4
+        CFBundleShortVersionString: 0.4.4
+        CFBundleVersion: 7
         LSRequiresIPhoneOS: true
         UILaunchScreen:
           UIColorName: LaunchBackground

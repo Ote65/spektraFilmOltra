@@ -67,8 +67,9 @@ final class MThumbnailCache {
         }
         if let group = inFlight[key] {
             // 已有相同 URL 在解码：释放锁后等待，避免在锁内阻塞。
+            // 加超时：损坏文件 / 磁盘异常导致解码永远不返回时，调用线程（可能含主线程）不会被永久挂住。
             lock.unlock()
-            group.wait()
+            _ = group.wait(timeout: .now() + 6)
             lock.lock()
             defer { lock.unlock() }
             return cache.object(forKey: key as NSString)
@@ -113,6 +114,13 @@ final class MThumbnailCache {
     func remove(path: String) {
         lock.lock()
         cache.removeObject(forKey: path as NSString)
+        lock.unlock()
+    }
+
+    /// 设置页清理缓存：缩略图只是解码加速层，清空后会按需重新读盘。
+    func removeAll() {
+        lock.lock()
+        cache.removeAllObjects()
         lock.unlock()
     }
 }

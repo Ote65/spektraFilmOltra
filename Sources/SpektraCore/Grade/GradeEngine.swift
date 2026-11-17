@@ -65,6 +65,25 @@ enum GradeEngine {
         ])
     }()
 
+    /// 线性 ProPhoto float → 线性 sRGB float（原地版，导出大图时省一张整图）。
+    static func prepareSourceInPlace(_ image: inout ImageRGB) {
+        let matrix = proPhotoToSRGB
+        let count = image.data.count
+        image.data.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var index = 0
+            while index < count {
+                let converted = matrix.apply(Vec3(Double(base[index]),
+                                                  Double(base[index + 1]),
+                                                  Double(base[index + 2])))
+                base[index] = Float(converted.x)
+                base[index + 1] = Float(converted.y)
+                base[index + 2] = Float(converted.z)
+                index += 3
+            }
+        }
+    }
+
     /// 线性 ProPhoto float → 线性 sRGB float。
     static func prepareSource(_ image: ImageRGB) -> ImageRGB {
         let matrix = proPhotoToSRGB
@@ -97,11 +116,203 @@ enum GradeEngine {
         guard sourceLinearSRGB.width > 0, sourceLinearSRGB.height > 0 else {
             return GradeRenderResult(image: sourceLinearSRGB, analysis: .neutral)
         }
-        let count = sourceLinearSRGB.width * sourceLinearSRGB.height
-        var data = [Double](repeating: 0, count: count * 3)
-        for i in 0..<(count * 3) { data[i] = Double(sourceLinearSRGB.data[i]) }
         let width = sourceLinearSRGB.width
         let height = sourceLinearSRGB.height
+        let count = width * height
+        var data = [Double](repeating: 0, count: count * 3)
+        for i in 0..<(count * 3) { data[i] = Double(sourceLinearSRGB.data[i]) }
+        return try renderPrepared(&data, width: width, height: height, recipe: recipe,
+                                  analyze: analyze, shouldCancel: shouldCancel)
+    }
+
+    /// 导出专用：把源图读进工作缓冲后立刻把源缓冲置空，
+    /// 大图在后续滤镜阶段不再多背一张整图（34 MP 下约 400 MB）。
+    @discardableResult
+    static func renderInPlace(
+        _ source: inout ImageRGB,
+        recipe: GradeRecipe,
+        analyze: Bool = true,
+        shouldCancel: (() -> Bool)? = nil
+    ) throws -> GradeRenderResult {
+        guard source.width > 0, source.height > 0 else {
+            return GradeRenderResult(image: source, analysis: .neutral)
+        }
+        let width = source.width
+        let height = source.height
+        let count = width * height
+        var data = [Double](repeating: 0, count: count * 3)
+        source.data.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            for i in 0..<(count * 3) { data[i] = Double(base[i]) }
+        }
+        source = ImageRGB(width: 0, height: 0)
+        return try renderPrepared(&data, width: width, height: height, recipe: recipe,
+                                  analyze: analyze, shouldCancel: shouldCancel)
+    }
+
+    /// 分带调色：整图只保留 Float 成品，工作缓冲按带分配。
+    ///
+    /// 48 MP 的整图 Double 工作缓冲是 1.17 GB，加辅助 Float 图会到 1.6 GB，
+    /// 6 GB 机型直接被 jetsam；这里改成逐带读 Double、逐带写回 Float，
+    /// 峰值 = 整图 Float + 一条带（含重叠行）。
+    /// 局部滤镜按整图短边算半径，靠 `halo` 行重叠保证带与带之间没有接缝；
+    /// 暗角 / 色差 / 颗粒用绝对行号，避免每条带各自重新居中。
+    @discardableResult
+    static func renderTiledInPlace(
+        _ image: inout ImageRGB,
+        recipe: GradeRecipe,
+        bandRows: Int = 512,
+        shouldCancel: (() -> Bool)? = nil
+    ) throws -> GradeRenderResult {
+        guard image.width > 0, image.height > 0 else {
+            return GradeRenderResult(image: image, analysis: .neutral)
+        }
+        let width = image.width
+        let height = image.height
+        let fullShortEdge = max(1, min(width, height))
+        let halo = bandHalo(width: width, height: height, recipe: recipe)
+        let rows = max(64, bandRows)
+        let (analysis, airlight) = globalStats(image, recipe: recipe)
+        // halo 行必须是**未处理**的原始输入：如果直接读回上一条带的成品，
+        // 局部滤镜在带边界会看到「已锐化 / 已降噪」与「原始」混在一起的输入，
+        // 结果就是每条带的第一行出现一条接缝。因此源图与成品必须各占一份整图
+        // Float（48 MP 约 585 MB，已计入 ExportEdge 的 gradePeak 预算）；
+        // 成品缓冲显式分配，不靠写回时的隐式 COW 复制。
+        let source = image
+        var output = ImageRGB(width: width, height: height)
+
+        var top = 0
+        var bandIndex = 0
+        while top < height {
+            if shouldCancel?() == true { throw GradeCancelled.cancelled }
+            let coreRows = min(rows, height - top)
+            let bandTop = max(0, top - halo)
+            let bandBottom = min(height, top + coreRows + halo)
+            let bandHeight = bandBottom - bandTop
+            let count = width * bandHeight
+            var data = [Double](repeating: 0, count: count * 3)
+            source.data.withUnsafeBufferPointer { raw in
+                data.withUnsafeMutableBufferPointer { destination in
+                    guard let src = raw.baseAddress, let dst = destination.baseAddress else { return }
+                    let start = bandTop * width * 3
+                    for i in 0..<(count * 3) { dst[i] = Double(src[start + i]) }
+                }
+            }
+
+            applyExposureWB(&data, count: count,
+                            exposure: recipe.light.exposure,
+                            temperature: recipe.color.temperature,
+                            tint: recipe.color.tint)
+            srgbEncode(&data, count: count)
+            applyTone(&data, width: width, height: bandHeight, light: recipe.light)
+            applyColor(&data, count: count, color: recipe.color)
+            applyTransparency(&data, count: count, recipe: recipe.transparency, analysis: analysis)
+            applyClarityStructure(&data, width: width, height: bandHeight,
+                                  quality: recipe.quality, fullShortEdge: fullShortEdge)
+            applyDehaze(&data, width: width, height: bandHeight,
+                        amount: recipe.quality.dehaze, fullShortEdge: fullShortEdge,
+                        airlight: airlight)
+            applyNoiseReduction(&data, width: width, height: bandHeight,
+                                quality: recipe.quality, fullShortEdge: fullShortEdge)
+            applySharpening(&data, width: width, height: bandHeight,
+                            quality: recipe.quality, fullShortEdge: fullShortEdge)
+            applyOptics(&data, width: width, height: bandHeight,
+                        optics: recipe.optics,
+                        rowOffset: bandTop, fullHeight: height,
+                        fullShortEdge: fullShortEdge,
+                        seed: 20240101 &+ UInt64(bandIndex &* 7919),
+                        banded: true)
+            let lutError = applyLUT(&data, count: count, path: recipe.lut.path,
+                                    strength: recipe.lut.strength)
+            postprocess(&data)
+            if lutError != nil {
+                image = ImageRGB(width: 0, height: 0)
+                return GradeRenderResult(image: ImageRGB(width: 0, height: 0),
+                                         analysis: analysis, lutError: lutError)
+            }
+
+            let coreStart = top - bandTop
+            output.data.withUnsafeMutableBufferPointer { destination in
+                data.withUnsafeBufferPointer { band in
+                    guard let dst = destination.baseAddress, let src = band.baseAddress else { return }
+                    let rowsToCopy = coreRows * width * 3
+                    let srcOffset = coreStart * width * 3
+                    let dstOffset = top * width * 3
+                    for i in 0..<rowsToCopy { dst[dstOffset + i] = Float(src[srcOffset + i]) }
+                }
+            }
+            top += coreRows
+            bandIndex += 1
+        }
+        image = ImageRGB(width: 0, height: 0)
+        return GradeRenderResult(image: output, analysis: analysis)
+    }
+
+    /// 分带调色需要向上下多读的行数：覆盖所有局部滤镜的最大半径。
+    private static func bandHalo(width: Int, height: Int, recipe: GradeRecipe) -> Int {
+        let shortEdge = Double(max(1, min(width, height)))
+        var radius = 0.0
+        let quality = recipe.quality
+        if abs(quality.clarity) > 1e-6 || abs(quality.texture) > 1e-6 {
+            radius = max(radius, shortEdge * 0.008)
+        }
+        if quality.dehaze > 1e-6 {
+            let window = max(3.0, (shortEdge * 0.02).rounded())
+            radius = max(radius, window / 2)
+        }
+        if quality.noiseLuminance > 1e-6 || quality.noiseColor > 1e-6 {
+            radius = max(radius, shortEdge * 0.0025)
+        }
+        if quality.sharpenAmount > 1e-6 {
+            let scale = max(0.6, min(2.0, shortEdge / 1080))
+            radius = max(radius, quality.sharpenRadius * scale * 2.6)
+        }
+        if recipe.optics.grainAmount > 1e-6 {
+            let scale = max(0.6, min(3.0, shortEdge / 1080))
+            radius = max(radius, (0.6 + recipe.optics.grainSize / 100 * 3.0) * scale)
+        }
+        if recipe.optics.chromaticAberration > 1e-6 {
+            radius = max(radius, Double(max(width, height)) * 0.004 / 2)
+        }
+        return max(16, Int(ceil(radius)) + 12)
+    }
+
+    /// 全局统计只取 1200 长边代理图，保证每条带用同一份黑场 / 白场 / 空气光。
+    private static func globalStats(
+        _ image: ImageRGB, recipe: GradeRecipe
+    ) -> (ToneAnalysis, Double) {
+        let proxy = Resize.longEdge(image, maxSize: 1200)
+        var data = [Double](repeating: 0, count: proxy.width * proxy.height * 3)
+        proxy.data.withUnsafeBufferPointer { source in
+            data.withUnsafeMutableBufferPointer { destination in
+                guard let src = source.baseAddress, let dst = destination.baseAddress else { return }
+                for i in 0..<(proxy.width * proxy.height * 3) { dst[i] = Double(src[i]) }
+            }
+        }
+        let count = proxy.width * proxy.height
+        applyExposureWB(&data, count: count,
+                        exposure: recipe.light.exposure,
+                        temperature: recipe.color.temperature,
+                        tint: recipe.color.tint)
+        srgbEncode(&data, count: count)
+        applyTone(&data, width: proxy.width, height: proxy.height, light: recipe.light)
+        applyColor(&data, count: count, color: recipe.color)
+        let analysis = analyzeTone(data, width: proxy.width, height: proxy.height)
+        guard recipe.quality.dehaze > 1e-6 else { return (analysis, 0) }
+        var samples = [Float](repeating: 0, count: count)
+        for i in 0..<count { samples[i] = Float(luma(data, i)) }
+        return (analysis, max(percentile(samples, 99), 0.30))
+    }
+
+    private static func renderPrepared(
+        _ data: inout [Double],
+        width: Int,
+        height: Int,
+        recipe: GradeRecipe,
+        analyze: Bool,
+        shouldCancel: (() -> Bool)?
+    ) throws -> GradeRenderResult {
+        let count = width * height
 
         func checkCancel() throws {
             if shouldCancel?() == true { throw GradeCancelled.cancelled }
@@ -163,60 +374,60 @@ enum GradeEngine {
         return t * t * (3 - 2 * t)
     }
 
-    private static func boxBlur(_ values: [Double], width: Int, height: Int,
-                                radius: Double) -> [Double] {
+    private static func boxBlur(_ values: [Float], width: Int, height: Int,
+                                radius: Double) -> [Float] {
         guard width > 0, height > 0 else { return values }
         let size = max(3, Int((radius * 2).rounded()) | 1)
         let half = size / 2
-        var horizontal = [Double](repeating: 0, count: values.count)
+        var horizontal = [Float](repeating: 0, count: values.count)
         var prefix = [Double](repeating: 0, count: max(width, height) + 1)
 
         for y in 0..<height {
             let row = y * width
             prefix[0] = 0
             for x in 0..<width {
-                prefix[x + 1] = prefix[x] + values[row + x]
+                prefix[x + 1] = prefix[x] + Double(values[row + x])
             }
             for x in 0..<width {
                 let low = max(0, x - half)
                 let high = min(width - 1, x + half)
-                horizontal[row + x] = (prefix[high + 1] - prefix[low]) / Double(high - low + 1)
+                horizontal[row + x] = Float((prefix[high + 1] - prefix[low]) / Double(high - low + 1))
             }
         }
 
-        var output = [Double](repeating: 0, count: values.count)
+        var output = [Float](repeating: 0, count: values.count)
         for x in 0..<width {
             prefix[0] = 0
             for y in 0..<height {
-                prefix[y + 1] = prefix[y] + horizontal[y * width + x]
+                prefix[y + 1] = prefix[y] + Double(horizontal[y * width + x])
             }
             for y in 0..<height {
                 let low = max(0, y - half)
                 let high = min(height - 1, y + half)
-                output[y * width + x] = (prefix[high + 1] - prefix[low]) / Double(high - low + 1)
+                output[y * width + x] = Float((prefix[high + 1] - prefix[low]) / Double(high - low + 1))
             }
         }
         return output
     }
 
-    private static func minimumFilter(_ values: [Double], width: Int, height: Int,
-                                      size: Int) -> [Double] {
+    private static func minimumFilter(_ values: [Float], width: Int, height: Int,
+                                      size: Int) -> [Float] {
         let half = max(1, size / 2)
-        var horizontal = [Double](repeating: 0, count: values.count)
+        var horizontal = [Float](repeating: 0, count: values.count)
         for y in 0..<height {
             let row = y * width
             for x in 0..<width {
-                var value = Double.greatestFiniteMagnitude
+                var value = Float.greatestFiniteMagnitude
                 for k in max(0, x - half)...min(width - 1, x + half) {
                     value = min(value, values[row + k])
                 }
                 horizontal[row + x] = value
             }
         }
-        var output = [Double](repeating: 0, count: values.count)
+        var output = [Float](repeating: 0, count: values.count)
         for x in 0..<width {
             for y in 0..<height {
-                var value = Double.greatestFiniteMagnitude
+                var value = Float.greatestFiniteMagnitude
                 for k in max(0, y - half)...min(height - 1, y + half) {
                     value = min(value, horizontal[k * width + x])
                 }
@@ -234,6 +445,16 @@ enum GradeEngine {
         let high = min(low + 1, sorted.count - 1)
         let fraction = position - Double(low)
         return sorted[low] * (1 - fraction) + sorted[high] * fraction
+    }
+
+    private static func percentile(_ values: [Float], _ percent: Double) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let position = Double(sorted.count - 1) * percent / 100
+        let low = Int(floor(position))
+        let high = min(low + 1, sorted.count - 1)
+        let fraction = position - Double(low)
+        return Double(sorted[low]) * (1 - fraction) + Double(sorted[high]) * fraction
     }
 
     private static func postprocess(_ data: inout [Double]) {
@@ -753,26 +974,28 @@ enum GradeEngine {
 
     // MARK: - 画质
 
-    private static func coreDetail(_ detail: [Double], threshold: Double) -> [Double] {
-        var output = detail
+    private static func coreDetailInPlace(_ detail: inout [Float], threshold: Double) {
+        let squaredThreshold = threshold * threshold
         for i in 0..<detail.count {
-            let squared = detail[i] * detail[i]
-            output[i] = detail[i] * squared / (squared + threshold * threshold)
+            let value = Double(detail[i])
+            let squared = value * value
+            detail[i] = Float(value * squared / (squared + squaredThreshold))
         }
-        return output
     }
 
     private static func applyClarityStructure(
-        _ data: inout [Double], width: Int, height: Int, quality: QualityRecipe
+        _ data: inout [Double], width: Int, height: Int, quality: QualityRecipe,
+        fullShortEdge: Int? = nil
     ) {
         let clarity = quality.clarity
         let texture = quality.texture
         guard abs(clarity) > 1e-6 || abs(texture) > 1e-6 else { return }
         let count = width * height
-        let shortEdge = max(1, min(width, height))
-        var logLuma = [Double](repeating: 0, count: count)
+        // 分带时按整图短边算半径，否则条带的短边会让清晰度半径和整图不一致。
+        let shortEdge = fullShortEdge ?? max(1, min(width, height))
+        var logLuma = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            logLuma[i] = log2(max(luma(data, i), 1e-4))
+            logLuma[i] = Float(log2(max(luma(data, i), 1e-4)))
         }
         let steps: [(Double, Double, Double)] = [
             (clarity, 0.008, 0.35),
@@ -782,7 +1005,7 @@ enum GradeEngine {
             let radius = max(1, Double(shortEdge) * ratio)
             let base = boxBlur(logLuma, width: width, height: height, radius: radius)
             for i in 0..<count {
-                let detail = logLuma[i] - base[i]
+                let detail = Double(logLuma[i]) - Double(base[i])
                 let shaped = detail / (1 + pow(detail / sigma, 2))
                 let gain = pow(2.0, amount / 100 * 0.5 * shaped)
                 data[i * 3] *= gain
@@ -793,7 +1016,8 @@ enum GradeEngine {
     }
 
     private static func applyDehaze(_ data: inout [Double], width: Int, height: Int,
-                                   amount: Double) {
+                                   amount: Double, fullShortEdge: Int? = nil,
+                                   airlight airlightOverride: Double? = nil) {
         guard abs(amount) > 1e-6 else { return }
         let count = width * height
         if amount < 0 {
@@ -804,19 +1028,26 @@ enum GradeEngine {
             return
         }
         let strength = 1 - pow(1 - amount / 100, 2)
-        let shortEdge = max(1, min(width, height))
-        var dark = [Double](repeating: 0, count: count)
+        let shortEdge = fullShortEdge ?? max(1, min(width, height))
+        var dark = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            dark[i] = min(data[i * 3], data[i * 3 + 1], data[i * 3 + 2])
+            let minimum = min(min(data[i * 3], data[i * 3 + 1]), data[i * 3 + 2])
+            dark[i] = Float(minimum)
         }
         let window = max(3, Int((Double(shortEdge) * 0.02).rounded()) | 1)
         let darkSmooth = minimumFilter(dark, width: width, height: height, size: window)
-        var lumaSamples = [Double](repeating: 0, count: count)
-        for i in 0..<count { lumaSamples[i] = luma(data, i) }
-        let airlight = max(percentile(lumaSamples, 99), 0.30)
+        // 分带时空气光由调用方从整图代理统一算好，避免每条带各算一份出现亮度台阶。
+        let airlight: Double
+        if let airlightOverride {
+            airlight = airlightOverride
+        } else {
+            var lumaSamples = [Float](repeating: 0, count: count)
+            for i in 0..<count { lumaSamples[i] = Float(luma(data, i)) }
+            airlight = max(percentile(lumaSamples, 99), 0.30)
+        }
         for i in 0..<count {
             let transmission = min(max(
-                1 - strength * 0.95 * darkSmooth[i] / max(airlight, 0.1), 0.1
+                1 - strength * 0.95 * Double(darkSmooth[i]) / max(airlight, 0.1), 0.1
             ), 1)
             data[i * 3] = airlight + (data[i * 3] - airlight) / transmission
             data[i * 3 + 1] = airlight + (data[i * 3 + 1] - airlight) / transmission
@@ -825,67 +1056,71 @@ enum GradeEngine {
     }
 
     private static func applyNoiseReduction(
-        _ data: inout [Double], width: Int, height: Int, quality: QualityRecipe
+        _ data: inout [Double], width: Int, height: Int, quality: QualityRecipe,
+        fullShortEdge: Int? = nil
     ) {
         let luminance = quality.noiseLuminance / 100
         let chroma = quality.noiseColor / 100
         guard luminance > 1e-6 || chroma > 1e-6 else { return }
         let count = width * height
-        let shortEdge = max(1, min(width, height))
+        let shortEdge = fullShortEdge ?? max(1, min(width, height))
         if luminance > 1e-6 {
-            var y = [Double](repeating: 0, count: count)
-            for i in 0..<count { y[i] = luma(data, i) }
+            var y = [Float](repeating: 0, count: count)
+            for i in 0..<count { y[i] = Float(luma(data, i)) }
             let smooth = boxBlur(y, width: width, height: height,
                                  radius: max(0.8, Double(shortEdge) * 0.0015))
             for i in 0..<count {
-                let delta = (smooth[i] - y[i]) * (luminance * 0.85)
+                let delta = (Double(smooth[i]) - Double(y[i])) * (luminance * 0.85)
                 data[i * 3] += delta
                 data[i * 3 + 1] += delta
                 data[i * 3 + 2] += delta
             }
         }
         if chroma > 1e-6 {
-            var cr = [Double](repeating: 0, count: count)
-            var cb = [Double](repeating: 0, count: count)
+            var cr = [Float](repeating: 0, count: count)
+            var cb = [Float](repeating: 0, count: count)
             for i in 0..<count {
                 let y = luma(data, i)
-                cr[i] = data[i * 3] - y
-                cb[i] = data[i * 3 + 2] - y
+                cr[i] = Float(data[i * 3] - y)
+                cb[i] = Float(data[i * 3 + 2] - y)
             }
             let radius = max(1, Double(shortEdge) * 0.0025)
             let crSmooth = boxBlur(cr, width: width, height: height, radius: radius)
+            for i in 0..<count {
+                data[i * 3] += (Double(crSmooth[i]) - Double(cr[i])) * (chroma * 0.85)
+            }
             let cbSmooth = boxBlur(cb, width: width, height: height, radius: radius)
             for i in 0..<count {
-                data[i * 3] += (crSmooth[i] - cr[i]) * (chroma * 0.85)
-                data[i * 3 + 2] += (cbSmooth[i] - cb[i]) * (chroma * 0.85)
+                data[i * 3 + 2] += (Double(cbSmooth[i]) - Double(cb[i])) * (chroma * 0.85)
             }
         }
     }
 
     private static func applySharpening(
-        _ data: inout [Double], width: Int, height: Int, quality: QualityRecipe
+        _ data: inout [Double], width: Int, height: Int, quality: QualityRecipe,
+        fullShortEdge: Int? = nil
     ) {
         let amount = quality.sharpenAmount / 100
         guard amount > 1e-6 else { return }
         let count = width * height
-        let shortEdge = max(1, min(width, height))
+        let shortEdge = fullShortEdge ?? max(1, min(width, height))
         let scale = max(0.6, min(2.0, Double(shortEdge) / 1080))
         let radius = quality.sharpenRadius * scale
-        var y = [Double](repeating: 0, count: count)
-        for i in 0..<count { y[i] = luma(data, i) }
+        var y = [Float](repeating: 0, count: count)
+        for i in 0..<count { y[i] = Float(luma(data, i)) }
         let blurOne = boxBlur(y, width: width, height: height,
                               radius: max(0.6, radius * 0.9))
         let blurWide = boxBlur(y, width: width, height: height,
                                radius: max(1.2, radius * 2.6))
         let threshold = 0.002 + quality.sharpenThreshold / 100 * 0.06
-        var detail = [Double](repeating: 0, count: count)
+        var detail = [Float](repeating: 0, count: count)
         for i in 0..<count { detail[i] = y[i] - blurOne[i] }
-        let core = coreDetail(detail, threshold: threshold)
-        var wide = [Double](repeating: 0, count: count)
+        coreDetailInPlace(&detail, threshold: threshold)
+        var wide = [Float](repeating: 0, count: count)
         for i in 0..<count { wide[i] = blurOne[i] - blurWide[i] }
-        let wideCore = coreDetail(wide, threshold: threshold)
+        coreDetailInPlace(&wide, threshold: threshold)
         for i in 0..<count {
-            let delta = (core[i] + 0.5 * wideCore[i]) * (amount * 2)
+            let delta = (Double(detail[i]) + 0.5 * Double(wide[i])) * (amount * 2)
             data[i * 3] += delta
             data[i * 3 + 1] += delta
             data[i * 3 + 2] += delta
@@ -895,16 +1130,19 @@ enum GradeEngine {
     // MARK: - 光学
 
     private static func applyVignette(_ data: inout [Double], width: Int, height: Int,
-                                      optics: OpticsRecipe) {
+                                      optics: OpticsRecipe,
+                                      rowOffset: Int = 0, fullHeight: Int? = nil) {
         let amount = optics.vignetteAmount / 100
         guard abs(amount) > 1e-6 else { return }
         let roundness = optics.vignetteRoundness / 100
         let midpoint = 0.20 + optics.vignetteMidpoint / 100 * 1.10
         let feather = max(0.05, optics.vignetteFeather / 100)
         let halfWidth = max(Double(width) / 2, 1)
-        let halfHeight = max(Double(height) / 2, 1)
+        // 分带时暗角必须按整图中心算，否则每条带都会重新居中，出现明暗台阶。
+        let centerY = Double(fullHeight ?? height) / 2
+        let halfHeight = max(Double(fullHeight ?? height) / 2, 1)
         for y in 0..<height {
-            let ny = (Double(y) - Double(height) / 2) / halfHeight * (1 - 0.25 * roundness)
+            let ny = (Double(y + rowOffset) - centerY) / halfHeight * (1 - 0.25 * roundness)
             for x in 0..<width {
                 let nx = (Double(x) - Double(width) / 2) / halfWidth * (1 + 0.25 * roundness)
                 let radius = sqrt(nx * nx + ny * ny)
@@ -919,7 +1157,7 @@ enum GradeEngine {
     }
 
     private static func bilinearSample(
-        _ channel: [Double], width: Int, height: Int,
+        _ channel: [Float], width: Int, height: Int,
         x: Double, y: Double
     ) -> Double {
         let x0 = Int(floor(x))
@@ -930,64 +1168,72 @@ enum GradeEngine {
         let xb = min(max(x0 + 1, 0), width - 1)
         let ya = min(max(y0, 0), height - 1)
         let yb = min(max(y0 + 1, 0), height - 1)
-        let top = channel[ya * width + xa] * (1 - fx) + channel[ya * width + xb] * fx
-        let bottom = channel[yb * width + xa] * (1 - fx) + channel[yb * width + xb] * fx
+        let top = Double(channel[ya * width + xa]) * (1 - fx) + Double(channel[ya * width + xb]) * fx
+        let bottom = Double(channel[yb * width + xa]) * (1 - fx) + Double(channel[yb * width + xb]) * fx
         return top * (1 - fy) + bottom * fy
     }
 
     private static func applyChromaticAberration(
-        _ data: inout [Double], width: Int, height: Int, amount: Double
+        _ data: inout [Double], width: Int, height: Int, amount: Double,
+        rowOffset: Int = 0, fullHeight: Int? = nil
     ) {
         let strength = amount / 100 * 0.004
         guard strength > 1e-6 else { return }
         let count = width * height
-        var red = [Double](repeating: 0, count: count)
-        var green = [Double](repeating: 0, count: count)
-        var blue = [Double](repeating: 0, count: count)
+        var red = [Float](repeating: 0, count: count)
+        var blue = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            red[i] = data[i * 3]
-            green[i] = data[i * 3 + 1]
-            blue[i] = data[i * 3 + 2]
+            red[i] = Float(data[i * 3])
+            blue[i] = Float(data[i * 3 + 2])
         }
-        let cy = Double(height) / 2
+        let fullH = fullHeight ?? height
+        let cy = Double(fullH) / 2
         let cx = Double(width) / 2
-        var outputRed = [Double](repeating: 0, count: count)
-        var outputBlue = [Double](repeating: 0, count: count)
+        var outputRed = [Float](repeating: 0, count: count)
+        var outputBlue = [Float](repeating: 0, count: count)
         for y in 0..<height {
+            // 分带采样：纵向按整图坐标偏移，再折回本条带的局部行号。
+            let absoluteY = Double(y + rowOffset)
+            let redY = cy + (absoluteY - cy) * (1 + strength) - Double(rowOffset)
+            let blueY = cy + (absoluteY - cy) * (1 - strength) - Double(rowOffset)
             for x in 0..<width {
                 let index = y * width + x
-                outputRed[index] = bilinearSample(
+                outputRed[index] = Float(bilinearSample(
                     red, width: width, height: height,
                     x: cx + (Double(x) - cx) * (1 + strength),
-                    y: cy + (Double(y) - cy) * (1 + strength)
-                )
-                outputBlue[index] = bilinearSample(
+                    y: redY
+                ))
+                outputBlue[index] = Float(bilinearSample(
                     blue, width: width, height: height,
                     x: cx + (Double(x) - cx) * (1 - strength),
-                    y: cy + (Double(y) - cy) * (1 - strength)
-                )
+                    y: blueY
+                ))
             }
         }
         for i in 0..<count {
-            data[i * 3] = outputRed[i]
-            data[i * 3 + 2] = outputBlue[i]
+            data[i * 3] = Double(outputRed[i])
+            data[i * 3 + 2] = Double(outputBlue[i])
         }
     }
 
     private static let grainLock = NSLock()
-    private static var grainCache: [String: [Double]] = [:]
+    private static var grainCache: [String: [Float]] = [:]
 
     /// 确定性噪声；与 numpy `default_rng(20240101)` 不逐位一致，但同尺寸同种子稳定。
-    private static func grainNoise(width: Int, height: Int) -> [Double] {
+    /// `useCache` 为 false 时（分带调色）每次按带的种子现算，避免所有带复用同一张噪声。
+    private static func grainNoise(width: Int, height: Int, seed: UInt64 = 20240101,
+                                   useCache: Bool = true) -> [Float] {
         let key = "\(width)x\(height)"
-        grainLock.lock()
-        if let cached = grainCache[key] {
+        if useCache {
+            grainLock.lock()
+            if let cached = grainCache[key] {
+                grainLock.unlock()
+                return cached
+            }
             grainLock.unlock()
-            return cached
         }
-        grainLock.unlock()
-        var noise = [Double](repeating: 0, count: width * height)
-        var state: UInt64 = 20240101
+        var noise = [Float](repeating: 0, count: width * height)
+        var state: UInt64 = seed
         func next() -> Double {
             state &+= 0x9E3779B97F4A7C15
             var z = state
@@ -1001,23 +1247,27 @@ enum GradeEngine {
             let u2 = next()
             let radius = sqrt(-2 * log(u1))
             let angle = 2 * Double.pi * u2
-            noise[i] = radius * cos(angle)
-            if i + 1 < noise.count { noise[i + 1] = radius * sin(angle) }
+            noise[i] = Float(radius * cos(angle))
+            if i + 1 < noise.count { noise[i + 1] = Float(radius * sin(angle)) }
         }
-        grainLock.lock()
-        if grainCache.count >= 4 { grainCache.removeAll() }
-        grainCache[key] = noise
-        grainLock.unlock()
+        if useCache {
+            grainLock.lock()
+            // 大图噪声很大，只保留最近两份，避免缓存反噬内存。
+            if grainCache.count >= 2 { grainCache.removeAll() }
+            grainCache[key] = noise
+            grainLock.unlock()
+        }
         return noise
     }
 
     private static func applyGrain(_ data: inout [Double], width: Int, height: Int,
-                                   optics: OpticsRecipe) {
+                                   optics: OpticsRecipe, fullShortEdge: Int? = nil,
+                                   seed: UInt64 = 20240101, useCache: Bool = true) {
         let amount = optics.grainAmount / 100
         guard amount > 1e-6 else { return }
         let count = width * height
-        var noise = grainNoise(width: width, height: height)
-        let scale = max(0.6, min(3.0, Double(min(width, height)) / 1080))
+        var noise = grainNoise(width: width, height: height, seed: seed, useCache: useCache)
+        let scale = max(0.6, min(3.0, Double(fullShortEdge ?? min(width, height)) / 1080))
         let sigma = (0.6 + optics.grainSize / 100 * 3.0) * scale
         if sigma > 0.9 {
             noise = boxBlur(noise, width: width, height: height, radius: sigma)
@@ -1025,22 +1275,26 @@ enum GradeEngine {
         let roughness = optics.grainRoughness / 100
         if roughness > 1e-6 {
             for i in 0..<count {
-                noise[i] = (noise[i] < 0 ? -1 : 1) * pow(abs(noise[i]), 1 - roughness * 0.7)
+                let value = Double(noise[i])
+                noise[i] = Float((value < 0 ? -1 : 1) * pow(abs(value), 1 - roughness * 0.7))
             }
         }
         var mean = 0.0
-        for value in noise { mean += value }
+        for value in noise { mean += Double(value) }
         mean /= Double(count)
         var variance = 0.0
-        for value in noise { variance += (value - mean) * (value - mean) }
+        for value in noise {
+            let delta = Double(value) - mean
+            variance += delta * delta
+        }
         let deviation = sqrt(variance / Double(count))
         if deviation > 1e-6 {
-            for i in 0..<count { noise[i] /= deviation }
+            for i in 0..<count { noise[i] = Float(Double(noise[i]) / deviation) }
         }
         for i in 0..<count {
             let y = luma(data, i)
             let weight = 0.4 + 0.6 * 4 * y * max(1 - y, 0)
-            let delta = noise[i] * (amount * 0.06) * weight
+            let delta = Double(noise[i]) * (amount * 0.06) * weight
             data[i * 3] += delta
             data[i * 3 + 1] += delta
             data[i * 3 + 2] += delta
@@ -1048,11 +1302,18 @@ enum GradeEngine {
     }
 
     private static func applyOptics(_ data: inout [Double], width: Int, height: Int,
-                                    optics: OpticsRecipe) {
-        applyVignette(&data, width: width, height: height, optics: optics)
+                                    optics: OpticsRecipe,
+                                    rowOffset: Int = 0, fullHeight: Int? = nil,
+                                    fullShortEdge: Int? = nil,
+                                    seed: UInt64 = 20240101,
+                                    banded: Bool = false) {
+        applyVignette(&data, width: width, height: height, optics: optics,
+                      rowOffset: rowOffset, fullHeight: fullHeight)
         applyChromaticAberration(&data, width: width, height: height,
-                                 amount: optics.chromaticAberration)
-        applyGrain(&data, width: width, height: height, optics: optics)
+                                 amount: optics.chromaticAberration,
+                                 rowOffset: rowOffset, fullHeight: fullHeight)
+        applyGrain(&data, width: width, height: height, optics: optics,
+                   fullShortEdge: fullShortEdge, seed: seed, useCache: !banded)
     }
 
     // MARK: - LUT

@@ -8,6 +8,7 @@ struct DevelopScreen: View {
     /// 吸入动画进行时隐藏原画布，避免照片被吸入后原位还留着一张。
     let previewHidden: Bool
     let onToast: (String) -> Void
+    let onToastAction: (String, MToastAction) -> Void
 
     @State private var mode = DebugLaunch.modePro ? 1 : 0
     @State private var page = DebugLaunch.developPage
@@ -36,6 +37,10 @@ struct DevelopScreen: View {
         nonmutating set { canvas.chromeHidden = newValue }
     }
     @State private var exportOpen = DebugLaunch.exportOpen
+    /// 保存预设弹窗与用户预设列表。
+    @State private var presetSaveOpen = false
+    @State private var userPresets: [MUserDevelopPreset] = MDevelopPresetStore.shared.userPresets
+    @State private var openedPresetRowID: String?
     @State private var stageSize: CGSize = .zero
     // 分栏右栏的直方图：随预览图刷新，后台采样不阻塞显影渲染。
     @State private var histogram = MHistogramData.empty
@@ -125,6 +130,16 @@ struct DevelopScreen: View {
         }
         .onChange(of: session.previewImage) { _, image in
             refreshHistogram(image)
+        }
+        .sheet(isPresented: $presetSaveOpen) {
+            MDevelopPresetSaveSheet(session: session) { saved in
+                userPresets = MDevelopPresetStore.shared.userPresets
+                onToast("已保存预设 · \(saved.name)")
+            }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationCornerRadius(MRadius.sheet)
+            .presentationBackground(MColor.surface1)
         }
     }
 
@@ -259,6 +274,15 @@ struct DevelopScreen: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
 
+                if let note = session.loadNote {
+                    Text(note)
+                        .font(.mSans(9, .medium))
+                        .foregroundStyle(MColor.brassHigh.opacity(0.92))
+                        .padding(.horizontal, 12)
+                        .padding(.top, 2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 // 直方图：macOS 编辑页同款卡片，显影参数调整时观察影调分布。
                 splitHistogramCard
                     .padding(.horizontal, 12)
@@ -341,6 +365,21 @@ struct DevelopScreen: View {
                 VStack(alignment: .leading, spacing: 2) {
                     switch railTab {
                     case 0:
+                        if !userPresets.isEmpty {
+                            Text("我的预设")
+                                .mLabel(8, color: MColor.text4)
+                                .padding(.top, 4)
+                            ForEach(userPresets) { preset in
+                                MSwipeDeleteRow(rowID: preset.id,
+                                                openedID: $openedPresetRowID,
+                                                onDelete: { deleteUserPreset(preset) }) {
+                                    userDevelopPresetRow(preset)
+                                }
+                            }
+                            Text("内置预设")
+                                .mLabel(8, color: MColor.text4)
+                                .padding(.top, 10)
+                        }
                         ForEach(MobileDevelopPresets.all) { preset in
                             developPresetRow(preset)
                         }
@@ -359,7 +398,6 @@ struct DevelopScreen: View {
 
                         if mode == 1 {
                             proGroupsView(2)
-                            resetButton("重置专业参数", action: resetPro)
                         }
                     default:
                         ForEach(MobileCatalog.papers) { paper in paperRow(paper) }
@@ -376,7 +414,7 @@ struct DevelopScreen: View {
 
     private var railCountLabel: String {
         switch railTab {
-        case 0: return "\(MobileDevelopPresets.all.count) 个"
+        case 0: return "\(MobileDevelopPresets.all.count + userPresets.count) 个"
         case 1: return "\(MobileCatalog.films.count) 种"
         default: return "\(MobileCatalog.papers.count) 种"
         }
@@ -485,12 +523,16 @@ struct DevelopScreen: View {
             Spacer(minLength: 0)
 
             // 调色入口从底部页签移到顶栏，和调色台的导出按钮同一套黄铜胶囊。
+            MBrassCircleButton(icon: "bookmark", size: 32) {
+                presetSaveOpen = true
+            }
+
             MBrassPill(title: "调色", icon: "slider.horizontal.3", height: 32) {
                 openGrade()
             }
             .accessibilityLabel("进入调色台")
         }
-        .frame(height: 34)
+        .frame(height: 44)
         .padding(.horizontal, 14)
         .overlay(alignment: .center) {
             // 分栏下快速/专业移到参数栏顶部：画布顶部只留返回与调色入口。
@@ -577,7 +619,14 @@ struct DevelopScreen: View {
 
     @ViewBuilder private var capsuleProgressText: some View {
         // 有开孔时文字归 MHousingAura 画在开孔下方；无开孔机型没有让位空间，才落在胶囊下方。
-        if session.isRendering, housing == .none {
+        if let note = session.loadNote, !session.isRendering {
+            Text(note)
+                .font(.mSans(9, .medium))
+                .foregroundStyle(MColor.brassHigh.opacity(0.92))
+                .shadow(color: .black.opacity(0.6), radius: 2)
+                .offset(y: 24)
+                .allowsHitTesting(false)
+        } else if session.isRendering, housing == .none {
             Text(session.phaseLabel.isEmpty ? "显影中" : session.phaseLabel)
                 .font(.mSans(9, .medium))
                 .foregroundStyle(MColor.brassHigh.opacity(0.92))
@@ -885,6 +934,12 @@ struct DevelopScreen: View {
 
             Spacer(minLength: 0)
 
+            MCircleIconButton(icon: "arrow.counterclockwise", size: 10, frame: 28) {
+                session.resetAllDevelop()
+                onToast("已重置显影参数")
+            }
+            .accessibilityLabel("重置显影参数")
+
             MCircleIconButton(icon: "arrow.uturn.backward", size: 10, frame: 28) {
                 session.undo()
             }
@@ -892,6 +947,35 @@ struct DevelopScreen: View {
             .allowsHitTesting(session.canUndo)
             .accessibilityLabel("撤销")
         }
+    }
+
+    /// 快速页冻结提示：专业模式接管后，快速滑条不再生效。
+    private var frozenQuickBanner: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(MColor.brass)
+            Text("专业模式有调整，重置参数后恢复")
+                .font(.mSans(9.5, .medium))
+                .foregroundStyle(MColor.text2)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Button("重置显影") {
+                MHaptic.tick()
+                withAnimation(MMotion.state) { session.resetAllDevelop() }
+                onToast("已重置显影参数")
+            }
+            .font(.mSans(9, .semibold))
+            .foregroundStyle(MColor.brass)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 44)
+        .background(Capsule().fill(MColor.brassWash))
+        .overlay(Capsule().strokeBorder(MColor.brass.opacity(0.25), lineWidth: 1))
+        .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
     // MARK: - 抽屉
@@ -1041,8 +1125,29 @@ struct DevelopScreen: View {
     private var developPresetPage: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 0) {
-                MSectionHead(title: "显影预设", trailing: "\(MobileDevelopPresets.all.count) 个")
+                MSectionHead(title: "显影预设",
+                             trailing: "\(userPresets.count + MobileDevelopPresets.all.count) 个")
                     .padding(.top, 10)
+
+                if !userPresets.isEmpty {
+                    Text("我的预设")
+                        .mLabel(8, color: MColor.text4)
+                        .padding(.top, 10)
+                        .padding(.bottom, 2)
+
+                    ForEach(userPresets) { preset in
+                        MSwipeDeleteRow(rowID: preset.id,
+                                        openedID: $openedPresetRowID,
+                                        onDelete: { deleteUserPreset(preset) }) {
+                            userDevelopPresetRow(preset)
+                        }
+                    }
+
+                    Text("内置预设")
+                        .mLabel(8, color: MColor.text4)
+                        .padding(.top, 12)
+                        .padding(.bottom, 2)
+                }
 
                 ForEach(MobileDevelopPresets.all) { preset in
                     developPresetRow(preset)
@@ -1053,6 +1158,55 @@ struct DevelopScreen: View {
             .background(MPanelHeightReporter())
         }
         .scrollIndicators(.never)
+    }
+
+    private func deleteUserPreset(_ preset: MUserDevelopPreset) {
+        guard let index = userPresets.firstIndex(where: { $0.id == preset.id }),
+              MDevelopPresetStore.shared.delete(id: preset.id) else { return }
+        userPresets = MDevelopPresetStore.shared.userPresets
+        openedPresetRowID = nil
+        onToastAction("已删除 \(preset.name)", MToastAction(title: "撤销") {
+            MDevelopPresetStore.shared.restore(preset, at: index)
+            userPresets = MDevelopPresetStore.shared.userPresets
+        })
+    }
+
+    private func userDevelopPresetRow(_ preset: MUserDevelopPreset) -> some View {
+        let film = MobileCatalog.film(id: preset.filmID) ?? MobileCatalog.films[0]
+        let paper = MobileCatalog.paperName(preset.paperID)
+        return Button {
+            MHaptic.light()
+            withAnimation(MMotion.state) { session.applyUserPreset(preset) }
+            onToast("已套用 \(preset.name)")
+        } label: {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(MColor.surface2.opacity(0.6))
+                        .frame(width: 38, height: 38)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(MColor.hairline, lineWidth: 1)
+                        )
+                    MFilmStockIcon(film: film, size: 28)
+                }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(preset.name)
+                        .font(.mSans(11.5, .medium))
+                        .foregroundStyle(MColor.text1)
+                    Text("\(film.name) · \(paper) · \(preset.pro.count) 项")
+                        .font(.mSans(8.5, .medium))
+                        .foregroundStyle(MColor.text4)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+            }
+            .frame(height: 50)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func developPresetRow(_ preset: MDevelopPreset) -> some View {
@@ -1185,6 +1339,10 @@ struct DevelopScreen: View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 0) {
                 if mode == 0 {
+                    if !session.frozenQuickAxes.isEmpty {
+                        frozenQuickBanner
+                            .padding(.bottom, 8)
+                    }
                     quickSectionHead(
                         "光调",
                         trailing: lightDirtyCount > 0 ? "\(lightDirtyCount) 项已调" : "基线"
@@ -1206,14 +1364,12 @@ struct DevelopScreen: View {
                 } else {
                     proGroupsView(0)
                         .padding(.top, 2)
-
-                    resetButton("重置专业参数", action: resetPro)
-                        .padding(.top, 16)
                 }
             }
             .padding(.horizontal, MMetric.pageMargin)
             .padding(.bottom, 16)
             .background(MPanelHeightReporter())
+            .animation(MMotion.state, value: session.frozenQuickAxes.isEmpty)
         }
         .scrollIndicators(.never)
     }
@@ -1224,6 +1380,10 @@ struct DevelopScreen: View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 0) {
                 if mode == 0 {
+                    if !session.frozenQuickAxes.isEmpty {
+                        frozenQuickBanner
+                            .padding(.bottom, 8)
+                    }
                     quickSectionHead("色彩") {
                         resetQuick()
                     }
@@ -1243,7 +1403,7 @@ struct DevelopScreen: View {
                             y: padYBinding,
                             width: max(1, geo.size.width),
                             height: 96,
-                            isEnabled: !scanFilmMode
+                            isEnabled: !scanFilmMode && !temperatureFrozen
                         )
                     }
                     .frame(height: 96)
@@ -1252,11 +1412,11 @@ struct DevelopScreen: View {
                     HStack(spacing: 6) {
                         Text("冷暖 \(ccText(session.padX))")
                             .font(.mSans(8, .medium).monospacedDigit())
-                            .foregroundStyle(abs(session.padX) > 0.5 && !scanFilmMode ? MColor.brass : MColor.text3)
+                            .foregroundStyle(abs(session.padX) > 0.5 && !scanFilmMode && !temperatureFrozen ? MColor.brass : MColor.text3)
                         Spacer(minLength: 0)
                         Text("品红 \(ccText(session.padY))")
                             .font(.mSans(8, .medium).monospacedDigit())
-                            .foregroundStyle(abs(session.padY) > 0.5 && !scanFilmMode ? MColor.brass : MColor.text3)
+                            .foregroundStyle(abs(session.padY) > 0.5 && !scanFilmMode && !temperatureFrozen ? MColor.brass : MColor.text3)
                     }
                     .padding(.top, 6)
 
@@ -1269,14 +1429,12 @@ struct DevelopScreen: View {
                 } else {
                     proGroupsView(1)
                         .padding(.top, 2)
-
-                    resetButton("重置专业参数", action: resetPro)
-                        .padding(.top, 16)
                 }
             }
             .padding(.horizontal, MMetric.pageMargin)
             .padding(.bottom, 16)
             .background(MPanelHeightReporter())
+            .animation(MMotion.state, value: session.frozenQuickAxes.isEmpty)
         }
         .scrollIndicators(.never)
     }
@@ -1288,6 +1446,10 @@ struct DevelopScreen: View {
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 0) {
                     if mode == 0 {
+                        if !session.frozenQuickAxes.isEmpty {
+                            frozenQuickBanner
+                                .padding(.bottom, 8)
+                        }
                         quickSectionHead("质感") {
                             resetQuick()
                         }
@@ -1311,14 +1473,12 @@ struct DevelopScreen: View {
                     } else {
                         proGroupsView(3)
                             .padding(.top, 2)
-
-                        resetButton("重置专业参数", action: resetPro)
-                            .padding(.top, 16)
                     }
                 }
                 .padding(.horizontal, MMetric.pageMargin)
                 .padding(.bottom, 16)
                 .background(MPanelHeightReporter())
+                .animation(MMotion.state, value: session.frozenQuickAxes.isEmpty)
             }
             .scrollIndicators(.never)
             .onAppear {
@@ -1343,6 +1503,7 @@ struct DevelopScreen: View {
                 decimals: axis.decimals,
                 suffix: axis.suffix,
                 isEnabled: !(scanFilmMode && printOnlyQuickAxes.contains(id)),
+                isFrozen: session.frozenQuickAxes.contains(id),
                 compact: true
             )
         }
@@ -1464,29 +1625,6 @@ struct DevelopScreen: View {
         }
     }
 
-    private func resetButton(_ title: String, action: @escaping () -> Void) -> some View {
-        Button {
-            MHaptic.medium()
-            withAnimation(MMotion.state) { action() }
-        } label: {
-            Text(title)
-                .font(.mSans(10, .medium))
-                .foregroundStyle(MColor.text2)
-                .frame(maxWidth: .infinity)
-                .frame(height: 32)
-                .background(
-                    RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                        .fill(MColor.surface2)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: MRadius.control, style: .continuous)
-                        .strokeBorder(MColor.hairline, lineWidth: 1)
-                )
-        }
-        .buttonStyle(.plain)
-        .padding(.top, 10)
-    }
-
     // MARK: - 底部页签
 
     private func tabBar(bottomPadding: CGFloat) -> some View {
@@ -1571,6 +1709,11 @@ struct DevelopScreen: View {
         session.proToggles["scan_film"] ?? false
     }
 
+    /// 印相冷暖已被专业模式接管：色盘与冷暖滑条一样置灰并停止手势。
+    private var temperatureFrozen: Bool {
+        session.frozenQuickAxes.contains("temperature")
+    }
+
     /// 与参考 `PRINT_ONLY_AXES` 对齐：印相明暗、影调反差、高光柔和（色盘 Y/M 单独处理）。
     private var printOnlyQuickAxes: Set<String> {
         ["print_brightness", "tonal_contrast", "highlight_softening"]
@@ -1633,9 +1776,248 @@ struct DevelopScreen: View {
     private func resetQuick() {
         session.resetQuick()
     }
+}
 
-    private func resetPro() {
-        session.resetPro()
+// MARK: - 保存显影预设
+
+private struct MProSaveItem: Identifiable {
+    let id: String
+    let label: String
+    let detail: String
+    let value: MProValue
+    let isDefault: Bool
+}
+
+private struct MDevelopPresetSaveSheet: View {
+    @ObservedObject var session: MobileDevelopSession
+    let onSaved: (MUserDevelopPreset) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var selected: Set<String> = []
+    @State private var seeded = false
+
+    private static let excluded: Set<String> = [
+        "crop", "crop_center_x", "crop_center_y", "crop_size_x", "crop_size_y",
+    ]
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var nameTaken: Bool {
+        MDevelopPresetStore.shared.isNameTaken(trimmedName)
+    }
+
+    private var canSave: Bool {
+        !trimmedName.isEmpty && !nameTaken
+    }
+
+    private var items: [MProSaveItem] {
+        var result: [MProSaveItem] = []
+        for page in MobileCatalog.proPages {
+            for group in page.groups {
+                for row in group.rows {
+                    switch row.control {
+                    case .slider(_, let base, let range, _, let decimals, let suffix):
+                        let value = session.proValues[row.id] ?? base
+                        let baseline = session.proBaseline(row.id)
+                        result.append(MProSaveItem(
+                            id: row.id,
+                            label: row.label,
+                            detail: valueText(value, decimals: decimals,
+                                              suffix: suffix, range: range),
+                            value: .number(value),
+                            isDefault: abs(value - baseline) < 1e-9
+                        ))
+                    case .toggle(let fallback):
+                        let value = session.proToggles[row.id] ?? fallback
+                        result.append(MProSaveItem(
+                            id: row.id,
+                            label: row.label,
+                            detail: value ? "开" : "关",
+                            value: .flag(value),
+                            isDefault: value == fallback
+                        ))
+                    case .choice(let options, let fallback):
+                        let value = session.choiceValue(row.id)
+                        let label = options.first(where: { $0.value == value })?.label ?? fallback
+                        result.append(MProSaveItem(
+                            id: row.id,
+                            label: row.label,
+                            detail: label,
+                            value: .option(value),
+                            isDefault: value == fallback
+                        ))
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    private var itemMap: [String: MProSaveItem] {
+        Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("保存显影预设")
+                    .font(.navTitle)
+                    .foregroundStyle(MColor.text1)
+                Spacer()
+                Button("取消") { dismiss() }
+                    .font(.mSans(11.5, .medium))
+                    .foregroundStyle(MColor.text3)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 16)
+            .padding(.bottom, 10)
+
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("预设名称", text: $name)
+                        .font(.mSans(13, .medium))
+                        .foregroundStyle(MColor.text1)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 12)
+                        .frame(height: 44)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(MColor.surface2)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(nameTaken ? Color.red.opacity(0.6) : MColor.hairline,
+                                              lineWidth: 1)
+                        )
+                        .onChange(of: name) { _, value in
+                            if value.count > 20 { name = String(value.prefix(20)) }
+                        }
+
+                    if nameTaken {
+                        Text("已有同名预设，请换一个名称")
+                            .mMeta(8, color: Color.red.opacity(0.9))
+                    }
+
+                    HStack(spacing: 6) {
+                        Image(systemName: "film")
+                        Text(MobileCatalog.filmName(session.filmID))
+                        Text("·")
+                        Text(MobileCatalog.paperName(session.paperID))
+                        if session.isMonochrome {
+                            Text("· 黑白")
+                        }
+                    }
+                    .font(.mSans(9.5, .medium))
+                    .foregroundStyle(MColor.text3)
+
+                    Text("胶片、相纸与黑白模式始终保存；专业参数只保存勾选项。")
+                        .mMeta(8, color: MColor.text4)
+
+                    ForEach(MobileCatalog.proPages) { page in
+                        Text(page.title)
+                            .mLabel(8.5, color: MColor.brass)
+                            .padding(.top, 10)
+
+                        ForEach(page.groups) { group in
+                            groupHeader(group)
+                            ForEach(group.rows) { row in
+                                if let item = itemMap[row.id] {
+                                    MCheckRow(
+                                        label: item.label,
+                                        detail: Self.excluded.contains(item.id)
+                                            ? "构图参数不参与预设"
+                                            : item.detail,
+                                        isOn: binding(for: item.id),
+                                        isEnabled: !Self.excluded.contains(item.id)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 18)
+            }
+            .scrollIndicators(.never)
+
+            MBrassPill(title: "保存", height: 44, fullWidth: true, disabled: !canSave) {
+                save()
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 8)
+            .padding(.bottom, 18)
+        }
+        .background(MColor.surface1)
+        .onAppear {
+            guard !seeded else { return }
+            seeded = true
+            selected = Set(items.filter {
+                !$0.isDefault && !Self.excluded.contains($0.id)
+            }.map(\.id))
+        }
+    }
+
+    private func groupHeader(_ group: MProGroup) -> some View {
+        let ids = group.rows.map(\.id).filter { !Self.excluded.contains($0) }
+        let allSelected = !ids.isEmpty && ids.allSatisfy { selected.contains($0) }
+        return HStack {
+            Text(group.title)
+                .mLabel(8, color: MColor.text4)
+            Spacer()
+            Button(allSelected ? "全不选" : "全选") {
+                MHaptic.tick()
+                if allSelected {
+                    selected.subtract(ids)
+                } else {
+                    selected.formUnion(ids)
+                }
+            }
+            .font(.mSans(8.5, .medium))
+            .foregroundStyle(MColor.text3)
+            .buttonStyle(.plain)
+        }
+        .padding(.top, 8)
+    }
+
+    private func binding(for id: String) -> Binding<Bool> {
+        Binding(
+            get: { selected.contains(id) },
+            set: { isOn in
+                if isOn { selected.insert(id) } else { selected.remove(id) }
+            }
+        )
+    }
+
+    private func save() {
+        guard canSave else { return }
+        let pro = Dictionary(items
+            .filter { selected.contains($0.id) && !Self.excluded.contains($0.id) }
+            .map { ($0.id, $0.value) }, uniquingKeysWith: { _, last in last })
+        var preset = MUserDevelopPreset(
+            name: trimmedName,
+            filmID: session.filmID,
+            paperID: session.paperID,
+            monochrome: session.isMonochrome,
+            pro: pro
+        )
+        // 记录保存时的拍摄曝光基线，套用到别的照片时换算成当前基线 + 同一调整量。
+        preset.exposureBaselineEV = session.proBaseline("exposure_compensation_ev")
+        let saved = MDevelopPresetStore.shared.save(preset)
+        MHaptic.light()
+        onSaved(saved)
+        dismiss()
+    }
+
+    private func valueText(_ value: Double, decimals: Int, suffix: String,
+                           range: ClosedRange<Double>) -> String {
+        var text = decimals == 0
+            ? String(Int(value.rounded()))
+            : String(format: "%.\(decimals)f", value)
+        if range.lowerBound < 0, value > 0 { text = "+" + text }
+        return text + suffix
     }
 }
 

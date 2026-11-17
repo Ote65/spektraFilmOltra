@@ -2772,3 +2772,301 @@ private struct MFilmBorderRandom {
         low + (high - low) * unit()
     }
 }
+
+// MARK: - 片边参数编辑
+
+/// 片边参数编辑器：调色台「边框」页签与相机直出成片页共用。
+/// 启用开关与预设轨道由外层负责，这里只放参数本身。
+struct MFilmBorderControls: View {
+    @Binding var config: MFilmBorderConfig
+    /// 传入后显示「重置片边」按钮。
+    var onReset: (() -> Void)? = nil
+
+    private var cornerValue: MFilmBorderCorner {
+        MFilmBorderCorner(rawValue: config.corner) ?? .rounded
+    }
+
+    private var baseValue: MFilmBorderBase {
+        MFilmBorderBase(rawValue: config.baseTone) ?? .colorNegative
+    }
+
+    private var textToneValue: MFilmBorderTextTone {
+        MFilmBorderTextTone(rawValue: config.textTone) ?? .auto
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            MChoiceRow(label: "比例", value: config.gaugeValue.label,
+                       options: gaugeOptions) { raw in
+                guard let gauge = MFilmBorderGauge(rawValue: raw) else { return }
+                var value = config
+                value.gauge = raw
+                value.baseTone = gauge.defaultBase.rawValue
+                value.perf = MFilmBorderPerf.auto.rawValue
+                value.notch = gauge.isSheet
+                value.edgeText = !gauge.isSheet
+                config = value.normalized()
+            }
+
+            colorRail
+
+            MParamSlider(label: "片边宽度", value: number(\.borderScale),
+                         base: 1, range: 0.4...2.0, step: 0.01, decimals: 2,
+                         suffix: "×", compact: true)
+
+            MChoiceRow(label: "宽度口径", value: config.widthModeValue.label,
+                       options: widthModeOptions) { raw in
+                mutate { $0.widthMode = raw }
+            }
+
+            MChoiceRow(label: "画幅角型", value: cornerValue.label,
+                       options: cornerOptions) { raw in
+                mutate { $0.corner = raw }
+            }
+
+            MParamSlider(label: "角口大小", value: number(\.cornerScale),
+                         base: 1, range: 0...3, step: 0.01, decimals: 2,
+                         suffix: "×", isEnabled: cornerValue != .square, compact: true)
+
+            MChoiceRow(label: "齿孔类型", value: config.perfValue.label,
+                       options: perfOptions) { raw in
+                mutate { $0.perf = raw }
+            }
+
+            MParamSlider(label: "齿孔大小", value: number(\.perfScale),
+                         base: 1, range: 0.5...1.8, step: 0.01, decimals: 2,
+                         suffix: "×", compact: true)
+            MParamSlider(label: "齿孔间距", value: number(\.perfPitch),
+                         base: 1, range: 0.5...2.0, step: 0.01, decimals: 2,
+                         suffix: "×", compact: true)
+            MParamSlider(label: "齿孔明暗", value: number(\.perfBrightness),
+                         base: 0, range: -1...1, step: 0.01, decimals: 2,
+                         suffix: "", compact: true)
+            MParamSlider(label: "片基明暗", value: number(\.baseBrightness),
+                         base: 0, range: -1...1, step: 0.01, decimals: 2,
+                         suffix: "", compact: true)
+
+            MToggleRow(label: "边字", isOn: flag(\.edgeText), compact: true)
+            if config.edgeText {
+                MChoiceRow(label: "边字内容", value: config.edgeTextModeValue.label,
+                           options: edgeTextModeOptions) { raw in
+                    mutate { $0.edgeTextMode = raw }
+                }
+                if config.edgeTextModeValue == .custom {
+                    MTextFieldRow(label: "自定义内容", text: customText,
+                                  placeholder: "输入边字")
+                }
+                MChoiceRow(label: "边字颜色", value: textToneValue.label,
+                           options: textToneOptions) { raw in
+                    mutate { $0.textTone = raw }
+                }
+                MParamSlider(label: "边字大小", value: number(\.textScale),
+                             base: 1, range: 0.5...2.5, step: 0.01, decimals: 2,
+                             suffix: "×", compact: true)
+                MToggleRow(label: "画幅编号", isOn: flag(\.frameNumbers), compact: true)
+                MToggleRow(label: "片边编码", isOn: flag(\.dxCode), compact: true)
+            }
+
+            MToggleRow(label: "日期戳", isOn: flag(\.dateStamp), compact: true)
+            if config.dateStamp {
+                MChoiceRow(label: "日期位置", value: config.datePositionValue.label,
+                           options: datePositionOptions) { raw in
+                    mutate { $0.datePosition = raw }
+                }
+                MChoiceRow(label: "日期内容", value: config.dateModeValue.label,
+                           options: dateModeOptions) { raw in
+                    mutate { $0.dateMode = raw }
+                }
+                MChoiceRow(label: "日期字体", value: config.dateFontValue.label,
+                           options: dateFontOptions) { raw in
+                    mutate { $0.dateFont = raw }
+                }
+                MParamSlider(label: "日期大小", value: number(\.dateScale),
+                             base: 1, range: 0.4...2.5, step: 0.01, decimals: 2,
+                             suffix: "×", compact: true)
+                MChoiceRow(label: "日期方向", value: config.dateOrientationValue.label,
+                           options: dateOrientationOptions) { raw in
+                    mutate { $0.dateOrientation = raw }
+                }
+                MChoiceRow(label: "日期颜色", value: config.dateStyleValue.label,
+                           options: dateStyleOptions) { raw in
+                    mutate { $0.dateStyle = raw }
+                }
+            }
+
+            if config.gaugeValue.isSheet {
+                MToggleRow(label: "片缺口", isOn: flag(\.notch), compact: true)
+            }
+
+            MSectionHead(title: "做旧", trailing: "默认关闭 · 作用于画面", compact: true)
+            MParamSlider(label: "瑕疵", value: number(\.scratches),
+                         base: 0, range: 0...1, step: 0.01, decimals: 2,
+                         suffix: "", compact: true)
+            MParamSlider(label: "细度", value: number(\.defectFineness),
+                         base: 1, range: 0.5...3.0, step: 0.01, decimals: 2,
+                         suffix: "×", compact: true)
+            MParamSlider(label: "灰尘", value: number(\.dust),
+                         base: 0, range: 0...1, step: 0.01, decimals: 2,
+                         suffix: "", compact: true)
+            MParamSlider(label: "雾化", value: number(\.fog),
+                         base: 0, range: 0...1, step: 0.01, decimals: 2,
+                         suffix: "", compact: true)
+        }
+    }
+
+    // MARK: 颜色
+
+    private var colorRail: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("边框颜色")
+                    .font(.mSans(11))
+                    .foregroundStyle(MColor.text2)
+                Text(baseValue.label)
+                    .mMeta(8, color: MColor.text4)
+                Spacer(minLength: 8)
+                if let onReset {
+                    Button {
+                        MHaptic.tick()
+                        withAnimation(MMotion.state) { onReset() }
+                    } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(MColor.text3)
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("重置片边")
+                }
+            }
+
+            ScrollView(.horizontal) {
+                HStack(spacing: 12) {
+                    ForEach(MFilmBorderBase.allCases) { tone in
+                        colorDot(tone)
+                    }
+                }
+                .padding(.vertical, 3)
+            }
+            .scrollIndicators(.never)
+        }
+        .padding(.top, 12)
+    }
+
+    private func colorDot(_ tone: MFilmBorderBase) -> some View {
+        let rgb = MFilmBorderRenderer.baseSwatch(tone, brightness: config.baseBrightness)
+        let selected = baseValue == tone
+        return Button {
+            MHaptic.tick()
+            withAnimation(MMotion.state) {
+                mutate { $0.baseTone = tone.rawValue }
+            }
+        } label: {
+            Circle()
+                .fill(Color(red: Double(rgb.0), green: Double(rgb.1), blue: Double(rgb.2)))
+                .frame(width: 30, height: 30)
+                .overlay(
+                    Circle().strokeBorder(selected ? MColor.brass : MColor.hairline,
+                                          lineWidth: selected ? 1.8 : 1)
+                )
+                .overlay(alignment: .bottomTrailing) {
+                    if selected {
+                        Circle()
+                            .fill(MColor.brass)
+                            .frame(width: 10, height: 10)
+                            .overlay(
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 6, weight: .bold))
+                                    .foregroundStyle(MColor.brassInk)
+                            )
+                            .offset(x: 2, y: 2)
+                    }
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(MPressStyle(scale: 0.92))
+        .accessibilityLabel(tone.label)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+
+    // MARK: 绑定
+
+    private func mutate(_ change: (inout MFilmBorderConfig) -> Void) {
+        var value = config
+        change(&value)
+        config = value.normalized()
+    }
+
+    private func number(
+        _ keyPath: WritableKeyPath<MFilmBorderConfig, Double>
+    ) -> Binding<Double> {
+        Binding(
+            get: { config[keyPath: keyPath] },
+            set: { value in mutate { $0[keyPath: keyPath] = value } }
+        )
+    }
+
+    private func flag(
+        _ keyPath: WritableKeyPath<MFilmBorderConfig, Bool>
+    ) -> Binding<Bool> {
+        Binding(
+            get: { config[keyPath: keyPath] },
+            set: { value in mutate { $0[keyPath: keyPath] = value } }
+        )
+    }
+
+    private var customText: Binding<String> {
+        Binding(
+            get: { config.customText },
+            set: { value in mutate { $0.customText = value } }
+        )
+    }
+
+    // MARK: 选项
+
+    private var gaugeOptions: [MProOption] {
+        MFilmBorderGauge.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var widthModeOptions: [MProOption] {
+        MFilmBorderWidthMode.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var cornerOptions: [MProOption] {
+        MFilmBorderCorner.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var perfOptions: [MProOption] {
+        MFilmBorderPerf.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var textToneOptions: [MProOption] {
+        MFilmBorderTextTone.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var datePositionOptions: [MProOption] {
+        MFilmBorderDatePosition.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateStyleOptions: [MProOption] {
+        MFilmBorderDateStyle.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateModeOptions: [MProOption] {
+        MFilmBorderDateMode.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateFontOptions: [MProOption] {
+        MFilmBorderDateFont.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var dateOrientationOptions: [MProOption] {
+        MFilmBorderDateOrientation.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+
+    private var edgeTextModeOptions: [MProOption] {
+        MFilmBorderTextContent.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
+    }
+}
+

@@ -312,7 +312,7 @@ struct HomeScreen: View {
             chips.append(ScopeChip(id: "saved", title: "保存", scope: .saved))
         }
         chips.append(ScopeChip(id: "favorites", title: "收藏", scope: .favorites))
-        if engine.hasRawAlbum {
+        if engine.hasRawAlbum || engine.scope == .raw {
             chips.append(ScopeChip(id: "raw", title: "RAW", scope: .raw))
         }
         chips.append(ScopeChip(id: "graded", title: "已调色", scope: .graded))
@@ -382,11 +382,22 @@ struct HomeScreen: View {
 
     // MARK: - 网格
 
+    /// iPad 用自适应列：由容器真实宽度决定，卡片保持最小宽度，
+    /// 窗口变窄时自动减少每行数量（台前调度 / 分屏都不会被挤小）。
+    /// iPhone 保持两列横幅卡片。
+    private var gridColumns: [GridItem] {
+        if MLayout.isPad {
+            return [GridItem(.adaptive(minimum: MLayout.gridMinCardWidth), spacing: 12, alignment: .top)]
+        }
+        return [
+            GridItem(.flexible(), spacing: 12),
+            GridItem(.flexible(), spacing: 12)
+        ]
+    }
+
     private var photoGrid: some View {
         LazyVGrid(
-            columns: (0..<MLayout.gridColumns(for: insets.width)).map { _ in
-                GridItem(.flexible(), spacing: 12)
-            },
+            columns: gridColumns,
             alignment: .leading,
             spacing: 18
         ) {
@@ -953,6 +964,7 @@ struct HomeScreen: View {
             Task {
                 var files: [URL] = []
                 var scoped: [URL] = []
+                var folders: [URL] = []
                 for url in urls {
                     if url.startAccessingSecurityScopedResource() { scoped.append(url) }
                     var isDirectory: ObjCBool = false
@@ -960,10 +972,19 @@ struct HomeScreen: View {
                         continue
                     }
                     if isDirectory.boolValue {
-                        files.append(contentsOf: Self.photoFiles(in: url, allowed: allowed))
+                        folders.append(url)
                     } else if allowed.contains(url.pathExtension.lowercased()) {
                         files.append(url)
                     }
+                }
+                // 大目录递归枚举放到后台：主线程在文件夹导入时保持可交互，
+                // 不会出现「点导入后整个 App 像死机」的观感。
+                if !folders.isEmpty {
+                    let allowedCopy = allowed
+                    let found = await Task.detached(priority: .userInitiated) {
+                        folders.flatMap { Self.photoFiles(in: $0, allowed: allowedCopy) }
+                    }.value
+                    files.append(contentsOf: found)
                 }
                 // 安全作用域必须活到入库完成：目录里枚举出的子文件 URL 依赖父目录授权。
                 defer { for url in scoped { url.stopAccessingSecurityScopedResource() } }
@@ -983,7 +1004,7 @@ struct HomeScreen: View {
     }
 
     /// 递归列出目录下的可导入文件（跳过隐藏文件与包）。
-    private static func photoFiles(in folder: URL, allowed: Set<String>) -> [URL] {
+    nonisolated private static func photoFiles(in folder: URL, allowed: Set<String>) -> [URL] {
         guard let enumerator = FileManager.default.enumerator(
             at: folder,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -1322,12 +1343,14 @@ private struct MAssetThumb: View {
             return
         }
         let options = PHImageRequestOptions()
-        options.deliveryMode = .highQualityFormat
+        // 网格只需要缩略图：opportunistic 先回本地低质量图秒出，
+        // 再渐进补高质量；fastFormat 对纯 iCloud 资源可能不回调留白格。
+        options.deliveryMode = .opportunistic
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         requestID = PHImageManager.default().requestImage(
             for: asset,
-            targetSize: CGSize(width: 360, height: 360),
+            targetSize: CGSize(width: 480, height: 480),
             contentMode: .aspectFill,
             options: options
         ) { result, info in
@@ -1338,7 +1361,7 @@ private struct MAssetThumb: View {
                 image = result
                 if !degraded {
                     MAssetThumbCache.shared.setObject(
-                        result, forKey: key, cost: 360 * 360 * 4)
+                        result, forKey: key, cost: 480 * 480 * 4)
                 }
             }
         }

@@ -28,13 +28,16 @@ final class ScanningStage {
         colorReference.cmyToLogXYZ = self.cmyToLogXYZ
     }
 
-    func scan(densityChannels: ImageRGB) -> ImageRGB {
-        let rgb = densityToRGB(densityChannels, useLUT: settings.useScannerLUT)
-        let blurred = applyBlurAndUnsharp(rgb)
-        return applyCCTFEncoding(blurred)
+    func scan(densityChannels: ImageRGB, rowOffset: Int = 0, rowSeeded: Bool = false) -> ImageRGB {
+        var rgb = densityToRGB(densityChannels, useLUT: settings.useScannerLUT,
+                               rowOffset: rowOffset, rowSeeded: rowSeeded)
+        applyBlurAndUnsharp(&rgb)
+        applyCCTFEncoding(&rgb)
+        return rgb
     }
 
-    private func densityToRGB(_ densityChannels: ImageRGB, useLUT: Bool) -> ImageRGB {
+    private func densityToRGB(_ densityChannels: ImageRGB, useLUT: Bool,
+                              rowOffset: Int = 0, rowSeeded: Bool = false) -> ImageRGB {
         let densityMin: [Double]
         let densityMax: [Double]
         let scanIlluminant: [Double]
@@ -77,7 +80,8 @@ final class ScanningStage {
         let illuminantXY = ColorMath.xyzToXY(illuminantXYZ)
 
         Glare.applyGlareInPlace(&xyz, illuminantXYZ: illuminantXYZ,
-                                params: io.scanFilm ? nil : printRender.glare)
+                                params: io.scanFilm ? nil : printRender.glare,
+                                rowOffset: rowOffset, rowSeeded: rowSeeded)
         // 色彩空间查表、CAT02 求逆、比例系数都是全图常量：搬出循环。
         // 注意这里**保留原来的运算顺序**（T·x ⊙ ratios → inv → fromXYZ），
         // 只是把每像素重算的常量提前算好，所以逐像素结果与旧实现完全一致；
@@ -138,23 +142,26 @@ final class ScanningStage {
                                ratios: ratios, adapts: true)
     }
 
-    private func applyBlurAndUnsharp(_ rgb: ImageRGB) -> ImageRGB {
-        var output = applyGaussianBlur(rgb, sigma: scanner.lensBlur)
-        let sigma = scanner.unsharpMask[0]
-        let amount = scanner.unsharpMask[1]
-        if sigma > 0 && amount > 0 {
-            output = applyUnsharpMask(output, sigma: sigma, amount: amount)
+    private func applyBlurAndUnsharp(_ image: inout ImageRGB) {
+        let sigma = scanner.lensBlur
+        if sigma > 0 {
+            image = FastGaussian.filter(image, sigma: sigma)
         }
-        return output
+        let maskSigma = scanner.unsharpMask[0]
+        let amount = scanner.unsharpMask[1]
+        if maskSigma > 0 && amount > 0 {
+            SpatialEffects.applyUnsharpMaskInPlace(&image, sigma: maskSigma, amount: amount)
+        }
     }
 
-    private func applyCCTFEncoding(_ rgb: ImageRGB) -> ImageRGB {
-        guard io.outputCCTFEncoding else { return rgb }
+    private func applyCCTFEncoding(_ image: inout ImageRGB) {
+        guard io.outputCCTFEncoding else { return }
         let kind = ColorMath.cctfKind(for: io.outputColorSpace)
         // 这里的 `rgbToRGB(from:to:)` 看似同一个空间、可以省掉，但它是 Python 参考
         // 实现的一部分：省掉会让输出相对偏差达到 ~1e-5，破坏 1e-9 对拍门禁。
-        return rgb.map { value in
-            let converted = ColorMath.rgbToRGB(value, from: io.outputColorSpace, to: io.outputColorSpace)
+        let space = io.outputColorSpace
+        image.mapInPlace { value in
+            let converted = ColorMath.rgbToRGB(value, from: space, to: space)
             return Vec3(
                 ColorMath.cctfEncode(converted.x, kind: kind),
                 ColorMath.cctfEncode(converted.y, kind: kind),
@@ -227,18 +234,6 @@ final class ScanningStage {
             for c in 0..<3 where row[c].isFinite { result[c] = min(result[c], row[c]) }
         }
         return result
-    }
-
-    private func applyGaussianBlur(_ image: ImageRGB, sigma: Double) -> ImageRGB {
-        SpatialEffects.gaussianBlurUM(image, sigmaUM: sigma, pixelSizeUM: 1)
-    }
-
-    private func applyUnsharpMask(_ image: ImageRGB, sigma: Double, amount: Double) -> ImageRGB {
-        SpatialEffects.applyUnsharpMask(image, sigma: sigma, amount: amount)
-    }
-
-    private func addGlare(_ xyz: ImageRGB, illuminantXYZ: Vec3, glare: GlareParams?) -> ImageRGB {
-        Glare.addGlare(xyz, illuminantXYZ: illuminantXYZ, params: glare)
     }
 
     private func compressRGB(_ rgb: ImageRGB) -> ImageRGB {

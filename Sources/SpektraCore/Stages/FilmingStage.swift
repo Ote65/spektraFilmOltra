@@ -64,17 +64,19 @@ final class FilmingStage {
     func expose(_ image: ImageRGB) -> ImageRGB {
         var raw = rgbToFilmRaw(image, colorSpace: io.inputColorSpace,
                                applyCCTFDecoding: io.inputCCTFDecoding)
-        raw = raw.map { $0 * pow(2, camera.exposureCompensationEV) }
+        let exposureScale = pow(2, camera.exposureCompensationEV)
+        raw.mapInPlace { $0 * exposureScale }
         raw = applyBoostHighlights(raw)
         raw = applyCameraDiffusion(raw)
         raw = applyGaussianBlurUM(raw, sigmaUM: camera.lensBlurUM)
         raw = applyHalation(raw)
         let correction = colorReference.blackWhiteFilmingExposureCorrection()
-        raw = raw.map { $0 * correction }
-        return raw.map { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        raw.mapInPlace { $0 * correction }
+        raw.mapInPlace { Vec3(ImageMath.log10Safe($0.x), ImageMath.log10Safe($0.y), ImageMath.log10Safe($0.z)) }
+        return raw
     }
 
-    func develop(_ logRaw: ImageRGB) -> ImageRGB {
+    func develop(_ logRaw: ImageRGB, rowOffset: Int = 0, rowSeeded: Bool = false) -> ImageRGB {
         let normalized = film.data.densityCurves.map { row in
             row.map { $0.isFinite ? $0 : 0 }
         }
@@ -90,7 +92,7 @@ final class FilmingStage {
             densityCurves: curves,
             gammaFactor: [filmRender.densityCurveGamma, filmRender.densityCurveGamma, filmRender.densityCurveGamma]
         )
-        let corrected = Couplers.applyDensityCorrection(
+        var corrected = Couplers.applyDensityCorrection(
             densityCMY: density,
             logRaw: logRaw,
             pixelSizeUM: pixelSizeUM,
@@ -101,13 +103,14 @@ final class FilmingStage {
             gammaFactor: filmRender.densityCurveGamma
         )
         return Grain.apply(
-            densityCMY: corrected,
+            densityCMY: &corrected,
             pixelSizeUM: pixelSizeUM,
             params: filmRender.grain,
             densityCurves: curves,
             densityCurvesLayers: film.data.densityCurvesLayers,
             profileType: film.info.type,
-            bypass: false
+            bypass: false,
+            rowOffset: rowOffset, rowSeeded: rowSeeded
         )
     }
 

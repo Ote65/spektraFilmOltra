@@ -8,6 +8,7 @@ struct GradeScreen: View {
     let onBack: () -> Void
     let onGoHome: () -> Void
     let onToast: (String) -> Void
+    let onToastAction: (String, MToastAction) -> Void
     /// 分栏底部胶片条的数据源：库内全部照片（iPad 横屏切换照片用）。
     let library: [MPhoto]
     /// 点击胶片条缩略图时切换调色对象。
@@ -28,6 +29,12 @@ struct GradeScreen: View {
     @State private var exportOpen = DebugLaunch.exportOpen
     @State private var cropOpen = false
     @State private var showLUTImporter = false
+    /// 保存调色预设弹窗与用户预设左滑状态。
+    @State private var presetSaveOpen = false
+    @State private var openedPresetRowID: String?
+    /// 首次出现时把会话里已恢复的配方（直出工程）同步到滑条。
+    @State private var didSyncRecipe = false
+    @State private var suppressRecipeChange = false
     @State private var hslBand = 0
     @State private var gradingZone = 1
     @State private var stageSize: CGSize = .zero
@@ -123,6 +130,14 @@ struct GradeScreen: View {
             }
         }
         .onChange(of: stageSize) { _, _ in popCardIfReady() }
+        .onAppear {
+            guard !didSyncRecipe else { return }
+            didSyncRecipe = true
+            suppressRecipeChange = true
+            recipe = session.currentRecipe
+            restoreCurveFromRecipe()
+            DispatchQueue.main.async { suppressRecipeChange = false }
+        }
         .onChange(of: session.previewImage != nil) { _, hasImage in
             if hasImage { popCardIfReady() }
         }
@@ -131,6 +146,7 @@ struct GradeScreen: View {
             if split && (tabIndex == 0 || tabIndex == 4) { tabIndex = 1 }
         }
         .onChange(of: recipe) { oldValue, newValue in
+            guard !suppressRecipeChange else { return }
             pushUndo(oldValue)
             session.apply(newValue)
         }
@@ -160,6 +176,15 @@ struct GradeScreen: View {
             case .failure:
                 onToast("LUT 导入失败")
             }
+        }
+        .sheet(isPresented: $presetSaveOpen) {
+            MGradePresetSaveSheet(session: session, recipe: recipe) { saved in
+                onToast("已保存预设 · \(saved.name)")
+            }
+            .presentationDetents([.height(540), .large])
+            .presentationDragIndicator(.visible)
+            .presentationCornerRadius(MRadius.sheet)
+            .presentationBackground(MColor.surface1)
         }
         .sheet(isPresented: $cropOpen, onDismiss: { session.clearCropBase() }) {
             ZStack {
@@ -514,7 +539,7 @@ struct GradeScreen: View {
                     .shadow(color: .black.opacity(0.75), radius: 3, y: 1)
                 HStack(spacing: 5) {
                     Circle().fill(MColor.brass).frame(width: 4, height: 4)
-                    Text(entry == .handoff ? "显影交接 · 线性" : "原片直达 · 线性")
+                    Text(session.isDevelopedSource ? "显影交接 · 线性" : "原片直达 · 线性")
                     Text("·")
                     Text("ProPhoto RGB")
                 }
@@ -527,6 +552,10 @@ struct GradeScreen: View {
                 resetAllGrade()
             }
             .accessibilityLabel("重置全部调整")
+
+            MBrassCircleButton(icon: "bookmark", size: 32) {
+                presetSaveOpen = true
+            }
 
             MBrassPill(title: "导出", icon: "square.and.arrow.up", height: 32) {
                 withAnimation(MMotion.pill) { exportOpen = true }
@@ -1098,7 +1127,15 @@ struct GradeScreen: View {
                     .padding(.top, 14)
 
                 ForEach(session.presets) { preset in
-                    gradePresetRow(preset)
+                    if preset.builtin {
+                        gradePresetRow(preset)
+                    } else {
+                        MSwipeDeleteRow(rowID: preset.id,
+                                        openedID: $openedPresetRowID,
+                                        onDelete: { deletePreset(preset) }) {
+                            gradePresetRow(preset)
+                        }
+                    }
                 }
             }
             .padding(.horizontal, MMetric.pageMargin)
@@ -1133,10 +1170,15 @@ struct GradeScreen: View {
     private func gradePresetRow(_ preset: GradePreset) -> some View {
         Button {
             MHaptic.light()
+            let groups = preset.appliedGroups
             let name = preset.recipe.lut.path.isEmpty
                 ? "无 LUT"
                 : (session.luts.first { $0.path == preset.recipe.lut.path }?.name ?? "LUT")
-            recipe = MGradeRecipe(grade: preset.recipe, lutName: name)
+            // 按组覆盖：未勾选的组保持当前值；裁切 / 边框不参与。
+            var merged = recipe
+            merged.merge(preset.recipe, groups: groups)
+            if groups.contains(.lut) { merged.lutName = name }
+            recipe = merged
             restoreCurveFromRecipe()
             session.applyPreset(preset)
             onToast("已套用 \(preset.name)")
@@ -1175,6 +1217,16 @@ struct GradeScreen: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    private func deletePreset(_ preset: GradePreset) {
+        let index = GradePresetStore.shared.userPresets.firstIndex { $0.id == preset.id }
+        guard session.deletePreset(id: preset.id) else { return }
+        openedPresetRowID = nil
+        onToastAction("已删除 \(preset.name)", MToastAction(title: "撤销") {
+            GradePresetStore.shared.restore(preset, at: index)
+            session.reloadPresets()
+        })
     }
 
     // MARK: - 光影
@@ -1426,123 +1478,9 @@ struct GradeScreen: View {
                 .padding(.top, 8)
 
                 if session.border.enabled {
-                    MChoiceRow(label: "比例", value: session.border.gaugeValue.label,
-                               options: gaugeOptions) { raw in
-                        guard let gauge = MFilmBorderGauge(rawValue: raw) else { return }
-                        session.updateBorder {
-                            $0.gauge = raw
-                            $0.baseTone = gauge.defaultBase.rawValue
-                            $0.perf = MFilmBorderPerf.auto.rawValue
-                            $0.notch = gauge.isSheet
-                            $0.edgeText = !gauge.isSheet
-                        }
-                    }
-
-                    borderColorRail
-
-                    MParamSlider(label: "片边宽度", value: borderDouble(\.borderScale),
-                                 base: 1, range: 0.4...2.0, step: 0.01, decimals: 2,
-                                 suffix: "×", compact: true)
-
-                    MChoiceRow(label: "宽度口径", value: session.border.widthModeValue.label,
-                               options: borderWidthModeOptions) { raw in
-                        session.updateBorder { $0.widthMode = raw }
-                    }
-
-                    MChoiceRow(label: "画幅角型", value: cornerValue.label,
-                               options: cornerOptions) { raw in
-                        session.updateBorder { $0.corner = raw }
-                    }
-
-                    MParamSlider(label: "角口大小", value: borderDouble(\.cornerScale),
-                                 base: 1, range: 0...3, step: 0.01, decimals: 2,
-                                 suffix: "×", isEnabled: cornerValue != .square, compact: true)
-
-                    MChoiceRow(label: "齿孔类型", value: session.border.perfValue.label,
-                               options: perfOptions) { raw in
-                        session.updateBorder { $0.perf = raw }
-                    }
-
-                    MParamSlider(label: "齿孔大小", value: borderDouble(\.perfScale),
-                                 base: 1, range: 0.5...1.8, step: 0.01, decimals: 2,
-                                 suffix: "×", compact: true)
-                    MParamSlider(label: "齿孔间距", value: borderDouble(\.perfPitch),
-                                 base: 1, range: 0.5...2.0, step: 0.01, decimals: 2,
-                                 suffix: "×", compact: true)
-                    MParamSlider(label: "齿孔明暗", value: borderDouble(\.perfBrightness),
-                                 base: 0, range: -1...1, step: 0.01, decimals: 2,
-                                 suffix: "", compact: true)
-
-                    MParamSlider(label: "片基明暗", value: borderDouble(\.baseBrightness),
-                                 base: 0, range: -1...1, step: 0.01, decimals: 2,
-                                 suffix: "", compact: true)
-
-                    MToggleRow(label: "边字", isOn: borderBool(\.edgeText), compact: true)
-                    if session.border.edgeText {
-                        MChoiceRow(label: "边字内容", value: edgeTextModeValue.label,
-                                   options: edgeTextModeOptions) { raw in
-                            session.updateBorder { $0.edgeTextMode = raw }
-                        }
-                        if session.border.edgeTextModeValue == .custom {
-                            MTextFieldRow(label: "自定义内容", text: borderText,
-                                          placeholder: "输入边字")
-                        }
-                        MChoiceRow(label: "边字颜色", value: textToneValue.label,
-                                   options: textToneOptions) { raw in
-                            session.updateBorder { $0.textTone = raw }
-                        }
-                        MParamSlider(label: "边字大小", value: borderDouble(\.textScale),
-                                     base: 1, range: 0.5...2.5, step: 0.01, decimals: 2,
-                                     suffix: "×", compact: true)
-                        MToggleRow(label: "画幅编号", isOn: borderBool(\.frameNumbers),
-                                   compact: true)
-                        MToggleRow(label: "片边编码", isOn: borderBool(\.dxCode), compact: true)
-                    }
-
-                    MToggleRow(label: "日期戳", isOn: borderBool(\.dateStamp), compact: true)
-                    if session.border.dateStamp {
-                        MChoiceRow(label: "日期位置", value: datePositionValue.label,
-                                   options: datePositionOptions) { raw in
-                            session.updateBorder { $0.datePosition = raw }
-                        }
-                        MChoiceRow(label: "日期内容", value: dateModeValue.label,
-                                   options: dateModeOptions) { raw in
-                            session.updateBorder { $0.dateMode = raw }
-                        }
-                        MChoiceRow(label: "日期字体", value: dateFontValue.label,
-                                   options: dateFontOptions) { raw in
-                            session.updateBorder { $0.dateFont = raw }
-                        }
-                        MParamSlider(label: "日期大小", value: borderDouble(\.dateScale),
-                                     base: 1, range: 0.4...2.5, step: 0.01, decimals: 2,
-                                     suffix: "×", compact: true)
-                        MChoiceRow(label: "日期方向", value: dateOrientationValue.label,
-                                   options: dateOrientationOptions) { raw in
-                            session.updateBorder { $0.dateOrientation = raw }
-                        }
-                        MChoiceRow(label: "日期颜色", value: dateStyleValue.label,
-                                   options: dateStyleOptions) { raw in
-                            session.updateBorder { $0.dateStyle = raw }
-                        }
-                    }
-
-                    if session.border.gaugeValue.isSheet {
-                        MToggleRow(label: "片缺口", isOn: borderBool(\.notch), compact: true)
-                    }
-
-                    MSectionHead(title: "做旧", trailing: "默认关闭 · 作用于画面", compact: true)
-                    MParamSlider(label: "瑕疵", value: borderDouble(\.scratches),
-                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
-                                 suffix: "", compact: true)
-                    MParamSlider(label: "细度", value: borderDouble(\.defectFineness),
-                                 base: 1, range: 0.5...3.0, step: 0.01, decimals: 2,
-                                 suffix: "×", compact: true)
-                    MParamSlider(label: "灰尘", value: borderDouble(\.dust),
-                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
-                                 suffix: "", compact: true)
-                    MParamSlider(label: "雾化", value: borderDouble(\.fog),
-                                 base: 0, range: 0...1, step: 0.01, decimals: 2,
-                                 suffix: "", compact: true)
+                    MFilmBorderControls(config: borderConfig,
+                                        onReset: { session.resetBorder() })
+                        .padding(.top, 6)
                 }
             }
             .padding(.horizontal, MMetric.pageMargin)
@@ -1553,79 +1491,12 @@ struct GradeScreen: View {
         .defaultScrollAnchor(DebugLaunch.gradePanelBottom ? .bottom : .top)
     }
 
-    /// 边框颜色：横向滚动的圆形色板，选色不用再进折叠菜单。
-    private var borderColorRail: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("边框颜色")
-                    .font(.mSans(11))
-                    .foregroundStyle(MColor.text2)
-                Text(baseValue.label)
-                    .mMeta(8, color: MColor.text4)
-                Spacer(minLength: 8)
-                Button {
-                    MHaptic.tick()
-                    withAnimation(MMotion.state) { session.resetBorder() }
-                } label: {
-                    Image(systemName: "arrow.counterclockwise")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(MColor.text3)
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("重置片边")
-            }
-
-            ScrollView(.horizontal) {
-                HStack(spacing: 12) {
-                    ForEach(MFilmBorderBase.allCases) { tone in
-                        borderColorDot(tone)
-                    }
-                }
-                .padding(.horizontal, MMetric.pageMargin)
-                .padding(.vertical, 3)
-            }
-            .scrollIndicators(.never)
-            .padding(.horizontal, -MMetric.pageMargin)
-        }
-        .padding(.top, 12)
-    }
-
-    private func borderColorDot(_ tone: MFilmBorderBase) -> some View {
-        let rgb = MFilmBorderRenderer.baseSwatch(tone, brightness: session.border.baseBrightness)
-        let selected = baseValue == tone
-        return Button {
-            MHaptic.tick()
-            withAnimation(MMotion.state) {
-                session.updateBorder { $0.baseTone = tone.rawValue }
-            }
-        } label: {
-            Circle()
-                .fill(Color(red: Double(rgb.0), green: Double(rgb.1), blue: Double(rgb.2)))
-                .frame(width: 30, height: 30)
-                .overlay(
-                    Circle().strokeBorder(selected ? MColor.brass : MColor.hairline,
-                                          lineWidth: selected ? 1.8 : 1)
-                )
-                .overlay(alignment: .bottomTrailing) {
-                    if selected {
-                        Circle()
-                            .fill(MColor.brass)
-                            .frame(width: 10, height: 10)
-                            .overlay(
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 6, weight: .bold))
-                                    .foregroundStyle(MColor.brassInk)
-                            )
-                            .offset(x: 2, y: 2)
-                    }
-                }
-                .contentShape(Circle())
-        }
-        .buttonStyle(MPressStyle(scale: 0.92))
-        .accessibilityLabel(tone.label)
-        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    /// 片边参数写回会话：统一走 updateBorder，保持预设名与归一化逻辑。
+    private var borderConfig: Binding<MFilmBorderConfig> {
+        Binding(
+            get: { session.border },
+            set: { value in session.updateBorder { $0 = value } }
+        )
     }
 
     // MARK: 调色/片边绑定
@@ -1721,86 +1592,6 @@ struct GradeScreen: View {
         .padding(.top, 12)
     }
 
-    private var cornerValue: MFilmBorderCorner {
-        MFilmBorderCorner(rawValue: session.border.corner) ?? .rounded
-    }
-
-    private var baseValue: MFilmBorderBase {
-        MFilmBorderBase(rawValue: session.border.baseTone) ?? .colorNegative
-    }
-
-    private var textToneValue: MFilmBorderTextTone {
-        MFilmBorderTextTone(rawValue: session.border.textTone) ?? .auto
-    }
-
-    private var datePositionValue: MFilmBorderDatePosition {
-        session.border.datePositionValue
-    }
-
-    private var dateStyleValue: MFilmBorderDateStyle {
-        session.border.dateStyleValue
-    }
-
-    private var dateModeValue: MFilmBorderDateMode {
-        session.border.dateModeValue
-    }
-
-    private var dateFontValue: MFilmBorderDateFont {
-        session.border.dateFontValue
-    }
-
-    private var dateOrientationValue: MFilmBorderDateOrientation {
-        session.border.dateOrientationValue
-    }
-
-    private var edgeTextModeValue: MFilmBorderTextContent {
-        session.border.edgeTextModeValue
-    }
-
-    private var gaugeOptions: [MProOption] {
-        MFilmBorderGauge.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var borderWidthModeOptions: [MProOption] {
-        MFilmBorderWidthMode.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var cornerOptions: [MProOption] {
-        MFilmBorderCorner.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var perfOptions: [MProOption] {
-        MFilmBorderPerf.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var textToneOptions: [MProOption] {
-        MFilmBorderTextTone.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var datePositionOptions: [MProOption] {
-        MFilmBorderDatePosition.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var dateStyleOptions: [MProOption] {
-        MFilmBorderDateStyle.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var dateModeOptions: [MProOption] {
-        MFilmBorderDateMode.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var dateFontOptions: [MProOption] {
-        MFilmBorderDateFont.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var dateOrientationOptions: [MProOption] {
-        MFilmBorderDateOrientation.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
-    private var edgeTextModeOptions: [MProOption] {
-        MFilmBorderTextContent.allCases.map { MProOption(value: $0.rawValue, label: $0.label) }
-    }
-
     private func borderPresetIsSelected(_ preset: MFilmBorderPreset) -> Bool {
         guard session.border.enabled == preset.config.enabled else { return false }
         return preset.config.matches(session.border)
@@ -1822,31 +1613,6 @@ struct GradeScreen: View {
                     session.updateBorder { $0.enabled = isOn }
                 }
             }
-        )
-    }
-
-    private func borderDouble(
-        _ keyPath: WritableKeyPath<MFilmBorderConfig, Double>
-    ) -> Binding<Double> {
-        Binding(
-            get: { session.border[keyPath: keyPath] },
-            set: { value in session.updateBorder { $0[keyPath: keyPath] = value } }
-        )
-    }
-
-    private func borderBool(
-        _ keyPath: WritableKeyPath<MFilmBorderConfig, Bool>
-    ) -> Binding<Bool> {
-        Binding(
-            get: { session.border[keyPath: keyPath] },
-            set: { value in session.updateBorder { $0[keyPath: keyPath] = value } }
-        )
-    }
-
-    private var borderText: Binding<String> {
-        Binding(
-            get: { session.border.customText },
-            set: { value in session.updateBorder { $0.customText = value } }
         )
     }
 
@@ -2025,5 +1791,131 @@ private struct MLUTImportRailItem: View {
         }
         .buttonStyle(MPressStyle(scale: 0.94))
         .accessibilityLabel("导入 LUT")
+    }
+}
+
+// MARK: - 保存调色预设
+
+private struct MGradePresetSaveSheet: View {
+    @ObservedObject var session: MobileGradeSession
+    let recipe: MGradeRecipe
+    let onSaved: (GradePreset) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var groups: Set<MGradeGroupKey> = Set(MGradeGroupKey.allCases)
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var nameTaken: Bool {
+        let target = trimmedName.lowercased()
+        guard !target.isEmpty else { return false }
+        if GradePresetStore.builtins.contains(where: {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target
+        }) { return true }
+        return GradePresetStore.shared.userPresets.contains {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target
+        }
+    }
+
+    private var canSave: Bool {
+        !trimmedName.isEmpty && !nameTaken && !groups.isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("保存调色预设")
+                    .font(.navTitle)
+                    .foregroundStyle(MColor.text1)
+                Spacer()
+                Button("取消") { dismiss() }
+                    .font(.mSans(11.5, .medium))
+                    .foregroundStyle(MColor.text3)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 16)
+            .padding(.bottom, 10)
+
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("预设名称", text: $name)
+                        .font(.mSans(13, .medium))
+                        .foregroundStyle(MColor.text1)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 12)
+                        .frame(height: 44)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(MColor.surface2)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(nameTaken ? Color.red.opacity(0.6) : MColor.hairline,
+                                              lineWidth: 1)
+                        )
+                        .onChange(of: name) { _, value in
+                            if value.count > 20 { name = String(value.prefix(20)) }
+                        }
+
+                    if nameTaken {
+                        Text("已有同名预设，请换一个名称")
+                            .mMeta(8, color: Color.red.opacity(0.9))
+                    }
+
+                    Text("按组保存。裁切与边框不参与预设，套用时也不会改变。")
+                        .mMeta(8, color: MColor.text4)
+                        .padding(.top, 4)
+
+                    ForEach(MGradeGroupKey.allCases, id: \.self) { group in
+                        MCheckRow(
+                            label: group.title,
+                            detail: groupDetail(group),
+                            isOn: binding(for: group)
+                        )
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 18)
+            }
+            .scrollIndicators(.never)
+
+            MBrassPill(title: "保存", height: 44, fullWidth: true, disabled: !canSave) {
+                save()
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 8)
+            .padding(.bottom, 18)
+        }
+        .background(MColor.surface1)
+    }
+
+    private func binding(for group: MGradeGroupKey) -> Binding<Bool> {
+        Binding(
+            get: { groups.contains(group) },
+            set: { isOn in
+                if isOn { groups.insert(group) } else { groups.remove(group) }
+            }
+        )
+    }
+
+    private func groupDetail(_ group: MGradeGroupKey) -> String {
+        switch group {
+        case .light: return "曝光 / 对比 / 高光 / 阴影 / 曲线"
+        case .color: return "色温 / 色调 / 饱和 / HSL / 分级"
+        case .optics: return "暗角 / 颗粒 / 色差"
+        case .quality: return "清晰度 / 纹理 / 锐化 / 降噪"
+        case .lut: return "LUT 名称与强度"
+        }
+    }
+
+    private func save() {
+        guard canSave else { return }
+        let preset = session.savePreset(name: trimmedName, groups: groups, recipe: recipe)
+        MHaptic.light()
+        onSaved(preset)
+        dismiss()
     }
 }

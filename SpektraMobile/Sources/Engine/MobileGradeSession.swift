@@ -15,6 +15,12 @@ enum MGradeSource {
 final class MobileGradeSession: ObservableObject {
     let photoID: String
     let filename: String
+    /// 当前交接像素是否来自显影结果：主页长按命中交接图缓存时，
+    /// 入口虽然还是「直接调色」，但来源已经是显影图，顶栏文案要跟着变。
+    var isDevelopedSource: Bool {
+        if case .developed = sourceMode { return true }
+        return false
+    }
     private let store: LibraryStore
     private let develop: MobileDevelopSession
     private let sourceMode: MGradeSource
@@ -64,6 +70,8 @@ final class MobileGradeSession: ObservableObject {
     private var pristineOriginalCG: CGImage?
     private var borderPersistWork: DispatchWorkItem?
     private var geometryPersistWork: DispatchWorkItem?
+    /// 调色配方落盘防抖：滑条拖动期间只写最后一次。
+    private var recipePersistWork: DispatchWorkItem?
     /// 裁切取景底图的目标长边：取景只需要屏幕分辨率，压缩快照能显著降低拖动期采样成本。
     private let cropBaseEdge = 1200
     /// 生成快照时的配方与 LUT，用于下次进裁切页时判断能否直接复用。
@@ -120,6 +128,16 @@ final class MobileGradeSession: ObservableObject {
         if let data = photo.cropData,
            let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
             self.geometry = decoded.normalized()
+        }
+        // 直出工程：调色配方随库记录保存，打开调色台直接回放。
+        if let data = photo.gradeData,
+           let decoded = try? JSONDecoder().decode(GradeRecipe.self, from: data) {
+            self.lutPath = decoded.lut.path
+            let lutName = decoded.lut.path.isEmpty
+                ? "无 LUT"
+                : (luts.first(where: { $0.path == decoded.lut.path })?.name
+                    ?? URL(fileURLWithPath: decoded.lut.path).lastPathComponent)
+            self.displayRecipe = MGradeRecipe(grade: decoded, lutName: lutName)
         }
     }
 
@@ -186,10 +204,12 @@ final class MobileGradeSession: ObservableObject {
     }
 
     /// 交接像素：正常链路走显影结果，直接调色入口走原片。
-    private func handoff(maxEdge: Int, completion: @escaping (ImageRGB?) -> Void) {
+    private func handoff(maxEdge: Int, tiled: Bool = false, bandPixelBudget: Int = 0,
+                         completion: @escaping (ImageRGB?) -> Void) {
         switch sourceMode {
         case .developed:
-            develop.prepareHandoff(maxEdge: maxEdge, completion: completion)
+            develop.prepareHandoff(maxEdge: maxEdge, tiled: tiled,
+                                   bandPixelBudget: bandPixelBudget, completion: completion)
         case .original:
             develop.prepareOriginalHandoff(maxEdge: maxEdge, completion: completion)
         }
@@ -336,6 +356,10 @@ final class MobileGradeSession: ObservableObject {
         borderPersistWork?.cancel()
         borderPersistWork = nil
         persistBorderNow()
+        recipePersistWork?.cancel()
+        recipePersistWork = nil
+        // 退出调色台必须把配方落盘：否则重新进入时参数会回到上一次导出的状态。
+        persistRecipeNow()
         borderFlag?.cancel()
         geometryFlag?.cancel()
         pendingProxy?.cancel()
@@ -456,10 +480,36 @@ final class MobileGradeSession: ObservableObject {
         try? store.update(photo)
     }
 
+    // MARK: - 配方持久化
+
+    private func persistRecipeSoon() {
+        recipePersistWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.recipePersistWork = nil
+            self?.persistRecipeNow()
+        }
+        recipePersistWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// 把当前配方写回库记录。空配方且此前没有配方时不写，避免「只是打开过调色台」
+    /// 就把照片标记成已调色；一旦有过配方，重置到中性也会照常落盘。
+    private func persistRecipeNow() {
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
+        guard recipe != GradeRecipe() || photo.gradeData != nil else { return }
+        photo.gradeData = try? JSONEncoder().encode(recipe)
+        try? store.update(photo)
+    }
+
     // MARK: - 配方
+
+    /// 当前完整配方（含直出工程恢复的调色参数），供界面初始化滑条状态。
+    var currentRecipe: MGradeRecipe { displayRecipe }
 
     func apply(_ ui: MGradeRecipe) {
         displayRecipe = ui
+        persistRecipeSoon()
         schedule()
     }
 
@@ -473,22 +523,55 @@ final class MobileGradeSession: ObservableObject {
             displayRecipe.lutName = "无 LUT"
             displayRecipe.lutStrength = 0
         }
+        persistRecipeSoon()
         schedule()
     }
 
     /// 按 LUT 名称回写会话内的 LUT 路径（撤销 / 重置配方时与 UI 的 lutName 保持同步）。
     func syncLUTPath(name: String) {
         lutPath = name == "无 LUT" ? "" : (luts.first { $0.name == name }?.path ?? "")
+        persistRecipeSoon()
     }
 
     func applyPreset(_ preset: GradePreset) {
-        let name = preset.recipe.lut.path.isEmpty
-            ? "无 LUT"
-            : (luts.first(where: { $0.path == preset.recipe.lut.path })?.name
-                ?? URL(fileURLWithPath: preset.recipe.lut.path).lastPathComponent)
-        lutPath = preset.recipe.lut.path
-        displayRecipe = MGradeRecipe(grade: preset.recipe, lutName: name)
+        let groups = preset.appliedGroups
+        if groups.contains(.lut) {
+            let name = preset.recipe.lut.path.isEmpty
+                ? "无 LUT"
+                : (luts.first(where: { $0.path == preset.recipe.lut.path })?.name
+                    ?? URL(fileURLWithPath: preset.recipe.lut.path).lastPathComponent)
+            lutPath = preset.recipe.lut.path
+            displayRecipe.lutName = name
+        }
+        displayRecipe.merge(preset.recipe, groups: groups)
+        persistRecipeSoon()
         schedule()
+    }
+
+    /// 用户预设的勾选组；裁切 / 边框始终不参与。
+    @discardableResult
+    func savePreset(name: String, groups: Set<MGradeGroupKey>,
+                    recipe: MGradeRecipe? = nil) -> GradePreset {
+        // 以界面当前配方为准，避免滑条变化与 onChange 之间的一帧延迟漏掉最后一次调整。
+        let source = recipe ?? displayRecipe
+        let preset = GradePresetStore.shared.save(
+            name: name,
+            recipe: source.gradeRecipe(lutPath: lutPath),
+            groups: groups
+        )
+        presets = GradePresetStore.shared.all
+        return preset
+    }
+
+    @discardableResult
+    func deletePreset(id: String) -> Bool {
+        guard GradePresetStore.shared.delete(id: id) else { return false }
+        presets = GradePresetStore.shared.all
+        return true
+    }
+
+    func reloadPresets() {
+        presets = GradePresetStore.shared.all
     }
 
     @discardableResult
@@ -499,14 +582,6 @@ final class MobileGradeSession: ObservableObject {
         luts = GradePresetStore.shared.luts()
         setLUT(entry: entry)
         return entry
-    }
-
-    @discardableResult
-    func savePreset(name: String) -> GradePreset {
-        let preset = GradePresetStore.shared.save(
-            name: name, recipe: displayRecipe.gradeRecipe(lutPath: lutPath))
-        presets = GradePresetStore.shared.all
-        return preset
     }
 
     // MARK: - 渲染
@@ -602,8 +677,13 @@ final class MobileGradeSession: ObservableObject {
             completion(.failure(MobileExportError.busy))
             return
         }
-        let originalEdge = max(store.photos.first(where: { $0.id == photoID })?.width ?? 0,
-                               store.photos.first(where: { $0.id == photoID })?.height ?? 0)
+        let photo = store.photos.first(where: { $0.id == photoID })
+        let originalWidth = photo?.width ?? 0
+        let originalHeight = photo?.height ?? 0
+        let originalEdge = max(originalWidth, originalHeight)
+        let aspect = (originalWidth > 0 && originalHeight > 0)
+            ? Double(min(originalWidth, originalHeight)) / Double(max(originalWidth, originalHeight))
+            : 0.75
         let borderConfig = border
         let filmID = develop.filmID
         let dateLabel = captureDateLabel
@@ -611,10 +691,13 @@ final class MobileGradeSession: ObservableObject {
         let watermarkEnabled = includeWatermark
         let watermark = MWatermarkStore.load()
         let rawEdge = ExportEdge.requested(index: longEdgeIndex, originalLongEdge: originalEdge)
-        // 原始档和带片边的大图都可能超过前台内存预算：所有档位统一按可用内存钳位，
-        // 实际尺寸写进导出文案，避免 48 MP 级原片导出时被 jetsam。
-        let edge = ExportEdge.clampToMemoryBudget(rawEdge)
-        let exportNote = edge < rawEdge ? "导出调色 · 内存上限 \(edge)" : "导出调色"
+        // 与显影台共用同一套内存计划：能整张算就整张算，放不下就分带。
+        let plan = develop.exportPlan(index: longEdgeIndex, originalEdge: originalEdge,
+                                      aspect: aspect, includeGrade: true)
+            ?? ExportEdge.Plan(edge: rawEdge, tiled: false, bandPixelBudget: 0,
+                               haloRows: 0, bandCount: 1, clamped: false)
+        let edge = plan.edge
+        let exportNote = plan.clamped ? "导出调色 · 内存上限 \(edge)" : "导出调色"
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
         let geometry = geometry
         let targetSpace: String
@@ -638,9 +721,9 @@ final class MobileGradeSession: ObservableObject {
         phaseLabel = "导出调色"
         exportLabel = exportNote
         phaseProgress = 0
-        handoff(maxEdge: edge) { [weak self] image in
+        handoff(maxEdge: edge, tiled: plan.tiled, bandPixelBudget: plan.bandPixelBudget) { [weak self] image in
             guard let self else { return }
-            guard let image else {
+            guard var image else {
                 Task { @MainActor in
                     self.isExporting = false
                     self.exportLabel = ""
@@ -651,20 +734,33 @@ final class MobileGradeSession: ObservableObject {
             let exportPhotoID = self.photoID
             self.gradeQueue.async {
                 do {
-                    let linear = GradeEngine.prepareSource(image)
-                    let warped = geometry.apply(to: linear)
-                    let result = try GradeEngine.render(warped, recipe: recipe)
-                    if let lutError = result.lutError { throw lutError }
-                    var output = Self.convertForExport(
-                        result.image, colorSpace: targetSpace, cctfEncoding: targetCCTF)
+                    // 交接图只在 prepare 阶段用一次；原地转换后立刻释放引用，
+                    // 34 MP 下能省掉一整张 400 MB 的 COW 副本。
+                    var linear = image
+                    image = ImageRGB(width: 0, height: 0)
+                    GradeEngine.prepareSourceInPlace(&linear)
+                    var warped = geometry.apply(to: linear)
+                    linear = ImageRGB(width: 0, height: 0)
+                    // 大图分带调色：48 MP 的整图 Double 工作缓冲是 1.17 GB。
+                    // 决策与直出共用 ExportEdge.Plan，避免两条链路分叉。
+                    let bandedGrade = plan.usesBandedGrade
+                    var rendered = bandedGrade
+                        ? try GradeEngine.renderTiledInPlace(
+                            &warped, recipe: recipe, bandRows: 256)
+                        : try GradeEngine.renderInPlace(&warped, recipe: recipe)
+                    if let lutError = rendered.lutError { throw lutError }
+                    var output = rendered.image
+                    // 把 result 里的引用也清掉，convertForExport 原地写回时才是唯一所有权。
+                    rendered.image = ImageRGB(width: 0, height: 0)
+                    Self.convertForExport(&output, colorSpace: targetSpace, cctfEncoding: targetCCTF)
                     // 水印属于照片本身：先压进画面，再合成片边，避免盖到片基与边字上。
                     if watermarkEnabled {
                         Task { @MainActor in self.exportLabel = "合成水印" }
                         var config = watermark
                         // 导出面板的勾选是这次导出的最终决定，覆盖设置里的启用位。
                         config.enabled = true
-                        output = MWatermarkRenderer.composite(
-                            image: output, config: config,
+                        MWatermarkRenderer.compositeInPlace(
+                            &output, config: config,
                             colorSpace: targetSpace, cctfEncoding: targetCCTF
                         )
                     }
@@ -705,13 +801,13 @@ final class MobileGradeSession: ObservableObject {
 
     // MARK: - 工具
 
-    private nonisolated static func convertForExport(
-        _ image: ImageRGB, colorSpace: String, cctfEncoding: Bool
-    ) -> ImageRGB {
-        if colorSpace == "sRGB" && cctfEncoding { return image }
+    nonisolated static func convertForExport(
+        _ image: inout ImageRGB, colorSpace: String, cctfEncoding: Bool
+    ) {
+        if colorSpace == "sRGB" && cctfEncoding { return }
         let sourceKind = ColorMath.cctfKind(for: "sRGB")
         let targetKind = ColorMath.cctfKind(for: colorSpace)
-        return image.map { pixel in
+        image.mapInPlace { pixel in
             let decoded = Vec3(
                 ColorMath.cctfDecode(pixel.x, kind: sourceKind),
                 ColorMath.cctfDecode(pixel.y, kind: sourceKind),

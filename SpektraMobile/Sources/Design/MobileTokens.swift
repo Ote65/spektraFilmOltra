@@ -148,6 +148,24 @@ enum MLayout {
         return size.width >= 800 && size.height >= 640 && canvas >= 470
     }
 
+    /// 台前调度窗口最窄形状锁到 iPhone 竖屏比例（393:852）：
+    /// 窗口再往窄拖会挤压顶部按钮造成重叠，所以按当前窗口高度反推最小宽度。
+    /// 只加宽下限、不锁高度，横竖窗口都按同一条比例线约束。
+    /// 纯计算：调用方负责去重，并在布局回调之外（如 `DispatchQueue.main.async`）
+    /// 调用 `applyWindowWidthFloor(_:)`，避免在 SwiftUI 布局事务里改窗口场景。
+    static func windowWidthFloor(for size: CGSize) -> CGFloat? {
+        guard isPad, size.height > 1 else { return nil }
+        return size.height * (393.0 / 852.0)
+    }
+
+    @MainActor
+    static func applyWindowWidthFloor(_ minWidth: CGFloat) {
+        guard #available(iOS 16.1, *) else { return }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        scene?.sizeRestrictions?.minimumSize = CGSize(width: minWidth, height: 0)
+    }
+
     /// 分栏右栏宽度：随屏宽增长，但给画布留足空间。
     static func inspectorWidth(for size: CGSize) -> CGFloat {
         min(430, max(330, size.width * 0.34))
@@ -158,13 +176,8 @@ enum MLayout {
         min(320, max(250, size.width * 0.21))
     }
 
-    /// 主页网格列数：按可用宽度决定，iPad 横屏不再固定两列。
-    static func gridColumns(for width: CGFloat) -> Int {
-        if width >= 1180 { return 5 }
-        if width >= 980 { return 4 }
-        if width >= 720 { return 3 }
-        return 2
-    }
+    /// 主页网格卡片的最小宽度：低于它就减少每行数量。iPhone 不用这个值。
+    static let gridMinCardWidth: CGFloat = 220
 }
 
 /// 真实屏幕度量：整屏尺寸 + 安全区。
@@ -174,15 +187,13 @@ enum MLayout {
 enum MScreenMetrics {
     static func current() -> MSafeInsets {
         #if os(iOS)
-        let window = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first(where: { $0.isKeyWindow })
-            ?? UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }
-                .flatMap { $0.windows }
-                .first
-        guard let window else { return .fallback }
+        // 台前调度 / 窗口化时，别的 Scene 或系统窗口也可能在主线程里，
+        // 必须锁到当前 App 所在的前台 Scene 的 keyWindow，否则会拿到整块虚拟画布。
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        guard let window = scene?.keyWindow ?? scene?.windows.first(where: { $0.isKeyWindow }) else {
+            return .fallback
+        }
         let insets = window.safeAreaInsets
         return MSafeInsets(top: insets.top, bottom: insets.bottom, size: window.bounds.size)
         #else
@@ -282,6 +293,20 @@ enum DebugLaunch {
     static var exportAutoStart: Bool { args.contains("--export-run") }
     /// 截图验收用：调色「调整」面板默认从底部开始，好截到「质感」分区。
     static var gradePanelBottom: Bool { args.contains("--grade-bottom") }
+    /// 验收/诊断用：`--develop-file DSC04059.ARW` 直接打开库内指定文件名的照片。
+    static var developFile: String? {
+        guard let index = args.firstIndex(of: "--develop-file"),
+              args.indices.contains(index + 1) else { return nil }
+        return args[index + 1]
+    }
+
+    /// 验收用：`--launch-scope graded` 临时覆盖启动筛选，方便截图验证。
+    static var launchScope: MAssetScope? {
+        guard let index = args.firstIndex(of: "--launch-scope"),
+              args.indices.contains(index + 1),
+              let value = MobileSettings.MLaunchScope(rawValue: args[index + 1]) else { return nil }
+        return value.scope
+    }
     /// 截图验收用：显影「细节」专业页默认滚到底部，好截到输入/输出分组。
     static var developPanelBottom: Bool { args.contains("--detail-bottom") }
     /// 机型矩阵验收用：启动时把真实安全区与推导出的开孔矩形打到日志（`log show` 可读）。
@@ -362,6 +387,28 @@ enum DebugLaunch {
         }
         return args[index + 1]
     }
+
+    /// 验收用：`--grade-handoff` 从显影交接入口进调色台（写入/复用交接图缓存）。
+    static var gradeHandoff: Bool { args.contains("--grade-handoff") }
+
+    /// 验收用：`--direct-image name.jpg` 直接把 App Documents 里的图片当作直出成片展示。
+    static var directImage: String? {
+        guard let index = args.firstIndex(of: "--direct-image"),
+              args.indices.contains(index + 1) else { return nil }
+        return args[index + 1]
+    }
+
+    /// 验收用：直出成片页启动时展开片边面板。
+    static var directBorderPanel: Bool { args.contains("--border-panel") }
+
+    /// 验收用：直出成片页启动后自动走一次「进入显影台」（配合 --direct-image）。
+    static var directDevelop: Bool { args.contains("--direct-develop") }
+
+    /// 验收用：相机页启动时展开直出预设面板。
+    static var directPicker: Bool { args.contains("--direct-picker") }
+
+    /// 截图验收用：设置页默认滚到底部，检查缓存分区。
+    static var settingsBottom: Bool { args.contains("--settings-bottom") }
 }
 
 // MARK: - 面板高度测量

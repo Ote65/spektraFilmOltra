@@ -47,6 +47,7 @@ final class PreviewRenderer {
     }
 
     func render(params: RuntimePhotoParams, image: ImageRGB, maxSize: Int? = nil,
+                tiled: Bool = false, bandPixelBudget: Int = 0,
                 progress: ((String, Int, Int) -> Void)? = nil,
                 completion: @escaping (Outcome) -> Void) {
         lock.lock()
@@ -64,11 +65,19 @@ final class PreviewRenderer {
             let pipeline = SimulationPipeline(params: working, lutService: lut, keepTaps: false)
             pipeline.shouldCancel = { self.currentGeneration() != token }
             let start = Date()
-            let result = pipeline.process(prepared, progress: { label, index, total in
+            let report: (String, Int, Int) -> Void = { label, index, total in
                 if self.currentGeneration() == token {
                     progress?(label, index, total)
                 }
-            })
+            }
+            let result: PipelineResult
+            if tiled {
+                result = pipeline.processTiled(prepared,
+                                               bandPixelBudget: max(bandPixelBudget, 2_000_000),
+                                               progress: report)
+            } else {
+                result = pipeline.process(prepared, progress: report)
+            }
             let elapsed = Date().timeIntervalSince(start)
             if self.currentGeneration() != token { return }
             completion(Outcome(image: result.rgbOut, elapsed: elapsed, cancelled: false))
