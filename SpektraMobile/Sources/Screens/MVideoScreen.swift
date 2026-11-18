@@ -880,7 +880,8 @@ private struct MVideoExportOverlay: View {
                 isRendering = false
                 return
             }
-            isRendering = false
+            // 成功路径保持 isRendering=true，进度态一直显示到 finished 置位，
+            // 中间不留空档——否则 saveVideo 的异步回调前会闪回编码选项 UI。
             PhotoLibraryExport.saveVideo(destination, album: PhotoLibraryExport.albumTitle) { outcome in
                 // 渲染成功就置完成态（对勾 + 点屏幕关闭）；相册写入是否成功
                 // 只由 toast 说明，不能让「写相册失败」把成功态打回进度态。
@@ -932,6 +933,9 @@ private struct MVideoExportBeat: View {
     @State private var goal: Double = 0
     @State private var hapticPercent = 0
     @State private var ticker: Task<Void, Never>?
+    /// 完成后不立刻切对勾：先让百分比平滑补到 100%，再由 ticker 置位切换，
+    /// 避免「百分比还没走完就硬切对勾」的断裂感。
+    @State private var showCheck = false
 
     private var percent: Int {
         Int((min(max(eased, 0), 1) * 100).rounded(.down))
@@ -939,10 +943,10 @@ private struct MVideoExportBeat: View {
 
     var body: some View {
         Group {
-            if finished {
+            if showCheck {
                 Image(systemName: "checkmark")
                     .font(.system(size: 32, weight: .semibold))
-                    .foregroundStyle(MColor.brassHigh)
+                    .foregroundStyle(.white)
                     .symbolEffect(.bounce, options: .speed(1.05))
                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
             } else {
@@ -957,21 +961,20 @@ private struct MVideoExportBeat: View {
         }
         .frame(maxWidth: .infinity)
         .frame(height: 54)
+        // 百分比 ↔ 对勾的切换动画；两者都在同一坐标系，无位移跳变。
+        .animation(MMotion.state, value: showCheck)
         .onAppear {
             goal = min(max(target, 0), 1)
             startTicker()
         }
-        .onChange(of: target) { _, new in goal = min(max(new, 0), 1) }
+        .onChange(of: target) { _, new in
+            guard !finished else { return }
+            goal = min(max(new, 0), 1)
+        }
         .onChange(of: finished) { _, done in
             guard done else { return }
+            // 只把目标推到 1，交给常驻 ticker 平滑补满；不直接 eased=1。
             goal = 1
-            eased = 1
-            // 完成后停掉 ticker：弹窗不会自动关闭，留着它每 60ms 空转一次是纯耗电。
-            ticker?.cancel()
-            ticker = nil
-            #if os(iOS)
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            #endif
         }
         .onDisappear {
             ticker?.cancel()
@@ -990,11 +993,27 @@ private struct MVideoExportBeat: View {
                 let remaining = goal - eased
                 if remaining <= 0.001 {
                     eased = goal
+                    // goal 只会被完成回调推到 1（普通进度最高 0.94），
+                    // 用它当完成信号——不能直接读 finished：ticker 在旧 View 实例
+                    // 里启动，闭包捕获的是旧值 false，对勾会永远不切。
+                    if goal >= 0.999 {
+                        withAnimation(MMotion.state) { showCheck = true }
+                        ticker?.cancel()
+                        ticker = nil
+                        #if os(iOS)
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        #endif
+                        break
+                    }
                     continue
                 }
                 // 每步约 1.5 个百分点，带 ±30% 随机微抖，越接近越慢。
-                let raw = max(0.0025, remaining * 0.10) * Double.random(in: 0.7...1.3)
-                eased = min(goal, eased + min(raw, 0.02))
+                // 完成补满阶段（goal=1）用大步长，约 0.5s 走到 100%，不让对勾等太久。
+                let finishing = goal >= 0.999
+                let raw = finishing
+                    ? max(0.05, remaining * 0.35)
+                    : max(0.0025, remaining * 0.10) * Double.random(in: 0.7...1.3)
+                eased = min(goal, eased + min(raw, finishing ? 0.12 : 0.02))
                 let value = Int((eased * 100).rounded(.down))
                 if value > hapticPercent {
                     hapticPercent = value
