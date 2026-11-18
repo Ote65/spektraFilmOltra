@@ -56,10 +56,10 @@ final class VideoMetalRenderer: VideoRendering {
         var diffusion: Float = 0
         var usm: Float = 0
         var padA: Float = 0
-        // MSL 的 float3 占 16 字节（alignment 16），而 Swift 的 SIMD3<Float> size 是 12。
-        // 用 SIMD3 会让 width 落在 140，MSL 按 144 读 → 从这里往后的
-        // width / developStrength / grade* / gradeTemperature 全部串位 4 字节，
-        // 参数滑条看起来"动了但画面没反应"正是这个原因。统一用 SIMD4 填充 16 字节。
+        // 矩阵四字段用 SIMD4：MSL float3 步长实测为 16 字节，SIMD4<Float> 同为 16 字节，
+        // 两者偏移严格对齐（m0=80/m1=96/m2=112/tint=128/width=144…gradeTemperature=196）。
+        // 之前误判 SIMD3 是 12 字节导致的「错位」其实是误诊——SIMD3 在 Swift 里 stride 也是 16；
+        // 参数真正生效靠的是新增 gradeTemperature uniform + frameUniforms 映射 + edit 透传。
         var m0 = SIMD4<Float>(1, 0, 0, 0)
         var m1 = SIMD4<Float>(0, 1, 0, 0)
         var m2 = SIMD4<Float>(0, 0, 1, 0)

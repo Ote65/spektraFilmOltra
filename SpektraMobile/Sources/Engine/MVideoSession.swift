@@ -425,9 +425,6 @@ final class MVideoSession: ObservableObject {
         defer { isExporting = false }
 
         do {
-            // 导出逐帧只吃 setup.edit，必须按当前参数重建一次；
-            // bake 有内容寻址缓存，LUT 没变时这里不会真的重算。
-            setupCache = nil
             let setup = try await preparedSetup()
             try await exporter.export(
                 project: project,

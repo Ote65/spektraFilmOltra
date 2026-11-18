@@ -283,10 +283,11 @@ final class VideoFramePipeline: @unchecked Sendable {
         }
         let natural = try await videoTrack.load(.naturalSize)
         let transform = try await videoTrack.load(.preferredTransform)
-        let angle = atan2(Double(transform.b), Double(transform.a)) * 180 / .pi
-        let rotated = abs(abs(angle) - 90) < 1 || abs(abs(angle) - 270) < 1
-        let outWidth = rotated ? Int(natural.height) : Int(natural.width)
-        let outHeight = rotated ? Int(natural.width) : Int(natural.height)
+        // 帧缓冲、Metal 渲染全程使用「传感器方向」尺寸（=naturalSize），与横拍素材一致。
+        // 竖拍的旋转不在 CPU 合成阶段做，而是作为元数据写到输出 track 的 transform，
+        // 由播放器/相册按 appliesPreferredTrackTransform 自动转正。
+        let frameWidth = Int(natural.width)
+        let frameHeight = Int(natural.height)
 
         let reader = try AVAssetReader(asset: asset)
         // 解码帧直接进 Metal 纹素：必须显式声明 Metal 兼容。iOS 上解码器默认给的是
@@ -296,36 +297,14 @@ final class VideoFramePipeline: @unchecked Sendable {
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferMetalCompatibilityKey as String: true,
         ]
-        let output: AVAssetReaderOutput
-        if transform.isIdentity {
-            let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readSettings)
-            trackOutput.alwaysCopiesSampleData = false
-            output = trackOutput
-        } else {
-            // 竖拍/旋转素材：解码帧是传感器方向，宽高却被换成了显示方向。不转正就
-            // 等于把横的像素硬塞进竖的画框 → 整片拉伸。预览走 `referenceFrame` 的
-            // `appliesPreferredTrackTransform = true` 早就是正的，这里必须对齐，
-            // 否则会出现「预览是正的、成片是歪的」。转正交给 VideoComposition，
-            // 不碰 Metal 管线，后面所有 Pass 都在显示方向上工作。
-            let composition = AVMutableVideoComposition()
-            composition.renderSize = CGSize(width: outWidth, height: outHeight)
-            // frameDuration 必须给：为 0 时 `setVideoComposition` 直接抛异常（实测崩在这里）。
-            // 它只参与输出帧时序推导，取源帧率即可。
-            let nominalFPS = try await videoTrack.load(.nominalFrameRate)
-            let timingFPS = nominalFPS > 0 ? nominalFPS.rounded() : 30
-            composition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, timingFPS)))
-            let instruction = AVMutableVideoCompositionInstruction()
-            instruction.timeRange = CMTimeRange(start: .zero, duration: try await asset.load(.duration))
-            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
-            layer.setTransform(transform, at: .zero)
-            instruction.layerInstructions = [layer]
-            composition.instructions = [instruction]
-            let compOutput = AVAssetReaderVideoCompositionOutput(
-                videoTracks: [videoTrack], videoSettings: readSettings)
-            compOutput.videoComposition = composition
-            compOutput.alwaysCopiesSampleData = false
-            output = compOutput
-        }
+        // 一律用 AVAssetReaderTrackOutput 直接解码，不再走 AVAssetReaderVideoCompositionOutput。
+        // 后者依赖 CPU 视频合成器，对 10-bit HEVC Rext（yuv422p10le，如 A001_C257）旋转
+        // 合成时会产出全黑/斜纹垃圾帧（2026-11-18 实证：直解亮度 110，合成后为 0）。
+        // 直接解码出的帧是传感器方向，经 Metal 渲染后仍按传感器方向编码，旋转交给
+        // writer 的 transform 元数据完成 —— 完全绕开合成器的编码兼容性问题。
+        let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readSettings)
+        trackOutput.alwaysCopiesSampleData = false
+        let output: AVAssetReaderOutput = trackOutput
         guard reader.canAdd(output) else { throw VideoError.exportFailed("无法添加视频读取器") }
         reader.add(output)
         if let range = timeRange { reader.timeRange = range }
@@ -334,8 +313,11 @@ final class VideoFramePipeline: @unchecked Sendable {
         let writer = try AVAssetWriter(outputURL: destination, fileType: .mov)
         let videoInput = AVAssetWriterInput(
             mediaType: .video,
-            outputSettings: Self.videoSettings(codec: codec, width: outWidth, height: outHeight, fps: 24))
+            outputSettings: Self.videoSettings(codec: codec, width: frameWidth, height: frameHeight, fps: 24))
         videoInput.expectsMediaDataInRealTime = false
+        // 旋转写成输出 track 的 transform 元数据：视频数据保持传感器方向，
+        // 播放器/相册据此自动转正，等效于参考帧的 appliesPreferredTrackTransform。
+        if !transform.isIdentity { videoInput.transform = transform }
         guard writer.canAdd(videoInput) else { throw VideoError.exportFailed("无法添加视频写入器") }
         writer.add(videoInput)
 
@@ -464,6 +446,14 @@ final class VideoFramePipeline: @unchecked Sendable {
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
         ]
+        // 色彩属性对所有编码都必须声明：缺了它 VideoToolbox 写出的片在相册里
+        // 会整段黑屏（只有元数据没有图像）。此前只在 ProRes 分支写，HEVC 分支
+        // 遗漏，是同类静默坏片的隐患，统一提到公共段。
+        settings[AVVideoColorPropertiesKey as String] = [
+            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+        ]
         if codec != .proRes422LT {
             // 码率只认 `VideoCodec.bitrateMbps` 一处：导出与「预估体积」共用同一张表，
             // 否则 UI 承诺的数字和实际写出的码率会各走一套。
@@ -472,14 +462,6 @@ final class VideoFramePipeline: @unchecked Sendable {
                 AVVideoAverageBitRateKey: bitrate,
                 AVVideoExpectedSourceFrameRateKey: fps,
                 AVVideoMaxKeyFrameIntervalKey: fps * 2,
-            ]
-        } else {
-            // ProRes 不能带码率，但必须显式声明色彩：缺了色彩属性时
-            // VideoToolbox 写出的母版在相册里会整段黑屏（只有元数据没有图像）。
-            settings[AVVideoColorPropertiesKey as String] = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
             ]
         }
         return settings

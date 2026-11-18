@@ -716,7 +716,7 @@ private struct MVideoExportOverlay: View {
         self.session = session
         self.onClose = onClose
         self.onToast = onToast
-        _codec = State(initialValue: session.project.exportSettings.codec)
+        _codec = State(initialValue: DebugLaunch.videoCodec ?? session.project.exportSettings.codec)
     }
 
     var body: some View {
@@ -730,6 +730,13 @@ private struct MVideoExportOverlay: View {
 
             panel
                 .padding(.horizontal, 42)
+                // 成功后点弹窗任意位置就关闭；编码态点空白处不动，
+                // 避免选规格时误触。遮罩层仍负责点外部关闭。
+                .onTapGesture {
+                    guard finished else { return }
+                    MHaptic.tick()
+                    onClose()
+                }
         }
         .transition(.opacity)
         .task {
@@ -741,15 +748,17 @@ private struct MVideoExportOverlay: View {
     /// 极简弹窗：没有标题、没有文件名、没有内部卡片框。
     /// 编码态 → 进度态 → 完成态之间用非线性位移 + 缩放衔接，不做生硬替换。
     private var panel: some View {
-        VStack(spacing: 24) {
+        VStack(spacing: 0) {
             if isRendering || finished {
                 progressBlock
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .transition(.asymmetric(
                         insertion: .opacity.combined(with: .scale(scale: 0.94)),
                         removal: .opacity
                     ))
             } else {
                 codecBlock
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .transition(.asymmetric(
                         insertion: .opacity.combined(with: .scale(scale: 0.96)),
                         removal: .opacity.combined(with: .scale(scale: 0.96))
@@ -757,10 +766,11 @@ private struct MVideoExportOverlay: View {
             }
         }
         .padding(.horizontal, 26)
-        .padding(.vertical, 30)
+        .padding(.vertical, 26)
         .frame(maxWidth: 360)
-        // 两态固定同一高度：编码态切进度态时弹窗不抽高，衔接只走内容淡入缩放。
-        .frame(minHeight: 236)
+        // 必须是固定高度：内部用 maxHeight: .infinity 做居中定位，
+        // 只给 minHeight 会让弹窗一路撑到全屏。
+        .frame(height: 248)
         .background(
             RoundedRectangle(cornerRadius: MRadius.sheet, style: .continuous)
                 .fill(MColor.surface1.opacity(0.98))
@@ -771,11 +781,14 @@ private struct MVideoExportOverlay: View {
 
     /// 只有「编码」和三个档位，选完直接点开始渲染；不放预估体积、不放说明。
     private var codecBlock: some View {
-        VStack(spacing: 22) {
+        VStack(spacing: 0) {
             Text("编码")
                 .font(.mSans(9.5, .semibold))
                 .tracking(1.2)
                 .foregroundStyle(MColor.text4)
+                .padding(.top, 2)
+
+            Spacer(minLength: 10)
 
             VStack(spacing: 2) {
                 ForEach(VideoCodec.allCases) { item in
@@ -799,34 +812,41 @@ private struct MVideoExportOverlay: View {
                 }
             }
 
+            Spacer(minLength: 10)
+
             MBrassPill(title: "开始渲染", icon: "wand.and.stars", height: 38) {
                 startRender()
             }
+            .padding(.bottom, 2)
         }
     }
 
-    /// 进度态：只有跳动百分比 + 白色「取消」文字；完成态：只有对勾 + 「完成」。
+    /// 弹窗主体占满固定高度后按坐标排版：百分比 / 对勾严格居中，
+    /// 只有渲染中才显示「取消」；成功后只剩对勾，点弹窗任意处关闭。
     private var progressBlock: some View {
-        VStack(spacing: 20) {
-            MVideoExportBeat(target: exportTarget, finished: finished)
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            ZStack {
+                MVideoExportBeat(target: exportTarget, finished: finished)
+                    .frame(width: w, height: 54)
+                    .position(x: w / 2, y: h / 2)
 
-            if finished {
-                MBrassPill(title: "完成", height: 38) { onClose() }
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
-            } else {
-                Button {
-                    MHaptic.tick()
-                    session.cancelExport()
-                } label: {
-                    Text("取消")
-                        .font(.mSans(12.5, .medium))
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 34)
-                        .contentShape(Rectangle())
+                if !finished {
+                    Button {
+                        MHaptic.tick()
+                        session.cancelExport()
+                    } label: {
+                        Text("取消")
+                            .font(.mSans(12.5, .medium))
+                            .foregroundStyle(.white)
+                            .frame(width: w, height: 34)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .transition(.opacity)
+                    .position(x: w / 2, y: h - 24)
                 }
-                .buttonStyle(.plain)
-                .transition(.opacity)
             }
         }
     }
@@ -848,13 +868,22 @@ private struct MVideoExportOverlay: View {
 
         Task {
             let ok = await session.renderFull(destination: destination)
-            isRendering = false
+            // 取消是用户主动行为，退回编码态即可，不弹「失败」；
+            // 用导出阶段判断，别去比对 status 文案。
             guard ok else {
-                NSLog("MVideoRender failed: %@", session.status)
-                onToast("渲染失败：\(session.status)")
+                if session.exportProgress.stage == .cancelled {
+                    NSLog("MVideoRender cancelled")
+                } else {
+                    NSLog("MVideoRender failed: %@", session.status)
+                    onToast("渲染失败：\(session.status)")
+                }
+                isRendering = false
                 return
             }
+            isRendering = false
             PhotoLibraryExport.saveVideo(destination, album: PhotoLibraryExport.albumTitle) { outcome in
+                // 渲染成功就置完成态（对勾 + 点屏幕关闭）；相册写入是否成功
+                // 只由 toast 说明，不能让「写相册失败」把成功态打回进度态。
                 finished = true
                 switch outcome {
                 case .saved:
@@ -937,6 +966,9 @@ private struct MVideoExportBeat: View {
             guard done else { return }
             goal = 1
             eased = 1
+            // 完成后停掉 ticker：弹窗不会自动关闭，留着它每 60ms 空转一次是纯耗电。
+            ticker?.cancel()
+            ticker = nil
             #if os(iOS)
             UINotificationFeedbackGenerator().notificationOccurred(.success)
             #endif

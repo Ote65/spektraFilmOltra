@@ -320,6 +320,17 @@ enum DebugLaunch {
     static var videoQuick: (String, Double)? {
         videoQuicks.first
     }
+    /// 验收用：`--video-codec prores` 让渲染面板默认选中母版，配合 export-run 自动验证成片。
+    static var videoCodec: VideoCodec? {
+        guard let index = args.firstIndex(of: "--video-codec"),
+              args.indices.contains(index + 1) else { return nil }
+        switch args[index + 1] {
+        case "prores": return .proRes422LT
+        case "hevc": return .hevcStandard
+        case "hevc-high": return .hevcHigh
+        default: return nil
+        }
+    }
     /// 同一条 `--video-quick` 可写多个，逗号分隔：
     /// `--video-quick temperature=0,color_density=100`，方便一次复位+推一个轴。
     static var videoQuicks: [(String, Double)] {

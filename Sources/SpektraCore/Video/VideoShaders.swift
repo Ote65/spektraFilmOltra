@@ -115,25 +115,27 @@ enum VideoShaders {
         float  diffusion;        // 68
         float  usm;              // 72
         float  padA;             // 76
+        // 偏移经 Metal 运行时编译实测：MSL float3 步长 16 字节（4 对齐但占 16）。
+        // 旧注释把 float3 当 12 字节，导致 width 之后全标小 4，别再照旧注释改布局。
         float3 m0;               // 80
         float3 m1;               // 96
         float3 m2;               // 112
         float3 tint;             // 128
-        uint   width;            // 140
-        uint   height;           // 144
-        uint   padB;             // 148
-        uint   padC;             // 152
+        uint   width;            // 144
+        uint   height;           // 148
+        uint   padB;             // 152
+        uint   padC;             // 156
         // ---- 显影 / 影调（显示域后处理，不参与 LUT 烘焙）----
-        float  developStrength;  // 156  1 = 全显影，0 = 原片
-        float  dynamicRange;     // 160  胶片宽容度补偿（进入胶片响应前）
-        float  gradeShadows;     // 164  -1…1
-        float  gradeHighlights;  // 168  -1…1
-        float  gradeBlacks;      // 172  -1…1
-        float  gradeWhites;      // 176  -1…1
-        float  gradeContrast;    // 180  -1…1
-        float  gradeSaturation;  // 184  1 = 原样
-        float  grainPixelScale;  // 188  渲染像素 / 成片像素（预览降分辨率时补偿高频颗粒尺度）
-        float  gradeTemperature; // 192  -1…1，正值偏暖
+        float  developStrength;  // 160  1 = 全显影，0 = 原片
+        float  dynamicRange;     // 164  胶片宽容度补偿（进入胶片响应前）
+        float  gradeShadows;     // 168  -1…1
+        float  gradeHighlights;  // 172  -1…1
+        float  gradeBlacks;      // 176  -1…1
+        float  gradeWhites;      // 180  -1…1
+        float  gradeContrast;    // 184  -1…1
+        float  gradeSaturation;  // 188  1 = 原样
+        float  grainPixelScale;  // 192  渲染像素 / 成片像素（预览降分辨率时补偿高频颗粒尺度）
+        float  gradeTemperature; // 196  -1…1，正值偏暖
     };
 
     kernel void develop(
