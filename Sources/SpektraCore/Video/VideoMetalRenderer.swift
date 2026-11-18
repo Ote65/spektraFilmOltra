@@ -1,0 +1,330 @@
+import Foundation
+import Metal
+import CoreVideo
+import simd
+
+/// Metal 设备/管线/纹理缓存，单帧渲染（方案 2.2）。
+///
+/// 采用 CVPixelBuffer → CVMetalTextureCache → Metal → CVPixelBuffer 的
+/// 零拷贝链路。输入 8-bit BGRA（Rec.709），输出 8-bit BGRA 给 AVAssetWriter；
+/// 中间在 float16 线性域运算，避免 8-bit LUT 查表的量化误差。
+protocol VideoRendering: AnyObject {
+    var hasLUT: Bool { get }
+    func installLUT(_ payload: VideoLUTPayload)
+    func render(source: CVPixelBuffer, destination: CVPixelBuffer,
+                uniforms: VideoFrameUniforms, payload: VideoLUTPayload) throws
+}
+
+final class VideoMetalRenderer: VideoRendering {
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let textureCache: CVMetalTextureCache
+    private let library: MTLLibrary
+
+    private var pipelineDevelop: MTLComputePipelineState
+    private var pipelineBloomDown: MTLComputePipelineState
+    private var pipelineBloomH: MTLComputePipelineState
+    private var pipelineBloomV: MTLComputePipelineState
+    private var pipelineComposite: MTLComputePipelineState
+
+    private var lutTextures: [MTLTexture]?
+    private var lutSize: Int = 0
+    private var uniformBuffer: MTLBuffer
+    private let lock = NSLock()
+
+
+    /// MSL 的 FrameParams 必须与 shader 内声明严格同布局（见 VideoShaders）。
+    /// 全部字段用定长标量与 simd 向量，保证 offset 与 MSL 一致。
+    private struct FrameParams {
+        var lutSize: UInt32 = 65
+        var shaperLoEV: Float = -8
+        var invSpan1: Float = 0
+        var encodedMax: Float = 2
+        var encodedInput: UInt32 = 0
+        var autoEV: Float = 0
+        var cameraOffset: Float = 0
+        var printOffset: Float = 0
+        var grainSigma: Float = 1
+        var frameSeed: UInt32 = 0
+        var grainR: Float = 0
+        var grainG: Float = 0
+        var grainB: Float = 0
+        var densMinR: Float = 0.03
+        var densMinG: Float = 0.03
+        var densMinB: Float = 0.03
+        var halation: Float = 0
+        var diffusion: Float = 0
+        var usm: Float = 0
+        var padA: Float = 0
+        // MSL 的 float3 占 16 字节（alignment 16），而 Swift 的 SIMD3<Float> size 是 12。
+        // 用 SIMD3 会让 width 落在 140，MSL 按 144 读 → 从这里往后的
+        // width / developStrength / grade* / gradeTemperature 全部串位 4 字节，
+        // 参数滑条看起来"动了但画面没反应"正是这个原因。统一用 SIMD4 填充 16 字节。
+        var m0 = SIMD4<Float>(1, 0, 0, 0)
+        var m1 = SIMD4<Float>(0, 1, 0, 0)
+        var m2 = SIMD4<Float>(0, 0, 1, 0)
+        var tint = SIMD4<Float>(1, 0.52, 0.24, 0)
+        var width: UInt32 = 0
+        var height: UInt32 = 0
+        var padB: UInt32 = 0
+        var padC: UInt32 = 0
+        // 显影 / 影调（显示域后处理）
+        var developStrength: Float = 1
+        var dynamicRange: Float = 0
+        var gradeShadows: Float = 0
+        var gradeHighlights: Float = 0
+        var gradeBlacks: Float = 0
+        var gradeWhites: Float = 0
+        var gradeContrast: Float = 0
+        var gradeSaturation: Float = 1
+        var grainPixelScale: Float = 1
+        var gradeTemperature: Float = 0
+    }
+
+    init() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw VideoError.noMetalDevice
+        }
+        guard let queue = device.makeCommandQueue() else {
+            throw VideoError.metalInit("无法创建 command queue")
+        }
+        var cache: CVMetalTextureCache?
+        guard CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess,
+              let cache else {
+            throw VideoError.metalInit("无法创建纹理缓存")
+        }
+        let library: MTLLibrary
+        do {
+            library = try device.makeLibrary(source: VideoShaders.source, options: nil)
+        } catch {
+            throw VideoError.metalInit("MSL 编译失败: \(error.localizedDescription)")
+        }
+        func pipe(_ name: String) throws -> MTLComputePipelineState {
+            guard let fn = library.makeFunction(name: name) else {
+                throw VideoError.metalInit("缺少 kernel \(name)")
+            }
+            return try device.makeComputePipelineState(function: fn)
+        }
+        self.device = device
+        self.commandQueue = queue
+        self.textureCache = cache
+        self.library = library
+        self.pipelineDevelop = try pipe("develop")
+        self.pipelineBloomDown = try pipe("bloomDownsample")
+        self.pipelineBloomH = try pipe("bloomH")
+        self.pipelineBloomV = try pipe("bloomV")
+        self.pipelineComposite = try pipe("composite")
+        guard let ub = device.makeBuffer(length: MemoryLayout<FrameParams>.stride,
+                                         options: .storageModeShared) else {
+            throw VideoError.metalInit("无法创建 uniform buffer")
+        }
+        self.uniformBuffer = ub
+    }
+
+    // MARK: - LUT 上传
+
+    /// 把四段 LUT 打包成 RGBA16Float 3D 纹理（width=b, height=g, depth=r）。
+    func installLUT(_ payload: VideoLUTPayload) {
+        lock.lock()
+        defer { lock.unlock() }
+        let tables = [payload.packed(payload.t1), payload.packed(payload.t2),
+                      payload.packed(payload.t3), payload.packed(payload.t4)]
+        let n = payload.resolution
+        var textures: [MTLTexture] = []
+        for table in tables {
+            let desc = MTLTextureDescriptor()
+            desc.textureType = .type3D
+            desc.width = n
+            desc.height = n
+            desc.depth = n
+            desc.pixelFormat = .rgba32Float
+            desc.usage = [.shaderRead]
+            guard let tex = device.makeTexture(descriptor: desc) else { continue }
+            let origin = MTLOrigin(x: 0, y: 0, z: 0)
+            let size = MTLSize(width: n, height: n, depth: n)
+            let region = MTLRegion(origin: origin, size: size)
+            let bytes = [UInt8](table.data)
+            let rowBytes = n * 4 * MemoryLayout<Float>.size
+            let imageBytes = n * n * 4 * MemoryLayout<Float>.size
+            tex.replace(region: region, mipmapLevel: 0, slice: 0, withBytes: bytes,
+                        bytesPerRow: rowBytes, bytesPerImage: imageBytes)
+            textures.append(tex)
+        }
+        self.lutTextures = textures.count == 4 ? textures : nil
+        self.lutSize = n
+    }
+
+    var hasLUT: Bool { lock.lock(); defer { lock.unlock() }; return lutTextures != nil }
+
+    // MARK: - 单帧渲染
+
+    /// - Parameters:
+    ///   - source: 解码得到的 BGRA CVPixelBuffer
+    ///   - destination: 编码用的 BGRA CVPixelBuffer
+    ///   - uniforms: 帧级参数（EV、颗粒、光晕、USM）
+    ///   - payload: LUT（提供 span/wire 与 buffer 偏移）
+    func render(source: CVPixelBuffer, destination: CVPixelBuffer,
+                uniforms: VideoFrameUniforms, payload: VideoLUTPayload) throws {
+        guard let luts = lutTextures else { throw VideoError.lutNotInstalled }
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        guard width > 0, height > 0 else { throw VideoError.badFrame }
+
+        // 输入纹理：BGRA8 → shader 里读 .bgr 得到 RGB display，再转线性 ProPhoto。
+        let srcTex = try metalTexture(from: source, pixelFormat: .bgra8Unorm,
+                                      width: width, height: height, plane: 0)
+        let dstTex = try metalTexture(from: destination, pixelFormat: .bgra8Unorm,
+                                      width: width, height: height, plane: 0)
+
+        let linearDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+        linearDesc.usage = [.shaderRead, .shaderWrite]
+        let linearA = device.makeTexture(descriptor: linearDesc)!
+
+        let bw = max(1, width / 2), bh = max(1, height / 2)
+        let bloomDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float, width: bw, height: bh, mipmapped: false)
+        bloomDesc.usage = [.shaderRead, .shaderWrite]
+        let bloomA = device.makeTexture(descriptor: bloomDesc)!
+        let bloomB = device.makeTexture(descriptor: bloomDesc)!
+        let bloomC = device.makeTexture(descriptor: bloomDesc)!
+
+        let rec709ToPP = VideoColorIO.rec709ToProPhoto
+        var params = FrameParams()
+        params.lutSize = UInt32(lutSize)
+        // t1 shaper 的跨度是固定的 (shaperHighEV - shaperLowEV)=14，
+        // 与 wire1 的归一化 span 无关（后者只用于曝光偏移）。
+        params.invSpan1 = Float(1.0 / (PreviewLUTService.shaperHighEV - PreviewLUTService.shaperLowEV))
+        params.encodedInput = payload.encodedInput ? 1 : 0
+        params.autoEV = uniforms.autoEV
+        params.cameraOffset = Float(payload.cameraOffset(exposureEV: Double(uniforms.cameraEV)))
+        params.printOffset = uniforms.printOffset
+        params.grainSigma = uniforms.grainSigma
+        params.frameSeed = uniforms.frameSeed
+        params.grainR = uniforms.grainAmplitude.x
+        params.grainG = uniforms.grainAmplitude.y
+        params.grainB = uniforms.grainAmplitude.z
+        params.densMinR = uniforms.grainDensityMin.x
+        params.densMinG = uniforms.grainDensityMin.y
+        params.densMinB = uniforms.grainDensityMin.z
+        params.halation = uniforms.halationStrength
+        params.diffusion = uniforms.diffusionStrength
+        params.usm = uniforms.usmStrength
+        params.m0 = SIMD4<Float>(rec709ToPP.columns.0, 0)
+        params.m1 = SIMD4<Float>(rec709ToPP.columns.1, 0)
+        params.m2 = SIMD4<Float>(rec709ToPP.columns.2, 0)
+        params.tint = SIMD4<Float>(uniforms.halationTint, 0)
+        params.width = UInt32(width)
+        params.height = UInt32(height)
+        params.developStrength = uniforms.developStrength
+        params.dynamicRange = uniforms.dynamicRange
+        params.gradeShadows = uniforms.gradeShadows
+        params.gradeHighlights = uniforms.gradeHighlights
+        params.gradeBlacks = uniforms.gradeBlacks
+        params.gradeWhites = uniforms.gradeWhites
+        params.gradeContrast = uniforms.gradeContrast
+        params.gradeSaturation = uniforms.gradeSaturation
+        params.grainPixelScale = uniforms.grainPixelScale
+        params.gradeTemperature = uniforms.gradeTemperature
+        uniformBuffer.contents().copyMemory(from: &params,
+                                            byteCount: MemoryLayout<FrameParams>.stride)
+
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw VideoError.metalInit("无法创建 command encoder")
+        }
+        encoder.setBuffer(uniformBuffer, offset: 0, index: 0)
+
+        // pass 0: 输入 BGRA(display Rec.709) → 线性 ProPhoto → develop → 线性 sRGB
+        // 输入转换用一个轻量 kernel 合并进 develop 前：这里先做 CPU 侧不可接受，
+        // 故用 develop kernel 直接吃 BGRA 并在 kernel 内做显示→线性转换。
+        encoder.setComputePipelineState(pipelineDevelop)
+        encoder.setTexture(srcTex, index: 0)
+        encoder.setTexture(linearA, index: 1)
+        for (i, tex) in luts.enumerated() { encoder.setTexture(tex, index: 2 + i) }
+        dispatch(encoder, pipeline: pipelineDevelop, width: width, height: height)
+
+        // pass 1..3：半分辨率 bloom（提取 → 横 → 纵）
+        var bloomParams = params
+        bloomParams.width = UInt32(bw)
+        bloomParams.height = UInt32(bh)
+        uniformBuffer.contents().copyMemory(from: &bloomParams,
+                                            byteCount: MemoryLayout<FrameParams>.stride)
+        encoder.setComputePipelineState(pipelineBloomDown)
+        encoder.setTexture(linearA, index: 0)
+        encoder.setTexture(bloomA, index: 1)
+        dispatch(encoder, pipeline: pipelineBloomDown, width: bw, height: bh)
+
+        encoder.setComputePipelineState(pipelineBloomH)
+        encoder.setTexture(bloomA, index: 0)
+        encoder.setTexture(bloomB, index: 1)
+        dispatch(encoder, pipeline: pipelineBloomH, width: bw, height: bh)
+
+        encoder.setComputePipelineState(pipelineBloomV)
+        encoder.setTexture(bloomB, index: 0)
+        encoder.setTexture(bloomC, index: 1)
+        dispatch(encoder, pipeline: pipelineBloomV, width: bw, height: bh)
+
+        // pass 4：合成 + OETF → BGRA 输出
+        uniformBuffer.contents().copyMemory(from: &params,
+                                            byteCount: MemoryLayout<FrameParams>.stride)
+        encoder.setComputePipelineState(pipelineComposite)
+        encoder.setTexture(linearA, index: 0)
+        encoder.setTexture(bloomC, index: 1)
+        encoder.setTexture(dstTex, index: 2)
+        encoder.setTexture(srcTex, index: 3)
+        dispatch(encoder, pipeline: pipelineComposite, width: width, height: height)
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw VideoError.metalInit(error.localizedDescription) }
+    }
+
+    private func dispatch(_ encoder: MTLComputeCommandEncoder, pipeline: MTLComputePipelineState,
+                          width: Int, height: Int) {
+        let w = pipeline.threadExecutionWidth
+        let h = max(1, pipeline.maxTotalThreadsPerThreadgroup / w)
+        let threads = MTLSize(width: w, height: h, depth: 1)
+        let groups = MTLSize(width: (width + w - 1) / w, height: (height + h - 1) / h, depth: 1)
+        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: threads)
+    }
+
+    private func metalTexture(from buffer: CVPixelBuffer, pixelFormat: MTLPixelFormat,
+                              width: Int, height: Int, plane: Int) throws -> MTLTexture {
+        var texture: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            nil, textureCache, buffer, nil, pixelFormat,
+            width, height, plane, &texture)
+        guard status == kCVReturnSuccess, let cvTexture = texture,
+              let tex = CVMetalTextureGetTexture(cvTexture) else {
+            NSLog("VMetal texture failed status=%d fmt=%d %dx%d plane=%d surface=%d",
+                  status, CVPixelBufferGetPixelFormatType(buffer), width, height, plane,
+                  CVPixelBufferGetIOSurface(buffer) != nil ? 1 : 0)
+            throw VideoError.metalInit("无法从 CVPixelBuffer 创建 Metal 纹理")
+        }
+        return tex
+    }
+}
+
+enum VideoError: LocalizedError {
+    case noMetalDevice
+    case metalInit(String)
+    case lutNotInstalled
+    case badFrame
+    case unsupported
+    case cancelled
+    case exportFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noMetalDevice: return "此设备不支持 Metal"
+        case .metalInit(let s): return "Metal 初始化失败：\(s)"
+        case .lutNotInstalled: return "LUT 尚未烘焙"
+        case .badFrame: return "无效的视频帧"
+        case .unsupported: return "当前格式不受支持（v1 仅支持 SDR Rec.709 负片）"
+        case .cancelled: return "已取消"
+        case .exportFailed(let s): return "导出失败：\(s)"
+        }
+    }
+}

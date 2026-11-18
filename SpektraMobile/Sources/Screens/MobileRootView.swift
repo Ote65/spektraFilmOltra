@@ -1,12 +1,18 @@
 import SwiftUI
+import Photos
 
 struct MobileRootView: View {
     @StateObject private var engine = MobileEngine()
     @Environment(\.mHousing) private var housingSetting
 
     @State private var screen: MScreen = .home
+    /// 访达访问序号：每次切回 .home 递增，首页据此在「真正进入访达」时弹切换提示。
+    @State private var homeVisit = 0
     @State private var develop: MobileDevelopSession?
     @State private var grade: MobileGradeSession?
+    @State private var video: MVideoSession?
+    /// 相册视频取回中：避免连续点击叠出多个导入任务。
+    @State private var openingVideo = false
     @State private var gradeEntry: MGradeEntry = .direct
     @State private var gradeReturn: MScreen = .home
     @State private var toast: String? = nil
@@ -51,6 +57,13 @@ struct MobileRootView: View {
             .ignoresSafeArea()
             .background(MColor.app)
             .preferredColorScheme(.dark)
+            .onAppear { noteHomeVisit() }
+            .onChange(of: screen) { _, _ in noteHomeVisit() }
+    }
+
+    private func noteHomeVisit() {
+        guard screen == .home else { return }
+        homeVisit += 1
     }
 
     private func content(insets: MSafeInsets) -> some View {
@@ -64,9 +77,13 @@ struct MobileRootView: View {
                     openGrade(photo.id, filename: photo.filename,
                               entry: .direct, returningTo: .home)
                 },
+                onOpenVideo: { asset in
+                    openVideo(asset)
+                },
                 onOpenCamera: openCamera,
                 onOpenSettings: openSettings,
-                onToast: showToast
+                onToast: showToast,
+                hintToken: homeVisit
             )
             .offset(x: screen == .home || screen == .camera ? 0 : -72)
             .allowsHitTesting(screen == .home)
@@ -112,6 +129,18 @@ struct MobileRootView: View {
                 .offset(x: screen == .grade && gradeReturn == .develop ? -72 : 0)
                 .allowsHitTesting(screen == .develop)
                 .zIndex(1)
+            }
+
+            if let video {
+                MVideoScreen(
+                    session: video,
+                    onBack: { closeVideo() },
+                    onToast: showToast
+                )
+                // 画布是 AVPlayerLayer 宿主视图，位移转场里它不会跟着滑，
+                // 会「先出现在终点再被挤过去」。整页改成淡入，层次交给页面内部。
+                .transition(.opacity)
+                .zIndex(2)
             }
 
             if let grade {
@@ -218,6 +247,12 @@ struct MobileRootView: View {
                       current.top, current.bottom, housing.rawValue,
                       NSCoder.string(for: opening))
             }
+            // 调试直达：视频显影台（`--video-open` 取相册第一个视频）。
+            if DebugLaunch.videoOpenFirst {
+                await engine.refreshVideos()
+                if let asset = engine.videoAssets.first { openVideo(asset) }
+                return
+            }
             // 调试直达：先扫相册，第一张 RAW 未入库时自动取回入库（等效于点开主页卡片）。
             guard screen == .develop || screen == .grade else { return }
             await engine.refreshAssets()
@@ -239,7 +274,7 @@ struct MobileRootView: View {
                 grade = engine.openGrade(
                     photoID: first.id,
                     entry: DebugLaunch.gradeHandoff ? .handoff : .direct)
-            case .home, .camera, .settings:
+            case .home, .camera, .settings, .video:
                 break
             }
             applyDebugQuickIfNeeded(to: develop)
@@ -377,7 +412,8 @@ struct MobileRootView: View {
             baseline: request.baseline,
             renderedURL: albumURL,
             aspect: request.aspect,
-            capturedLandscape: request.capturedLandscape
+            capturedLandscape: request.capturedLandscape,
+            mirrorFront: request.mirrorFront
         )
         return .saved("已保存原图与成片" + sizeNote)
     }
@@ -399,7 +435,8 @@ struct MobileRootView: View {
             baseline: request.baseline,
             renderedURL: request.renderedURL,
             aspect: request.aspect,
-            capturedLandscape: request.capturedLandscape
+            capturedLandscape: request.capturedLandscape,
+            mirrorFront: request.mirrorFront
         )
         openDevelop(photoID)
         return .opened
@@ -431,13 +468,55 @@ struct MobileRootView: View {
         }
     }
 
+    // MARK: - 视频显影
+
+    /// 相册视频 → 沙盒工程 → 视频显影台。
+    /// 同一个 PHAsset 只会导入一次，再次点开沿用上次调好的参数。
+    private func openVideo(_ asset: PHAsset) {
+        guard !openingVideo else { return }
+        openingVideo = true
+        showToast("正在取回视频…")
+        Task {
+            defer { openingVideo = false }
+            guard let file = await engine.exportVideoResource(for: asset) else {
+                showToast(engine.importFailureMessage ?? "这个视频没能取回，请检查网络后重试")
+                return
+            }
+            defer { try? FileManager.default.removeItem(at: file.url) }
+
+            do {
+                let session = try await MVideoLibrary.shared.session(
+                    forAssetID: asset.localIdentifier,
+                    displayName: file.filename,
+                    downloadedURL: file.url
+                )
+                withAnimation(MMotion.push) {
+                    video = session
+                    screen = .video
+                }
+            } catch {
+                showToast("视频导入失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func closeVideo() {
+        video?.pausePlayback()
+        withAnimation(MMotion.push) {
+            video = nil
+            screen = .home
+        }
+    }
+
     private func goHome() {
         engine.closeGrade()
         engine.closeDevelop()
+        video?.pausePlayback()
         resetFlight()
         withAnimation(MMotion.push) {
             grade = nil
             develop = nil
+            video = nil
             screen = .home
         }
     }

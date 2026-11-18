@@ -84,6 +84,19 @@
 		F87AEA4E50D32F3F8C033074 /* SpectralLUTService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E59977671F71849AD03DCEF /* SpectralLUTService.swift */; };
 		FAEC0537770F0FDE1AD82B2B /* MobileDevelopSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CEE45A13ABE31F2DB4722F3 /* MobileDevelopSession.swift */; };
 		FDBDA364A4E40B2B52CA1EBA /* MobileGradeSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDED726EC9328414B6BE600A /* MobileGradeSession.swift */; };
+		BB0000000000000000000001 /* VideoModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000001 /* VideoModels.swift */; };
+		BB0000000000000000000002 /* VideoColorIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000002 /* VideoColorIO.swift */; };
+		BB0000000000000000000003 /* VideoLUTPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000003 /* VideoLUTPayload.swift */; };
+		BB0000000000000000000004 /* VideoLUTBaker.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000004 /* VideoLUTBaker.swift */; };
+		BB0000000000000000000005 /* VideoGrainModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000005 /* VideoGrainModel.swift */; };
+		BB0000000000000000000006 /* VideoShaders.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000006 /* VideoShaders.swift */; };
+		BB0000000000000000000007 /* VideoMetalRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000007 /* VideoMetalRenderer.swift */; };
+		BB0000000000000000000008 /* VideoFramePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000008 /* VideoFramePipeline.swift */; };
+		BB0000000000000000000009 /* VideoExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000009 /* VideoExporter.swift */; };
+		BB000000000000000000000A /* VideoAudioMuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000000000000000000000A /* VideoAudioMuxer.swift */; };
+		BB000000000000000000000B /* VideoProjectStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000000000000000000000B /* VideoProjectStore.swift */; };
+		BB0000000000000000000065 /* MVideoSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000065 /* MVideoSession.swift */; };
+		BB0000000000000000000066 /* MVideoScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000066 /* MVideoScreen.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -165,6 +178,19 @@
 		FA5E0000000000000000B0B2 /* Watermark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Watermark.swift; sourceTree = "<group>"; };
 		CA5E000000000000000000A1 /* CameraScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraScreen.swift; sourceTree = "<group>"; };
 		CA5E000000000000000000A2 /* MCameraSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCameraSession.swift; sourceTree = "<group>"; };
+		AA0000000000000000000001 /* VideoModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoModels.swift; sourceTree = "<group>"; };
+		AA0000000000000000000002 /* VideoColorIO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoColorIO.swift; sourceTree = "<group>"; };
+		AA0000000000000000000003 /* VideoLUTPayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoLUTPayload.swift; sourceTree = "<group>"; };
+		AA0000000000000000000004 /* VideoLUTBaker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoLUTBaker.swift; sourceTree = "<group>"; };
+		AA0000000000000000000005 /* VideoGrainModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoGrainModel.swift; sourceTree = "<group>"; };
+		AA0000000000000000000006 /* VideoShaders.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoShaders.swift; sourceTree = "<group>"; };
+		AA0000000000000000000007 /* VideoMetalRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoMetalRenderer.swift; sourceTree = "<group>"; };
+		AA0000000000000000000008 /* VideoFramePipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoFramePipeline.swift; sourceTree = "<group>"; };
+		AA0000000000000000000009 /* VideoExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoExporter.swift; sourceTree = "<group>"; };
+		AA000000000000000000000A /* VideoAudioMuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoAudioMuxer.swift; sourceTree = "<group>"; };
+		AA000000000000000000000B /* VideoProjectStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoProjectStore.swift; sourceTree = "<group>"; };
+		AA0000000000000000000065 /* MVideoSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MVideoSession.swift; sourceTree = "<group>"; };
+		AA0000000000000000000066 /* MVideoScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MVideoScreen.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -194,6 +220,7 @@
 				C78999096C3DD44EE064E973 /* Services */,
 				C0EDA2FB4A37B1A65EC180AA /* Stages */,
 				90A9F594A9F6D609F4DA7773 /* Utils */,
+				CC0000000000000000000001 /* Video */,
 			);
 			path = SpektraCore;
 			sourceTree = "<group>";
@@ -245,6 +272,7 @@
 				890BCF63EE3D7458482705CC /* MobileRootView.swift */,
 				FA5E0000000000000000B0A2 /* SettingsScreen.swift */,
 				FA5E0000000000000000B0B2 /* Watermark.swift */,
+				AA0000000000000000000066 /* MVideoScreen.swift */,
 			);
 			path = Screens;
 			sourceTree = "<group>";
@@ -293,6 +321,7 @@
 				E536D899C0B961A72C903EA3 /* MobileEngine.swift */,
 				EDED726EC9328414B6BE600A /* MobileGradeSession.swift */,
 				A1B2C3D4E5F60718293A4B5C /* MPhotoGeometry.swift */,
+				AA0000000000000000000065 /* MVideoSession.swift */,
 			);
 			path = Engine;
 			sourceTree = "<group>";
@@ -419,6 +448,24 @@
 				D2E1B8C3F4A5567890ABCD02 /* Fonts */,
 			);
 			path = Resources;
+			sourceTree = "<group>";
+		};
+		CC0000000000000000000001 /* Video */ = {
+			isa = PBXGroup;
+			children = (
+				AA0000000000000000000001 /* VideoModels.swift */,
+				AA0000000000000000000002 /* VideoColorIO.swift */,
+				AA0000000000000000000003 /* VideoLUTPayload.swift */,
+				AA0000000000000000000004 /* VideoLUTBaker.swift */,
+				AA0000000000000000000005 /* VideoGrainModel.swift */,
+				AA0000000000000000000006 /* VideoShaders.swift */,
+				AA0000000000000000000007 /* VideoMetalRenderer.swift */,
+				AA0000000000000000000008 /* VideoFramePipeline.swift */,
+				AA0000000000000000000009 /* VideoExporter.swift */,
+				AA000000000000000000000A /* VideoAudioMuxer.swift */,
+				AA000000000000000000000B /* VideoProjectStore.swift */,
+			);
+			path = Video;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -567,6 +614,19 @@
 				F87AEA4E50D32F3F8C033074 /* SpectralLUTService.swift in Sources */,
 				BB35201ED62D6AF907DD6DA9 /* SpectralUpsampling.swift in Sources */,
 				3D248851BAA6EFAAA4A3BA2D /* SpektraMobileApp.swift in Sources */,
+				BB0000000000000000000001 /* VideoModels.swift in Sources */,
+				BB0000000000000000000002 /* VideoColorIO.swift in Sources */,
+				BB0000000000000000000003 /* VideoLUTPayload.swift in Sources */,
+				BB0000000000000000000004 /* VideoLUTBaker.swift in Sources */,
+				BB0000000000000000000005 /* VideoGrainModel.swift in Sources */,
+				BB0000000000000000000006 /* VideoShaders.swift in Sources */,
+				BB0000000000000000000007 /* VideoMetalRenderer.swift in Sources */,
+				BB0000000000000000000008 /* VideoFramePipeline.swift in Sources */,
+				BB0000000000000000000009 /* VideoExporter.swift in Sources */,
+				BB000000000000000000000A /* VideoAudioMuxer.swift in Sources */,
+				BB000000000000000000000B /* VideoProjectStore.swift in Sources */,
+				BB0000000000000000000065 /* MVideoSession.swift in Sources */,
+				BB0000000000000000000066 /* MVideoScreen.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

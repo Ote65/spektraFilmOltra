@@ -2163,6 +2163,9 @@ struct MDirectRenderSettings {
     /// 快门瞬间的握持方向，决定画幅比例是否旋转（横拍 9:16 → 16:9）。
     /// 来自 meta 的真实朝向；调试直达等无拍摄流程时 fallback 按 output 像素判断。
     var capturedLandscape: Bool? = nil
+    /// 前置 + 「镜像前置相机」开：成片镜像为取景所见（预览默认就是镜子）。
+    /// 解码后立即水平翻转，显影 / 调色 / 裁切 / 片边 / 水印都作用在镜像画面上。
+    var mirrorOutput: Bool = false
     /// 相机页选择的直出分辨率档位；非 MAX 时覆盖设置页的尺寸档。
     var resolution: MDirectResolution = .maximum
 
@@ -2402,6 +2405,11 @@ enum MDirectRenderer {
             throw RenderError.decodeFailed
         }
         let usedFallback = loaded.usedFallback
+        // 前置镜像拍摄：在进入显影管线前水平翻转，成片与镜像取景一致（所见即所得）。
+        // RAW 原片本身保持原始数据；片边 / 水印画在镜像后的画面上，文字不会被翻反。
+        if settings.mirrorOutput {
+            Self.mirrorHorizontally(&loaded.image)
+        }
         try checkCancellation()
         params.io.inputColorSpace = loaded.colorSpace
         params.io.inputCCTFDecoding = loaded.cctfDecoding
@@ -2504,6 +2512,27 @@ enum MDirectRenderer {
         return MDirectRenderResult(url: destination, preview: preview,
                                    clampedEdge: plan.clamped ? plan.edge : nil,
                                    usedFallback: usedFallback)
+    }
+
+    /// 水平镜像整图（HWC Float）：前置镜像拍摄用，逐像素左右互换，不插值不改色。
+    private static func mirrorHorizontally(_ image: inout ImageRGB) {
+        let width = image.width
+        let height = image.height
+        guard width > 1, height > 0 else { return }
+        let channels = 3
+        image.data.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            for y in 0..<height {
+                let row = y * width * channels
+                for x in 0..<(width / 2) {
+                    let left = row + x * channels
+                    let right = row + (width - 1 - x) * channels
+                    for k in 0..<channels {
+                        swap(&base[left + k], &base[right + k])
+                    }
+                }
+            }
+        }
     }
 
     /// 居中裁切到目标宽高比（宽/高）。只做像素搬运，不重新采样。

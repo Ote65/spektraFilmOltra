@@ -48,6 +48,9 @@ final class MobileEngine: ObservableObject {
     /// 主页网格的数据源：当前选中相簿/智能筛选对应的相册资产。
     @Published private(set) var assets: [MLibraryAsset] = []
     @Published private(set) var assetPhase: AssetPhase = .idle
+    /// 视频访达的数据源：直接映射系统相册的视频列表，不做筛选。
+    @Published private(set) var videoAssets: [PHAsset] = []
+    @Published private(set) var videoPhase: AssetPhase = .idle
     /// 主页筛选：全部 / 收藏 / RAW / 已调色 / 某个相簿。
     @Published private(set) var scope: MAssetScope = .all
     /// 系统相册里的用户相簿，供顶部类型按钮使用。
@@ -974,7 +977,8 @@ final class MobileEngine: ObservableObject {
                            baseline: PhotoEdit? = nil,
                            renderedURL: URL,
                            aspect: MDirectAspect = .portrait3_4,
-                           capturedLandscape: Bool? = nil) async {
+                           capturedLandscape: Bool? = nil,
+                           mirrorFront: Bool = false) async {
         guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
         photo.edit = edit
         photo.gradeData = try? JSONEncoder().encode(grade)
@@ -1001,6 +1005,9 @@ final class MobileEngine: ObservableObject {
         geometry.crop = MPhotoGeometry.centerCrop(
             ratio: aspect.ratio(landscape: landscape),
             width: oriented.width, height: oriented.height)
+        // 前置镜像拍摄：直出成片已翻成预览所见，调色台（显影交接图 + 导出）
+        // 走 geometry.apply 同一翻转，两个成片方向一致。显影台仍显示 RAW 原始画面。
+        if mirrorFront { geometry.flippedH = true }
         photo.cropData = try? JSONEncoder().encode(geometry.normalized())
         try? store.update(photo)
 
@@ -1308,6 +1315,86 @@ final class MobileEngine: ObservableObject {
         }
         refreshWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    // MARK: - 视频相册映射
+
+    /// 视频访达：直接映射系统相册的视频列表，不做任何筛选/分类。
+    /// 与照片扫描互不干扰，只借用同一套相册授权。
+    func refreshVideos(force: Bool = false) async {
+        if !force, !videoAssets.isEmpty, videoPhase == .ready { return }
+        let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        guard status == .authorized || status == .limited else {
+            videoAssets = []
+            videoPhase = .denied
+            return
+        }
+        videoPhase = .scanning
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        let result = PHAsset.fetchAssets(with: .video, options: options)
+        var list: [PHAsset] = []
+        list.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in list.append(asset) }
+        videoAssets = list
+        videoPhase = .ready
+        NSLog("MVideos count=%d", list.count)
+    }
+
+    /// 把相册视频的原始资源写到临时文件；调用方拷贝进工程后负责删除。
+    /// iCloud 视频可能很大，超时放宽到 180s，但仍要有上限，避免无限等待。
+    func exportVideoResource(for asset: PHAsset) async -> (url: URL, filename: String)? {
+        importFailureMessage = nil
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let resource = resources.first(where: { $0.type == .fullSizeVideo })
+            ?? resources.first(where: { $0.type == .video })
+            ?? resources.first else {
+            importFailureMessage = "这个视频没有可用的原片数据"
+            return nil
+        }
+        let ext = UTType(resource.uniformTypeIdentifier)?.preferredFilenameExtension ?? "mov"
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(ext)
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let once = MOnceResume()
+                var timeoutWork: DispatchWorkItem?
+                PHAssetResourceManager.default().writeData(
+                    for: resource, toFile: url, options: options
+                ) { error in
+                    timeoutWork?.cancel()
+                    once.run {
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                }
+                let timeout = DispatchWorkItem {
+                    once.run {
+                        continuation.resume(throwing: NSError(
+                            domain: "Spektrafilm.VideoImport", code: 408, userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "从 iCloud 取回视频超时，请检查网络后重试"
+                            ]))
+                    }
+                }
+                timeoutWork = timeout
+                DispatchQueue.global(qos: .utility).asyncAfter(
+                    deadline: .now() + 180, execute: timeout)
+            }
+        } catch {
+            NSLog("MVideo fetch failed %@ — %@", asset.localIdentifier, error.localizedDescription)
+            let detail = error.localizedDescription
+            importFailureMessage = detail.isEmpty ? "取回视频失败，请检查网络后重试" : detail
+            return nil
+        }
+        let rawName = (resource.originalFilename as NSString).deletingPathExtension
+        return (url, rawName.isEmpty ? "视频" : rawName)
     }
 
     // MARK: - 显影会话

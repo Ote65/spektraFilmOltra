@@ -269,6 +269,8 @@ enum MMotion {
     static let press = Animation.easeOut(duration: 0.16)
     /// 预览画布的缩放 / 归位：系统相册同款弹簧，收尾带一点回弹。
     static let canvas = Animation.spring(response: 0.4, dampingFraction: 0.86)
+    /// 参数面板整块下沉 / 回升：三次贝塞尔，起手快、收尾长，不是计时线性。
+    static let panelSlide = Animation.timingCurve(0.2, 0.92, 0.24, 1, duration: 0.46)
 }
 
 // MARK: - 预览调试参数
@@ -298,6 +300,36 @@ enum DebugLaunch {
         guard let index = args.firstIndex(of: "--develop-file"),
               args.indices.contains(index + 1) else { return nil }
         return args[index + 1]
+    }
+    /// 截图验收用：`--video` 让主页直接停在视频库（相册视频映射）。
+    static var videoLibrary: Bool { args.contains("--video") }
+    /// 截图验收用：`--video-open` 直接打开相册第一个视频，进视频显影台。
+    static var videoOpenFirst: Bool { args.contains("--video-open") }
+    /// 截图验收用：`--video-collapse` 进视频显影台后参数面板直接收起。
+    static var videoCollapse: Bool { args.contains("--video-collapse") }
+    /// 截图验收用：`--video-axes-bottom` 参数列表直接停在底部，方便看新增的轴。
+    static var videoAxesBottom: Bool { args.contains("--video-axes-bottom") }
+    /// 截图验收用：`--video-scrub` 让底部播放条直接停在拖动展开态。
+    static var videoScrub: Bool { args.contains("--video-scrub") }
+    /// 截图验收用：`--video-export` 进视频显影台后直接展开渲染面板。
+    static var videoExport: Bool { args.contains("--video-export") }
+    /// 截图验收用：`--video-export-run` 展开渲染面板后自动开跑，好截到进度与完成态。
+    static var videoExportRun: Bool { args.contains("--video-export-run") }
+    /// 截图验收用：`--video-quick camera_exposure=2.5` 打开视频后直接推一个参数，
+    /// 用来比对「画面到底有没有走显影」。
+    static var videoQuick: (String, Double)? {
+        videoQuicks.first
+    }
+    /// 同一条 `--video-quick` 可写多个，逗号分隔：
+    /// `--video-quick temperature=0,color_density=100`，方便一次复位+推一个轴。
+    static var videoQuicks: [(String, Double)] {
+        guard let index = args.firstIndex(of: "--video-quick"),
+              args.indices.contains(index + 1) else { return [] }
+        return args[index + 1].split(separator: ",").compactMap { pair in
+            let parts = pair.split(separator: "=")
+            guard parts.count == 2, let value = Double(parts[1]) else { return nil }
+            return (String(parts[0]), value)
+        }
     }
 
     /// 验收用：`--launch-scope graded` 临时覆盖启动筛选，方便截图验证。
@@ -449,6 +481,12 @@ enum MHaptic {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         #endif
     }
+}
+
+/// 冷启动的一次性引导标记：进程内只记一次，切屏重建首页不再重复弹提示。
+@MainActor
+enum MLaunchHint {
+    static var switchHintShown = false
 }
 
 // MARK: - 图片

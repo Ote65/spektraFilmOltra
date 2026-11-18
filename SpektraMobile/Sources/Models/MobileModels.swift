@@ -723,6 +723,7 @@ enum MScreen: Hashable {
     case camera
     case develop
     case grade
+    case video
     case settings
 }
 
@@ -803,6 +804,9 @@ struct MDirectSaveRequest {
     var aspect: MDirectAspect = .portrait3_4
     /// 快门瞬间的握持方向，决定 cropData 的画幅是否旋转（横拍 9:16 → 16:9）。
     var capturedLandscape: Bool = false
+    /// 前置镜像拍摄：写进 cropData 的 flippedH，调色台成片与直出成片同一方向。
+    /// 显影台仍显示 RAW 原始画面（原片不翻转）。
+    var mirrorFront: Bool = false
 }
 
 enum MDirectSaveOutcome {
@@ -822,6 +826,8 @@ struct MDirectDevelopRequest {
     var aspect: MDirectAspect = .portrait3_4
     /// 快门瞬间的握持方向，决定 cropData 的画幅是否旋转（横拍 9:16 → 16:9）。
     var capturedLandscape: Bool = false
+    /// 前置镜像拍摄：写进 cropData 的 flippedH，调色台成片与直出成片同一方向。
+    var mirrorFront: Bool = false
 }
 
 enum MDirectDevelopOutcome {

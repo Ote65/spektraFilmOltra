@@ -18,6 +18,12 @@ enum ColorLabel: String, CaseIterable, Identifiable, Hashable {
     }
 }
 
+/// 库里只有一种「媒体项」：照片和视频同库同网格，仅用类型区分展示与去向。
+enum MediaKind: String, Hashable {
+    case photo
+    case video
+}
+
 struct PhotoItem: Identifiable, Hashable {
     let id: String
     let filename: String
@@ -30,8 +36,15 @@ struct PhotoItem: Identifiable, Hashable {
     let color: ColorLabel?
     let isGraded: Bool
     var thumbnailPath: String? = nil
+    /// 库里区分照片 / 视频；显影台据此决定预览与导出路径。
+    var mediaKind: MediaKind = .photo
+    /// 视频时长（如 "0:12"）；照片为空。
+    var durationText: String? = nil
+
+    var isVideo: Bool { mediaKind == .video }
 
     var metaLine: String {
+        // 照片与视频同一套元信息：胶片 · 尺寸（视频时长在卡片角标上）。
         [film, dimensions].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
@@ -72,13 +85,17 @@ struct FolderItem: Identifiable, Hashable {
 
 struct LibrarySnapshot {
     let folderCount: Int
+    /// 照片数量（不含视频）。
     let photoCount: Int
     let sectionTitle: String
     let sectionCount: String
     let folders: [FolderItem]
+    /// 照片与视频混排的同一个库。
     let photos: [PhotoItem]
     let statusMessage: String
     var currentID: String? = nil
+    var videoCount: Int = 0
+    var videoTotalDuration: Double = 0
 }
 
 // MARK: - 预设
@@ -331,7 +348,9 @@ struct SkinActions {
     var padChanged: (Double, Double) -> Void = { _, _ in }
     var proChanged: (String, Double) -> Void = { _, _ in }
     var proToggled: (String, Bool) -> Void = { _, _ in }
+    var importMedia: () -> Void = {}
     var importPhotos: () -> Void = {}
+    var importVideos: () -> Void = {}
     var importFolder: () -> Void = {}
     var exportAs: (String) -> Void = { _ in }
     var exportWithSettings: (ExportSettings) -> Void = { _ in }

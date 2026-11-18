@@ -20,8 +20,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key><string>Spektrafilm</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleShortVersionString</key><string>0.3.4</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>1.5</string>
+    <key>CFBundleVersion</key><string>6</string>
+    <key>CFBundleIconFile</key><string>Spektrafilm</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.photography</string>
     <key>NSHighResolutionCapable</key><true/>
@@ -47,17 +48,20 @@ JSON
 fi
 
 swiftc \
-  -parse-as-library -O \
+  -parse-as-library -O -disable-sandbox \
   -target "$(uname -m)-apple-macosx14.0" \
   -framework SwiftUI -framework AppKit \
   -framework Accelerate -framework Metal \
   -framework ImageIO -framework CoreGraphics -framework CoreImage \
   -framework ColorSync -framework UniformTypeIdentifiers \
+  -framework AVFoundation -framework VideoToolbox -framework CoreMedia \
+  -framework CoreVideo -framework AudioToolbox \
   "${EXTRA_FLAGS[@]}" \
   "${FILES[@]}" \
   -o "$APP/Contents/MacOS/Spektrafilm"
 
 rsync -a "$CORE/Resources/Data/" "$APP/Contents/Resources/Data/"
+[ -f "$ROOT/Resources/Spektrafilm.icns" ] && cp "$ROOT/Resources/Spektrafilm.icns" "$APP/Contents/Resources/"
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
 echo "Built $APP"

@@ -194,6 +194,22 @@ extension CGImage {
         context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
         return context.makeImage()
     }
+
+    /// 水平镜像：纯几何变换，不插值。前置「镜像前置相机」开时，
+    /// 快门缩略图翻成取景预览所见，成片渲染做同一翻转。
+    var mirroredHorizontally: CGImage? {
+        guard let space = colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        context.translateBy(x: CGFloat(width) / 2, y: CGFloat(height) / 2)
+        context.scaleBy(x: -1, y: 1)
+        context.translateBy(x: -CGFloat(width) / 2, y: -CGFloat(height) / 2)
+        context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
 }
 
 extension MPlatformImage {

@@ -16,6 +16,9 @@ struct MCameraCaptureMeta: Equatable {
     /// 快门瞬间的握持方向：横拍为 true。成片画幅据此决定，
     /// 不依赖解码后像素的宽高（RAW 的 EXIF 转正会让像素方向判断失准）。
     var capturedLandscape: Bool = false
+    /// 前置 + 「镜像前置相机」开：成片镜像为取景所见（预览默认就是镜子），
+    /// RAW 原片保持原始数据。缩略图与直出渲染都按这个标志翻转。
+    var mirrorFront: Bool = false
 }
 
 /// 一次 RAW 拍摄的结果：临时 DNG 文件 + 取景器里用的缩略图。
@@ -457,7 +460,8 @@ final class MCameraSession: NSObject, ObservableObject {
         let capturedLandscape = angle == 0 || angle == 180
         let delegate = MCaptureDelegate(
             meta: MCameraCaptureMeta(exposureBias: exposureBias, temperature: temperature,
-                                     capturedLandscape: capturedLandscape)
+                                     capturedLandscape: capturedLandscape,
+                                     mirrorFront: isFront && MobileSettings.cameraMirrorFront)
         ) { [weak self] result in
             DispatchQueue.main.async { self?.finish(result) }
         }
@@ -1023,7 +1027,10 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
             completion(.failure(error))
             return
         }
-        completion(.success(MCameraShot(url: url, thumbnail: Self.thumbnail(url: url), meta: meta)))
+        completion(.success(MCameraShot(
+            url: url,
+            thumbnail: Self.thumbnail(url: url, mirrored: meta.mirrorFront),
+            meta: meta)))
     }
 
     /// 出片前就失败（如采集被中断）时只会回调这里；不复位的话 `isCapturing` 会永远卡住。
@@ -1043,7 +1050,8 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     }
 
     /// 只读 DNG 内嵌预览，避免为了取景器缩略图去解码整张 RAW。
-    private static func thumbnail(url: URL) -> MPlatformImage? {
+    /// 前置镜像拍摄时把缩略图翻成预览所见，成片渲染同样会镜像，两边一致。
+    private static func thumbnail(url: URL, mirrored: Bool) -> MPlatformImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             // 先用 DNG 内嵌的小预览；只有缺失时才解整张 RAW，避免快门后立刻吃一大块内存。
@@ -1054,7 +1062,10 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
             return nil
         }
-        return MImage.make(cgImage: image)
+        guard mirrored, let flipped = image.mirroredHorizontally else {
+            return MImage.make(cgImage: image)
+        }
+        return MImage.make(cgImage: flipped)
     }
 }
 #endif

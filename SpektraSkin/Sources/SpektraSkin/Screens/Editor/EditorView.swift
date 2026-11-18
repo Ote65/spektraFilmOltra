@@ -76,7 +76,7 @@ private struct EditorTopBar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            SkinButton("照片库", icon: "chevron.left", kind: .secondary, height: 28) {
+            SkinButton("媒体库", icon: "chevron.left", kind: .secondary, height: 28) {
                 actions.backToLibrary()
             }
 

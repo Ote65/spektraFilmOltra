@@ -275,7 +275,7 @@ struct SettingsScreen: View {
                        detail: "取景框中央显示水平与俯拍参考")
 
             MToggleRow(label: "镜像前置相机", isOn: $cameraMirrorFront, compact: true,
-                       detail: "仅镜像取景预览；RAW 原片与成片不翻转")
+                       detail: "前置成片镜像为取景所见（和预览一样）；显影台与 RAW 原片保持原始画面")
 
             MToggleRow(label: "拍摄后进入显影台", isOn: $cameraEnterDevelop, compact: true,
                        detail: "关闭后停留在取景页，可连续拍摄")

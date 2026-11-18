@@ -97,6 +97,13 @@ final class EngineHost: ObservableObject {
 
     var photos: [LibraryPhoto] { store.photos }
 
+    /// 视频与照片共用同一个库；视频条目由 VideoHost 提供。
+    var videos: [VideoProject] { VideoHost.shared.projects }
+
+    func isVideoID(_ id: String) -> Bool {
+        videos.contains { $0.id == id }
+    }
+
     func photo(with id: String) -> LibraryPhoto? {
         store.photos.first { $0.id == id }
     }
@@ -700,7 +707,7 @@ final class EngineHost: ObservableObject {
         while index < pixels {
             for channel in 0..<3 {
                 let value = min(max(image.data[index * 3 + channel], 0), 1)
-                let bucket = min(binCount - 1, Int(value * Double(binCount)))
+                let bucket = min(binCount - 1, Int(Float(value) * Float(binCount)))
                 bins[channel][bucket] += 1
             }
             index += stride
@@ -1304,19 +1311,45 @@ extension EngineHost {
         )
     }
 
+    func videoItem(_ project: VideoProject) -> PhotoItem {
+        PhotoItem(
+            id: project.id,
+            filename: "\(project.displayName).mov",
+            asset: "",
+            film: filmDisplayName(project.edit.filmStock),
+            paper: paperDisplayName(project.edit.printStock),
+            dimensions: project.resolutionText,
+            isRaw: false,
+            favorite: project.favorite,
+            color: project.colorLabel.flatMap(ColorLabel.init(rawValue:)),
+            isGraded: !project.edit.quickIntents.isEmpty,
+            thumbnailPath: VideoHost.shared.thumbnails[project.id],
+            mediaKind: .video,
+            durationText: project.durationText
+        )
+    }
+
     func librarySnapshot() -> LibrarySnapshot {
-        let items = store.photos.map(photoItem)
+        let photoItems = store.photos.map(photoItem)
+        let videoProjects = videos
+        let videoItems = videoProjects.map(videoItem)
+        // 照片与视频按导入时间混排（新的在前），同一个网格里直接可见。
+        var dated: [(Date, PhotoItem)] = zip(store.photos, photoItems).map { ($0.importedAt, $1) }
+        dated.append(contentsOf: zip(videoProjects, videoItems).map { ($0.createdAt, $1) })
+        let items = dated.sorted { $0.0 > $1.0 }.map { $0.1 }
         return LibrarySnapshot(
             folderCount: 1,
-            photoCount: items.count,
-            sectionTitle: "全部照片",
-            sectionCount: "\(items.count) 张照片",
+            photoCount: photoItems.count,
+            sectionTitle: "全部媒体",
+            sectionCount: "\(items.count) 项",
             folders: [
-                FolderItem(id: "all", name: "全部照片", count: items.count, isCurrent: true),
+                FolderItem(id: "all", name: "全部媒体", count: items.count, isCurrent: true),
             ],
             photos: items,
             statusMessage: statusMessage,
-            currentID: selectedID
+            currentID: selectedID,
+            videoCount: videoItems.count,
+            videoTotalDuration: videoProjects.reduce(0) { $0 + $1.duration }
         )
     }
 

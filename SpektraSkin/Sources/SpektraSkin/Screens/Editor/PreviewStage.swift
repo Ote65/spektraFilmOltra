@@ -23,6 +23,8 @@ struct PreviewStage: View {
     @State private var previewFade: Double = 1
     @State private var fadeGeneration = 0
 
+    @ObservedObject private var keyRouter = KeyRouter.shared
+
     var body: some View {
         ZStack {
             SkinColor.canvas
@@ -173,6 +175,13 @@ struct PreviewStage: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             if displayedImage == nil { displayedImage = previewImage }
+        }
+        .onChange(of: keyRouter.zoomResetToken) { _, _ in
+            // 空格：回到默认预览大小（与双击画布一致）。
+            withAnimation(SkinMotion.state) {
+                zoom = 1
+                pan = .zero
+            }
         }
         .onChange(of: previewRevision) { _, _ in
             let previous = displayedImage

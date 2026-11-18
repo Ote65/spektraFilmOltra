@@ -39,7 +39,6 @@ struct CameraScreen: View {
     @AppStorage("mobile.camera.grid") private var gridEnabled = false
     @AppStorage(MobileSettings.cameraLevelKey) private var levelEnabled = true
     @AppStorage(MobileSettings.cameraVolumeShutterKey) private var volumeShutter = true
-    @AppStorage(MobileSettings.cameraMirrorFrontKey) private var mirrorFront = false
     @AppStorage(MobileSettings.cameraEnterDevelopKey) private var enterDevelopAfterShot = true
 
     @State private var timerMenuOpen = false
@@ -66,6 +65,8 @@ struct CameraScreen: View {
     #endif
     /// 本次直出快门瞬间的握持方向：横拍为 true，驱动成片与 cropData 的画幅旋转。
     @State private var directCapturedLandscape: Bool = false
+    /// 本次直出是否为前置镜像拍摄：成片与 cropData 的 flippedH 都按它翻转。
+    @State private var directMirrorFront: Bool = false
     @State private var directPhoto: MPlatformImage?
     @State private var directPreviewToken = 0
     @State private var directRawURL: URL?
@@ -709,7 +710,6 @@ struct CameraScreen: View {
         if camera.permission == .authorized, camera.unusableReason == nil {
             MCameraPreview(
                 session: camera.session,
-                mirrorPreview: mirrorFront && camera.isFront,
                 volumeShutter: volumeShutter,
                 onVolumeShutter: { capture() },
                 onTap: { devicePoint, viewPoint in
@@ -1797,6 +1797,7 @@ struct CameraScreen: View {
         Self.progressHaptic.prepare()
         #endif
         directCapturedLandscape = shot.meta.capturedLandscape
+        directMirrorFront = shot.meta.mirrorFront
         // 显影是独立页面：立刻停相机与水平仪，把 CPU / 内存留给显影管线。
         camera.stop()
         level.stop()
@@ -1830,6 +1831,8 @@ struct CameraScreen: View {
         settings.aspect = directAspect
         // 快门瞬间的真实朝向是画幅旋转的权威信号，不依赖解码后像素方向。
         settings.capturedLandscape = shot.meta.capturedLandscape
+        // 前置镜像拍摄：成片翻成取景所见，缩略图与渲染做同一翻转。
+        settings.mirrorOutput = shot.meta.mirrorFront
         settings.resolution = effectiveResolution
         if settings.downgradedFromEXR {
             showHint("相册不支持 EXR，直出已使用 JPEG")
@@ -1986,7 +1989,8 @@ struct CameraScreen: View {
                                          border: directBorder,
                                          baseline: directBaseline,
                                          aspect: directAspect,
-                                         capturedLandscape: directCapturedLandscape)
+                                         capturedLandscape: directCapturedLandscape,
+                                         mirrorFront: directMirrorFront)
         Task {
             let outcome = await onDirectSave(request)
             await MainActor.run {
@@ -2025,7 +2029,8 @@ struct CameraScreen: View {
         let request = MDirectDevelopRequest(
             rawURL: raw, renderedURL: result.url, edit: edit, grade: recipe,
             baseline: directBaseline, aspect: directAspect,
-            capturedLandscape: directCapturedLandscape)
+            capturedLandscape: directCapturedLandscape,
+            mirrorFront: directMirrorFront)
         Task {
             let outcome = await onDirectDevelop(request)
             await MainActor.run {
@@ -2149,7 +2154,6 @@ struct CameraScreen: View {
 /// AVCaptureVideoPreviewLayer 的 SwiftUI 容器；点击对焦，长按锁定 AE/AF，按住上下拖动改 ISO。
 struct MCameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
-    let mirrorPreview: Bool
     let volumeShutter: Bool
     let onVolumeShutter: () -> Void
     let onTap: (CGPoint, CGPoint) -> Void
@@ -2175,7 +2179,6 @@ struct MCameraPreview: UIViewRepresentable {
         view.onLongPress = onLongPress
         view.onDragBegin = onDragBegin
         view.onISODrag = onISODrag
-        view.setMirrored(mirrorPreview)
         view.setVolumeShutter(enabled: volumeShutter, handler: onVolumeShutter)
     }
 }
@@ -2196,13 +2199,8 @@ final class MPreviewView: UIView {
     /// iOS 17.2 才有的类型：用 AnyObject 存储，避免整个类被标成 17.2+。
     private var captureInteraction: AnyObject?
 
-    /// 镜像只作用于预览；RAW 原片不翻转（DNG 无法无损镜像）。
-    func setMirrored(_ mirrored: Bool) {
-        guard let connection = previewLayer.connection,
-              connection.isVideoMirroringSupported else { return }
-        connection.automaticallyAdjustsVideoMirroring = false
-        connection.isVideoMirrored = mirrored
-    }
+    /// 预览保持 AVFoundation 默认行为：前置自动镜像（像镜子），后置不镜像。
+    /// 「镜像前置相机」设置只决定成片是否翻成预览所见，不再干预预览本身。
 
     func setVolumeShutter(enabled: Bool, handler: @escaping () -> Void) {
         guard #available(iOS 17.2, *) else { return }
