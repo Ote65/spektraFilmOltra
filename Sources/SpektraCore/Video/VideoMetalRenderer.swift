@@ -36,7 +36,32 @@ final class VideoMetalRenderer: VideoRendering {
     private var lutTextures: [MTLTexture]?
     private var lutSize: Int = 0
     private var uniformBuffer: MTLBuffer
+    /// LUT 上传锁。
     private let lock = NSLock()
+    /// 整帧渲染串行锁：预览 developStill（主线程）与导出 render（串行队列）
+    /// 共用同一个 renderer 实例；uniformBuffer 与下面的复用池都是单例可变状态，
+    /// 必须串行化，否则两帧会互相覆盖 uniform 并抢占同一批纹理。
+    private let renderLock = NSLock()
+
+    /// 每帧中间纹理复用池。之前每帧 makeTexture 7 张全/半尺寸 rgba32Float，
+    /// 4K 单帧 GPU 纹理峰值约 601MB；复用后按尺寸常驻，不再随帧数反复分配。
+    private struct ScratchTextures {
+        let width: Int
+        let height: Int
+        /// 主链线性缓冲，必须 rgba32Float（色彩 parity 门禁），不动。
+        let linear: MTLTexture
+        let bloomA: MTLTexture
+        let bloomB: MTLTexture
+        let bloomC: MTLTexture
+        /// 物理颗粒链 3 张：密度与增量值域 [0,1] / ±0.03，rgba16Float 足够，
+        /// 比 32F 省一半（4K 3 张 380MB → 190MB）。nil = 尚未为物理模式建。
+        let density: MTLTexture?
+        let grainA: MTLTexture?
+        let grainB: MTLTexture?
+
+        var hasPhysical: Bool { density != nil && grainA != nil && grainB != nil }
+    }
+    private var scratch: ScratchTextures?
 
 
     /// MSL 的 FrameParams 必须与 shader 内声明严格同布局（见 VideoShaders）。
@@ -180,6 +205,33 @@ final class VideoMetalRenderer: VideoRendering {
 
     var hasLUT: Bool { lock.lock(); defer { lock.unlock() }; return lutTextures != nil }
 
+    /// 取中间纹理池：尺寸一致且（如需物理链）物理纹理已建时直接复用，否则重建。
+    /// 调用方必须持有 renderLock。
+    private func scratchTextures(width: Int, height: Int, needPhysical: Bool) -> ScratchTextures {
+        if let s = scratch, s.width == width, s.height == height,
+           (!needPhysical || s.hasPhysical) {
+            return s
+        }
+        func make(_ fmt: MTLPixelFormat, _ w: Int, _ h: Int) -> MTLTexture {
+            let d = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: fmt, width: w, height: h, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            return device.makeTexture(descriptor: d)!
+        }
+        let bw = max(1, width / 2), bh = max(1, height / 2)
+        let s = ScratchTextures(
+            width: width, height: height,
+            linear: make(.rgba32Float, width, height),
+            bloomA: make(.rgba32Float, bw, bh),
+            bloomB: make(.rgba32Float, bw, bh),
+            bloomC: make(.rgba32Float, bw, bh),
+            density: needPhysical ? make(.rgba16Float, width, height) : nil,
+            grainA: needPhysical ? make(.rgba16Float, width, height) : nil,
+            grainB: needPhysical ? make(.rgba16Float, width, height) : nil)
+        scratch = s
+        return s
+    }
+
     // MARK: - 单帧渲染
 
     /// - Parameters:
@@ -189,6 +241,11 @@ final class VideoMetalRenderer: VideoRendering {
     ///   - payload: LUT（提供 span/wire 与 buffer 偏移）
     func render(source: CVPixelBuffer, destination: CVPixelBuffer,
                 uniforms: VideoFrameUniforms, payload: VideoLUTPayload) throws {
+        // 串行化：uniformBuffer 与 scratch 复用池是单例可变状态，
+        // 预览与导出可能并发调用；整帧锁住，commandBuffer 本就同步等待，无吞吐损失。
+        renderLock.lock()
+        defer { renderLock.unlock() }
+
         guard let luts = lutTextures else { throw VideoError.lutNotInstalled }
         let width = CVPixelBufferGetWidth(source)
         let height = CVPixelBufferGetHeight(source)
@@ -200,18 +257,11 @@ final class VideoMetalRenderer: VideoRendering {
         let dstTex = try metalTexture(from: destination, pixelFormat: .bgra8Unorm,
                                       width: width, height: height, plane: 0)
 
-        let linearDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
-        linearDesc.usage = [.shaderRead, .shaderWrite]
-        let linearA = device.makeTexture(descriptor: linearDesc)!
-
+        let pool = scratchTextures(width: width, height: height,
+                                   needPhysical: uniforms.grainMode == 1)
+        let linearA = pool.linear
+        let bloomA = pool.bloomA, bloomB = pool.bloomB, bloomC = pool.bloomC
         let bw = max(1, width / 2), bh = max(1, height / 2)
-        let bloomDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba32Float, width: bw, height: bh, mipmapped: false)
-        bloomDesc.usage = [.shaderRead, .shaderWrite]
-        let bloomA = device.makeTexture(descriptor: bloomDesc)!
-        let bloomB = device.makeTexture(descriptor: bloomDesc)!
-        let bloomC = device.makeTexture(descriptor: bloomDesc)!
 
         let rec709ToPP = VideoColorIO.rec709ToProPhoto
         var params = FrameParams()
@@ -274,15 +324,10 @@ final class VideoMetalRenderer: VideoRendering {
         // 故用 develop kernel 直接吃 BGRA 并在 kernel 内做显示→线性转换。
         if uniforms.grainMode == 1 {
             // 物理颗粒链：developPre(CMY 密度) → grainSample(粒子) → blurH/V → developPost
-            let densityDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
-            densityDesc.usage = [.shaderRead, .shaderWrite]
-            let densityTex = device.makeTexture(descriptor: densityDesc)!
-            let grainDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
-            grainDesc.usage = [.shaderRead, .shaderWrite]
-            let grainA = device.makeTexture(descriptor: grainDesc)!
-            let grainB = device.makeTexture(descriptor: grainDesc)!
+            // 三张中间纹理来自复用池（rgba16Float），不再每帧分配。
+            guard let densityTex = pool.density, let grainA = pool.grainA, let grainB = pool.grainB else {
+                throw VideoError.metalInit("物理颗粒纹理池未就绪")
+            }
 
             // pre：到 t2 密度
             encoder.setComputePipelineState(pipelineDevelopPre)
