@@ -193,6 +193,21 @@ final class VideoFramePipeline: @unchecked Sendable {
         u.gradeSaturation = Float(min(max(saturation, 0), 2))
         // 印相冷暖：相纸滤色偏移在 LUT 里被归零，改由显示域 R/B 增益承载。
         u.gradeTemperature = Float(min(max(q["temperature"] ?? 0, -100), 100) / 100)
+
+        // 物理颗粒：设置页「GPU 物理颗粒」开关为唯一主控（命令行可 defaults write 同一个 key）。
+        // 关闭即恢复原 valueNoise 密度域颗粒，不受工程 quickIntents 影响。
+        let physical = VideoGrainModel.physicalGrainEnabled
+        if physical {
+            let fitted = VideoGrainModel.fitPhysical(edit: e, longEdgePixels: max(renderEdge, 1))
+            if fitted.enabled {
+                u.grainMode = 1
+                u.particleN = fitted.n
+                u.particleDMax = fitted.densityMax
+                u.particleBlurPx = fitted.blurPx
+                u.particleMicroPx = fitted.microPx
+                u.grainUniformity = fitted.uniformity
+            }
+        }
         return u
     }
 

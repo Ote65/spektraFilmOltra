@@ -26,6 +26,12 @@ final class VideoMetalRenderer: VideoRendering {
     private var pipelineBloomH: MTLComputePipelineState
     private var pipelineBloomV: MTLComputePipelineState
     private var pipelineComposite: MTLComputePipelineState
+    // 物理颗粒链（grainMode=1）
+    private var pipelineDevelopPre: MTLComputePipelineState
+    private var pipelineGrainSample: MTLComputePipelineState
+    private var pipelineGrainBlurH: MTLComputePipelineState
+    private var pipelineGrainBlurV: MTLComputePipelineState
+    private var pipelineDevelopPost: MTLComputePipelineState
 
     private var lutTextures: [MTLTexture]?
     private var lutSize: Int = 0
@@ -79,6 +85,19 @@ final class VideoMetalRenderer: VideoRendering {
         var gradeSaturation: Float = 1
         var grainPixelScale: Float = 1
         var gradeTemperature: Float = 0
+        // 物理颗粒（对齐 MSL FrameParams 200–244）
+        var grainMode: UInt32 = 0
+        var particleN0: Float = 0
+        var particleN1: Float = 0
+        var particleN2: Float = 0
+        var particleDMax: Float = 2.2
+        var particleBlurPx: Float = 0.65
+        var particleMicroPx: Float = 0
+        var unifR: Float = 0.97
+        var unifG: Float = 0.99
+        var unifB: Float = 0.97
+        var padE0: Float = 0
+        var padE1: Float = 0
     }
 
     init() throws {
@@ -114,6 +133,11 @@ final class VideoMetalRenderer: VideoRendering {
         self.pipelineBloomH = try pipe("bloomH")
         self.pipelineBloomV = try pipe("bloomV")
         self.pipelineComposite = try pipe("composite")
+        self.pipelineDevelopPre = try pipe("developPre")
+        self.pipelineGrainSample = try pipe("grainSample")
+        self.pipelineGrainBlurH = try pipe("grainBlurH")
+        self.pipelineGrainBlurV = try pipe("grainBlurV")
+        self.pipelineDevelopPost = try pipe("developPost")
         guard let ub = device.makeBuffer(length: MemoryLayout<FrameParams>.stride,
                                          options: .storageModeShared) else {
             throw VideoError.metalInit("无法创建 uniform buffer")
@@ -226,6 +250,16 @@ final class VideoMetalRenderer: VideoRendering {
         params.gradeSaturation = uniforms.gradeSaturation
         params.grainPixelScale = uniforms.grainPixelScale
         params.gradeTemperature = uniforms.gradeTemperature
+        params.grainMode = uniforms.grainMode
+        params.particleN0 = uniforms.particleN.x
+        params.particleN1 = uniforms.particleN.y
+        params.particleN2 = uniforms.particleN.z
+        params.particleDMax = uniforms.particleDMax
+        params.particleBlurPx = uniforms.particleBlurPx
+        params.particleMicroPx = uniforms.particleMicroPx
+        params.unifR = uniforms.grainUniformity.x
+        params.unifG = uniforms.grainUniformity.y
+        params.unifB = uniforms.grainUniformity.z
         uniformBuffer.contents().copyMemory(from: &params,
                                             byteCount: MemoryLayout<FrameParams>.stride)
 
@@ -238,11 +272,57 @@ final class VideoMetalRenderer: VideoRendering {
         // pass 0: 输入 BGRA(display Rec.709) → 线性 ProPhoto → develop → 线性 sRGB
         // 输入转换用一个轻量 kernel 合并进 develop 前：这里先做 CPU 侧不可接受，
         // 故用 develop kernel 直接吃 BGRA 并在 kernel 内做显示→线性转换。
-        encoder.setComputePipelineState(pipelineDevelop)
-        encoder.setTexture(srcTex, index: 0)
-        encoder.setTexture(linearA, index: 1)
-        for (i, tex) in luts.enumerated() { encoder.setTexture(tex, index: 2 + i) }
-        dispatch(encoder, pipeline: pipelineDevelop, width: width, height: height)
+        if uniforms.grainMode == 1 {
+            // 物理颗粒链：developPre(CMY 密度) → grainSample(粒子) → blurH/V → developPost
+            let densityDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+            densityDesc.usage = [.shaderRead, .shaderWrite]
+            let densityTex = device.makeTexture(descriptor: densityDesc)!
+            let grainDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+            grainDesc.usage = [.shaderRead, .shaderWrite]
+            let grainA = device.makeTexture(descriptor: grainDesc)!
+            let grainB = device.makeTexture(descriptor: grainDesc)!
+
+            // pre：到 t2 密度
+            encoder.setComputePipelineState(pipelineDevelopPre)
+            encoder.setTexture(srcTex, index: 0)
+            encoder.setTexture(densityTex, index: 1)
+            encoder.setTexture(luts[0], index: 2)
+            encoder.setTexture(luts[1], index: 3)
+            dispatch(encoder, pipeline: pipelineDevelopPre, width: width, height: height)
+
+            // 粒子抽样（只在颗粒开启时，否则写零值仍无害）
+            encoder.setComputePipelineState(pipelineGrainSample)
+            encoder.setTexture(densityTex, index: 0)
+            encoder.setTexture(grainA, index: 1)
+            dispatch(encoder, pipeline: pipelineGrainSample, width: width, height: height)
+
+            // 分离高斯：dye-cloud + final blur
+            encoder.setComputePipelineState(pipelineGrainBlurH)
+            encoder.setTexture(grainA, index: 0)
+            encoder.setTexture(grainB, index: 1)
+            dispatch(encoder, pipeline: pipelineGrainBlurH, width: width, height: height)
+            encoder.setComputePipelineState(pipelineGrainBlurV)
+            encoder.setTexture(grainB, index: 0)
+            encoder.setTexture(grainA, index: 1)
+            dispatch(encoder, pipeline: pipelineGrainBlurV, width: width, height: height)
+
+            // post：密度+颗粒 → t3/t4 → 线性 sRGB
+            encoder.setComputePipelineState(pipelineDevelopPost)
+            encoder.setTexture(densityTex, index: 0)
+            encoder.setTexture(grainA, index: 1)
+            encoder.setTexture(linearA, index: 2)
+            encoder.setTexture(luts[2], index: 3)
+            encoder.setTexture(luts[3], index: 4)
+            dispatch(encoder, pipeline: pipelineDevelopPost, width: width, height: height)
+        } else {
+            encoder.setComputePipelineState(pipelineDevelop)
+            encoder.setTexture(srcTex, index: 0)
+            encoder.setTexture(linearA, index: 1)
+            for (i, tex) in luts.enumerated() { encoder.setTexture(tex, index: 2 + i) }
+            dispatch(encoder, pipeline: pipelineDevelop, width: width, height: height)
+        }
 
         // pass 1..3：半分辨率 bloom（提取 → 横 → 纵）
         var bloomParams = params

@@ -136,7 +136,238 @@ enum VideoShaders {
         float  gradeSaturation;  // 188  1 = 原样
         float  grainPixelScale;  // 192  渲染像素 / 成片像素（预览降分辨率时补偿高频颗粒尺度）
         float  gradeTemperature; // 196  -1…1，正值偏暖
+
+        // ---- 物理颗粒（grainMode=1）：逐像素 Poisson-Binomial 卤化银抽样 ----
+        // 只在这个字段段追加，不改动上面任何偏移，valueNoise 路径完全不受影响。
+        uint   grainMode;        // 200  0=valueNoise(原) 1=物理粒子
+        float  particleN0;       // 204  每像素有效粒子数 R/G/B
+        float  particleN1;       // 208
+        float  particleN2;       // 212
+        float  particleDMax;     // 216  密度上限（odParticle=dMax/n）
+        float  particleBlurPx;   // 220  团簇模糊 σ(px)
+        float  particleMicroPx;  // 224  微结构 σ(px)，<0.05 跳过
+        float  unifR;            // 228  均匀度
+        float  unifG;            // 232
+        float  unifB;            // 236
+        float  padE0;            // 240  16 字节对齐补齐
+        float  padE1;            // 244
     };
+
+    // =====================================================================
+    // 物理颗粒 kernel 链（实验性，grainMode=1 才走）
+    //   developPre  : display → t1 → t2，把 CMY 密度写进中间纹理
+    //   grainSample : 逐像素 Poisson-Binomial + 微结构，输出密度增量
+    //   blurH/V     : 分离高斯，dye-cloud + final blur
+    //   developPost : 密度+增量 → t3 → t4 → 线性 sRGB
+    // 与原 develop 数值对齐：查表分解顺序、t0 输入变换、printOffset 一致。
+    // =====================================================================
+
+    // Box-Muller：两个 32 位 hash 均匀数 → 一个标准正态。
+    // 用整数哈希而非 float fract：种子可达几十亿，转 float 后 ULP≈256 会把
+    // 相邻像素/帧折叠到同一随机数（这也是原 valueNoise 注释的坑）。
+    static inline float gaussianHash(uint x, uint y, uint seed) {
+        float u1 = max(float(hashU32(x, y, seed)) * (1.0f / 4294967296.0f), 1e-7f);
+        float u2 = float(hashU32(x, y, seed ^ 0x9E3779B9u)) * (1.0f / 4294967296.0f);
+        return sqrt(-2.0f * log(u1)) * cos(6.28318530718f * u2);
+    }
+
+    // Poisson 抽样：小 λ 用 Knuth 乘积极限，大 λ 用正态近似（与 RandomStats 同策略）。
+    static inline float poissonSample(float lambda, uint x, uint y, uint seed) {
+        if (lambda <= 0.0f) return 0.0f;
+        if (lambda < 30.0f) {
+            float limit = exp(-lambda);
+            float prod = 1.0f;
+            int k = 0;
+            while (prod > limit && k < 64) {
+                k += 1;
+                prod *= float(hashU32(x, y, seed ^ uint(k))) * (1.0f / 4294967296.0f);
+            }
+            return float(max(k - 1, 0));
+        }
+        float z = gaussianHash(x, y, seed);
+        float s = lambda + sqrt(lambda) * z;
+        return s < 0.0f ? 0.0f : floor(s + 0.5f);
+    }
+
+    // Binomial 抽样：p>0.5 翻转；小 n 逐次伯努利，方差大用正态，否则 CDF 反演。
+    // 与 RandomStats.binomial 同分支策略，只是随机数来自哈希而非 Swift RNG。
+    static inline float binomialSample(float n, float p, uint x, uint y, uint seed) {
+        if (p <= 0.0f) return 0.0f;
+        if (p >= 1.0f) return n;
+        bool flipped = p > 0.5f;
+        float q = flipped ? 1.0f - p : p;
+        float variance = n * q * (1.0f - q);
+        float value;
+        if (n < 25.0f) {
+            int count = 0;
+            int ni = int(n + 0.5f);
+            for (int i = 0; i < ni && i < 64; ++i) {
+                float u = float(hashU32(x, y, seed ^ uint(0x5B3 + i * 7919))) * (1.0f / 4294967296.0f);
+                if (u < q) count += 1;
+            }
+            value = float(count);
+        } else if (variance > 10.0f) {
+            float z = gaussianHash(x, y, seed ^ 0x85EBCA6Bu);
+            float approx = n * q + sqrt(variance) * z;
+            value = clamp(approx, 0.0f, n);
+            value = floor(value + 0.5f);
+        } else {
+            float u = float(hashU32(x, y, seed ^ 0xC2B2AE35u)) * (1.0f / 4294967296.0f);
+            float cdf = 0.0f;
+            float prob = pow(1.0f - q, n);
+            int k = 0;
+            int ni = int(n + 0.5f);
+            while (cdf < u && k < ni && k < 1024) {
+                cdf += prob;
+                if (k < ni) {
+                    prob = prob * (float(ni - k) / float(k + 1)) * (q / (1.0f - q));
+                }
+                k += 1;
+            }
+            value = float(max(k - 1, 0));
+        }
+        return flipped ? n - value : value;
+    }
+
+    // developPre：与 develop 前半段逐位一致，到 t2 后把密度写到中间纹理。
+    kernel void developPre(
+        texture2d<float, access::read>  inTex  [[texture(0)]],
+        texture2d<float, access::write> outTex [[texture(1)]],
+        texture3d<float, access::read>  t1 [[texture(2)]],
+        texture3d<float, access::read>  t2 [[texture(3)]],
+        constant FrameParams& p [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        if (gid.x >= p.width || gid.y >= p.height) return;
+        float3 display = inTex.read(gid).rgb;
+        float3 c = displayToLinearProPhoto(display, p.m0, p.m1, p.m2);
+        if (p.dynamicRange > 0.001f) {
+            float lum = max(dot(c, float3(0.2126f, 0.7152f, 0.0722f)), 1e-8f);
+            float lg = log2(lum);
+            float hiMask = smoothstep(-2.2f, 0.2f, lg);
+            float loMask = 1.0f - smoothstep(-7.5f, -2.6f, lg);
+            float gain = (1.0f + p.dynamicRange * 0.90f * loMask)
+                       * (1.0f - p.dynamicRange * 0.60f * hiMask);
+            c *= gain;
+        }
+        float3 t1in = p.encodedInput
+            ? clamp(c * (exp2(p.autoEV) / p.encodedMax), 0.0f, 1.0f)
+            : t1Shaped(c, p.autoEV, p.shaperLoEV, p.invSpan1);
+        c = lutSample(t1, p.lutSize, t1in);
+        c = clamp(c + p.cameraOffset, 0.0f, 1.0f);
+        c = lutSample(t2, p.lutSize, c);
+        outTex.write(float4(c, 1.0f), gid);
+    }
+
+    // grainSample：密度域逐像素卤化银粒子 + 微结构团簇。
+    // 逐通道独立种子（+11/+23/+37），帧种子来自 FrameParams.frameSeed。
+    kernel void grainSample(
+        texture2d<float, access::read>  density [[texture(0)]],
+        texture2d<float, access::write> outTex  [[texture(1)]],
+        constant FrameParams& p [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        if (gid.x >= p.width || gid.y >= p.height) return;
+        float3 d = density.read(gid).rgb;
+        float3 n   = float3(p.particleN0, p.particleN1, p.particleN2);
+        float3 dmin = float3(p.densMinR, p.densMinG, p.densMinB);
+        float3 unif = float3(p.unifR, p.unifG, p.unifB);
+        float3 od   = float3(
+            n.x > 0.0f ? p.particleDMax / n.x : 0.0f,
+            n.y > 0.0f ? p.particleDMax / n.y : 0.0f,
+            n.z > 0.0f ? p.particleDMax / n.z : 0.0f);
+        // 物理模型：probability = density/densityMax，先加 densityMin 底噪。
+        // saturation = 1 - probability*uniformity，用来压高均匀度区的离散度。
+        float3 prob = clamp((d + dmin) / max(p.particleDMax + dmin, 1e-3f), 1e-6f, 1.0f - 1e-6f);
+        float3 sat  = 1.0f - prob * unif * (1.0f - 1e-6f);
+        float3 delta = float3(0.0f);
+        float3 seeds = float3(
+            poissonSample(n.x / max(sat.x, 1e-3f), gid.x, gid.y, p.frameSeed ^ 11u),
+            poissonSample(n.y / max(sat.y, 1e-3f), gid.x, gid.y, p.frameSeed ^ 23u),
+            poissonSample(n.z / max(sat.z, 1e-3f), gid.x, gid.y, p.frameSeed ^ 37u));
+        float3 developed = float3(
+            binomialSample(seeds.x, prob.x, gid.x, gid.y, p.frameSeed ^ 101u),
+            binomialSample(seeds.y, prob.y, gid.x, gid.y, p.frameSeed ^ 103u),
+            binomialSample(seeds.z, prob.z, gid.x, gid.y, p.frameSeed ^ 107u));
+        // layer_particle_model 输出的是「带扰动的密度」，其均值 ≈ prob*dMax ≈ d+dmin。
+        // developPost 做的是 d + delta，所以这里必须减去均值，得到零均值颗粒波动，
+        // 否则密度会翻倍。期望值：E[developed]*od*sat = (n/sat)*prob*(dMax/n)*sat = prob*dMax。
+        float3 mean = prob * p.particleDMax;
+        delta = developed * od * sat - mean;
+
+        // 微结构团簇：lognormal clumping，1080p 下 σ<0.05 被跳过（尺度小于像素）。
+        if (p.particleMicroPx > 0.05f) {
+            float s2 = log(1.0f + p.particleMicroPx * p.particleMicroPx);
+            float sig = sqrt(s2);
+            float mu = -0.5f * s2;
+            float3 clump = float3(
+                exp(mu + sig * gaussianHash(gid.x, gid.y, p.frameSeed ^ 211u)),
+                exp(mu + sig * gaussianHash(gid.x, gid.y, p.frameSeed ^ 223u)),
+                exp(mu + sig * gaussianHash(gid.x, gid.y, p.frameSeed ^ 227u)));
+            delta *= clump;
+        }
+        outTex.write(float4(delta, 1.0f), gid);
+    }
+
+    // 分离高斯（3σ 半径，9 tap）。团簇模糊 + final blur 合并成一次 σ。
+    // 复用 bloomH/V 的高斯权重，但作用于整幅密度增量，不分亮度通道。
+    static inline float3 blurAxis(texture2d<float, access::read> t, uint2 gid,
+                                  uint2 size, bool horizontal, float sigma) {
+        float w0 = 0.227027f, w1 = 0.1945946f, w2 = 0.1216216f, w3 = 0.054054f, w4 = 0.016216f;
+        float3 sum = t.read(gid).rgb * w0;
+        for (int i = 1; i <= 4; ++i) {
+            float wi = (i == 1) ? w1 : ((i == 2) ? w2 : ((i == 3) ? w3 : w4));
+            uint a1, a0;
+            if (horizontal) { a1 = min(gid.x + uint(i), size.x - 1u); a0 = (gid.x >= uint(i)) ? gid.x - uint(i) : 0u; }
+            else            { a1 = min(gid.y + uint(i), size.y - 1u); a0 = (gid.y >= uint(i)) ? gid.y - uint(i) : 0u; }
+            if (horizontal) {
+                sum += t.read(uint2(a1, gid.y)).rgb * wi;
+                sum += t.read(uint2(a0, gid.y)).rgb * wi;
+            } else {
+                sum += t.read(uint2(gid.x, a1)).rgb * wi;
+                sum += t.read(uint2(gid.x, a0)).rgb * wi;
+            }
+        }
+        return sum;
+    }
+
+    kernel void grainBlurH(
+        texture2d<float, access::read>  inTex  [[texture(0)]],
+        texture2d<float, access::write> outTex [[texture(1)]],
+        constant FrameParams& p [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        if (gid.x >= p.width || gid.y >= p.height) return;
+        outTex.write(float4(blurAxis(inTex, gid, uint2(p.width, p.height), true, p.particleBlurPx), 1.0f), gid);
+    }
+
+    kernel void grainBlurV(
+        texture2d<float, access::read>  inTex  [[texture(0)]],
+        texture2d<float, access::write> outTex [[texture(1)]],
+        constant FrameParams& p [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        if (gid.x >= p.width || gid.y >= p.height) return;
+        outTex.write(float4(blurAxis(inTex, gid, uint2(p.width, p.height), false, p.particleBlurPx), 1.0f), gid);
+    }
+
+    // developPost：密度 + 颗粒增量 → t3 → printOffset → t4 → 线性 sRGB。
+    kernel void developPost(
+        texture2d<float, access::read>  density [[texture(0)]],
+        texture2d<float, access::read>  grain  [[texture(1)]],
+        texture2d<float, access::write> outTex  [[texture(2)]],
+        texture3d<float, access::read>  t3 [[texture(3)]],
+        texture3d<float, access::read>  t4 [[texture(4)]],
+        constant FrameParams& p [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        if (gid.x >= p.width || gid.y >= p.height) return;
+        float3 c = clamp(density.read(gid).rgb + grain.read(gid).rgb, 0.0f, 1.0f);
+        c = lutSample(t3, p.lutSize, c);
+        c = clamp(c + p.printOffset, 0.0f, 1.0f);
+        c = lutSample(t4, p.lutSize, c);
+        outTex.write(float4(c, 1.0f), gid);
+    }
 
     kernel void develop(
         texture2d<float, access::read>  inTex  [[texture(0)]],

@@ -7,6 +7,13 @@ import simd
 /// t2 输出 CMY 密度域的幅度包络与团簇尺度（方案 4.3）。幅度包络在中密度
 /// 达峰、阴影/高光收敛，逐帧重随机。
 enum VideoGrainModel {
+    /// 设置页「GPU 物理颗粒」开关：落在 UserDefaults，core 与 UI 共用同一份值。
+    /// 打开 = 逐像素 Poisson-Binomial 卤化银粒子；关闭 = 原 valueNoise 密度域颗粒。
+    static let physicalGrainKey = "video.grain.physicalGPU"
+    static var physicalGrainEnabled: Bool {
+        UserDefaults.standard.object(forKey: physicalGrainKey) as? Bool ?? false
+    }
+
     struct Fitted {
         var enabled = false
         /// CMY 密度域的每通道幅度（已乘快速轴 grain_amount）。
@@ -75,6 +82,60 @@ enum VideoGrainModel {
             hash = (hash ^ UInt64(byte)) &* 0x100000001b3
         }
         return UInt32(truncatingIfNeeded: hash)
+    }
+
+    /// 物理颗粒 GPU 参数：把 GrainParams 的统计量换算成逐像素 Poisson-Binomial 的粒子数。
+    /// 与照片端 `Grain.applyToDensity` 同源：n = pixelArea / particleArea，
+    /// odParticle = densityMax / n；模糊与微结构直接沿用物理参数。
+    struct PhysicalFitted {
+        var enabled = false
+        var n: SIMD3<Float> = SIMD3<Float>(0, 0, 0)
+        var densityMax: Float = 1.0
+        var blurPx: Float = 0.65
+        var microPx: Float = 0
+        var uniformity: SIMD3<Float> = SIMD3<Float>(0.97, 0.99, 0.97)
+    }
+
+    /// - longEdgePixels：输出长边，用于 μm→px；filmFormatMM 取相机画幅。
+    /// - sublayersActive 时按 particleScaleLayers 分摊到单层，层数取 nSubLayers（默认 1）。
+    static func fitPhysical(edit: PhotoEdit, longEdgePixels: Int) -> PhysicalFitted {
+        let g = edit.filmRender.grain
+        var out = PhysicalFitted()
+        guard g.active else { return out }
+
+        let amount = max(0, (edit.quickIntents["grain_amount"] ?? 100.0)) / 100.0
+        guard amount > 0 else { return out }
+        let sizeAxis = (edit.quickIntents["grain_size"] ?? 0.0) / 100.0
+
+        let filmMM = edit.camera.filmFormatMM > 0 ? edit.camera.filmFormatMM : 35
+        let pixelSizeUM = filmMM * 1000.0 / Double(max(longEdgePixels, 1))
+        let pixelArea = pixelSizeUM * pixelSizeUM
+
+        // grain_size 快轴：面积随尺度平方，与 valueNoise 路径保持一致。
+        let sizeMul = pow(2.0, sizeAxis * 1.6)
+        let areaUM2 = max(g.particleAreaUM2, 0.001) * sizeMul * sizeMul
+        let subLayers = g.sublayersActive ? max(g.nSubLayers, 1) : 1
+        // 与 Grain.applyToDensity 一致：particles[c] = pixelArea / (area*scale[c]) / subLayers。
+        // 幅度随 grain_amount 缩放：通过 n 反向缩放（n 越小颗粒越粗越大）。
+        let nScale = max(pixelArea / areaUM2 / Double(subLayers), 1)
+        let amountFactor = 1.0 / max(amount, 1e-3)   // amount=1 基准；越大 n 越小→颗粒越显著
+        out.n = SIMD3<Float>(
+            Float(min(max(nScale * amountFactor / max(g.particleScale[0], 1e-3), 1), 2_000_000)),
+            Float(min(max(nScale * amountFactor / max(g.particleScale[1], 1e-3), 1), 2_000_000)),
+            Float(min(max(nScale * amountFactor / max(g.particleScale[2], 1e-3), 1), 2_000_000)))
+
+        // 密度上限：物理 density_max ≈ 2.2 + densityMin；这里用归一化 wire 域，
+        // 取 valueNoise 幅度标定量级，确保增量落在 [0,1] 内可见但不溢出。
+        out.densityMax = 1.0
+        // dye-cloud blur + final blur 合并；微结构 σ = micro[1]*0.001/pixelSizeUM。
+        out.blurPx = Float(min(max(g.blur * sizeMul, 0), 24))
+        out.microPx = g.microStructure.count > 1
+            ? Float(g.microStructure[1] * 0.001 / max(pixelSizeUM, 1e-6)) : 0
+        out.uniformity = SIMD3<Float>(
+            Float(clamp01(g.uniformity[0])), Float(clamp01(g.uniformity[1])),
+            Float(clamp01(g.uniformity[2])))
+        out.enabled = true
+        return out
     }
 
     private static func clamp01(_ v: Double) -> Double {

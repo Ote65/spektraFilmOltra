@@ -205,4 +205,16 @@ struct VideoFrameUniforms {
     var grainPixelScale: Float = 1
     /// 印相冷暖：-1…1，正值偏暖（显示域 R/B 互补增益）。
     var gradeTemperature: Float = 0
+
+    // ---- 物理颗粒（实验性）----
+    /// 0 = 原 valueNoise 密度域颗粒；1 = 逐像素 Poisson-Binomial 卤化银粒子 + 微结构。
+    var grainMode: UInt32 = 0
+    /// 每像素有效粒子数（R/G/B），由 particleAreaUM2 与 pixelSizeUM 换算。
+    var particleN: SIMD3<Float> = SIMD3<Float>(0, 0, 0)
+    /// 归一化密度上限，odParticle = dMax / n。
+    var particleDMax: Float = 2.2
+    /// 团簇模糊 σ（px），dye-cloud blur + final blur 合并值。
+    var particleBlurPx: Float = 0.65
+    /// 微结构团簇 σ（px），<=0.05 时 shader 跳过。
+    var particleMicroPx: Float = 0
 }
