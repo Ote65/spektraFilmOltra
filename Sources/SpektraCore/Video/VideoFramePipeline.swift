@@ -29,6 +29,17 @@ final class VideoFramePipeline: @unchecked Sendable {
         var isHDR: Bool = false
     }
 
+    /// 轨道 preferredTransform → 显示方向的唯一推导入口。probe（UI 尺寸）和
+    /// export（编码尺寸 + 旋转方向）共用，避免两处各算一遍导致不一致。
+    /// 约定：相机竖拍 [0,1,-1,0] 实测对应 CI 的 .right；[0,-1,1,0] 对应 .left。
+    static func displayGeometry(transform: CGAffineTransform)
+        -> (rotated: Bool, orientation: CGImagePropertyOrientation?) {
+        let angle = atan2(Double(transform.b), Double(transform.a)) * 180 / .pi
+        let rotated = abs(abs(angle) - 90) < 1 || abs(abs(angle) - 270) < 1
+        guard rotated else { return (false, nil) }
+        return (true, transform.b > 0 ? .right : .left)
+    }
+
     func probe(url: URL) async throws -> VideoInfo {
         try Task.checkCancellation()
         let asset = AVAsset(url: url)
@@ -40,13 +51,12 @@ final class VideoFramePipeline: @unchecked Sendable {
         let rate = try await track.load(.nominalFrameRate)
         let transform = try await track.load(.preferredTransform)
         let hasAudio = !(try await asset.loadTracks(withMediaType: .audio).isEmpty)
-        let angle = atan2(Double(transform.b), Double(transform.a)) * 180 / .pi
-        let rotated = abs(abs(angle) - 90) < 1 || abs(abs(angle) - 270) < 1
+        let display = Self.displayGeometry(transform: transform)
         return VideoInfo(
             duration: CMTimeGetSeconds(duration),
             fps: rate > 0 ? Double(rate) : 24,
-            width: rotated ? Int(size.height) : Int(size.width),
-            height: rotated ? Int(size.width) : Int(size.height),
+            width: display.rotated ? Int(size.height) : Int(size.width),
+            height: display.rotated ? Int(size.width) : Int(size.height),
             hasAudio: hasAudio,
             isHDR: false // v1 只接受 SDR Rec.709；HDR 门禁留待 M6 后扩展。
         )
@@ -293,18 +303,11 @@ final class VideoFramePipeline: @unchecked Sendable {
         // 只写元数据时 App 内播放器会读它自动转正，但保存到系统相册后元数据丢失
         // → 画面横躺（2026-11-18 用户实证）。这里渲染后按显示方向真实旋转像素，
         // 输出 track 不写 transform，任何播放器/相册看到的都是正立画面。
-        let angle = atan2(Double(transform.b), Double(transform.a)) * 180 / .pi
-        let rotated = abs(abs(angle) - 90) < 1 || abs(abs(angle) - 270) < 1
+        let display = Self.displayGeometry(transform: transform)
+        let rotated = display.rotated
         let outWidth = rotated ? frameHeight : frameWidth
         let outHeight = rotated ? frameWidth : frameHeight
-        // preferredTransform 的旋转方向 → CoreImage 方向枚举。
-        // [0,1,-1,0]（b>0,c<0，逆时针90）实测对应 .right（顺时针90）后画面正立，
-        // [0,-1,1,0]（b<0,c>0）对应 .left。其余 180° 用 .down，identity 不旋转。
-        let orientation: CGImagePropertyOrientation? = {
-            if !rotated { return nil }
-            if abs(abs(angle) - 180) < 1 { return .down }
-            return transform.b > 0 ? .right : .left
-        }()
+        let orientation = display.orientation
         let rotateContext = orientation == nil ? nil : CIContext()
 
         let reader = try AVAssetReader(asset: asset)
@@ -318,8 +321,8 @@ final class VideoFramePipeline: @unchecked Sendable {
         // 一律用 AVAssetReaderTrackOutput 直接解码，不再走 AVAssetReaderVideoCompositionOutput。
         // 后者依赖 CPU 视频合成器，对 10-bit HEVC Rext（yuv422p10le，如 A001_C257）旋转
         // 合成时会产出全黑/斜纹垃圾帧（2026-11-18 实证：直解亮度 110，合成后为 0）。
-        // 直接解码出的帧是传感器方向，经 Metal 渲染后仍按传感器方向编码，旋转交给
-        // writer 的 transform 元数据完成 —— 完全绕开合成器的编码兼容性问题。
+        // 直接解码出的帧是传感器方向，经 Metal 渲染后保持传感器方向，
+        // 最后在帧泵里真实旋转到显示方向，完全绕开合成器的编码兼容性问题。
         let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readSettings)
         trackOutput.alwaysCopiesSampleData = false
         let output: AVAssetReaderOutput = trackOutput
