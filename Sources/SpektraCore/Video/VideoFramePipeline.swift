@@ -509,7 +509,11 @@ final class VideoFramePipeline: @unchecked Sendable {
         let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
                                          kCVPixelFormatType_32BGRA, attrs as CFDictionary, &dst)
         guard status == kCVReturnSuccess, let out = dst else { return nil }
-        context.render(ci, to: out, bounds: ci.extent, colorSpace: nil)
+        // colorSpace 必须传输入图自己的 ci.colorSpace，不能传 nil：
+        // nil 会让 CI 把已做 OETF 的显示编码值当默认空间再做一次转换 → 整片变暗
+        // （2026-11-18 实证：nil 亮度 119→76，ci.colorSpace 119→118.7 无损）。
+        // 这里只想旋转像素位置，不该改动任何颜色值。
+        context.render(ci, to: out, bounds: ci.extent, colorSpace: ci.colorSpace)
         return out
     }
 
