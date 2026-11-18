@@ -4,6 +4,7 @@ import CoreVideo
 import CoreMedia
 import ImageIO
 import CoreGraphics
+import CoreImage
 
 /// 视频探测 / 参考帧测光 / 帧渲染循环（方案 6.1、7.3、7.4）。
 ///
@@ -283,11 +284,28 @@ final class VideoFramePipeline: @unchecked Sendable {
         }
         let natural = try await videoTrack.load(.naturalSize)
         let transform = try await videoTrack.load(.preferredTransform)
-        // 帧缓冲、Metal 渲染全程使用「传感器方向」尺寸（=naturalSize），与横拍素材一致。
-        // 竖拍的旋转不在 CPU 合成阶段做，而是作为元数据写到输出 track 的 transform，
-        // 由播放器/相册按 appliesPreferredTrackTransform 自动转正。
+        // 帧缓冲、Metal 渲染全程使用「传感器方向」尺寸（=naturalSize），与横拍素材一致，
+        // 避开 AVAssetReaderVideoCompositionOutput 对 10-bit HEVC Rext 合成出黑帧的坑。
         let frameWidth = Int(natural.width)
         let frameHeight = Int(natural.height)
+
+        // 竖拍旋转必须「烘焙进像素」，不能只写 transform 元数据：
+        // 只写元数据时 App 内播放器会读它自动转正，但保存到系统相册后元数据丢失
+        // → 画面横躺（2026-11-18 用户实证）。这里渲染后按显示方向真实旋转像素，
+        // 输出 track 不写 transform，任何播放器/相册看到的都是正立画面。
+        let angle = atan2(Double(transform.b), Double(transform.a)) * 180 / .pi
+        let rotated = abs(abs(angle) - 90) < 1 || abs(abs(angle) - 270) < 1
+        let outWidth = rotated ? frameHeight : frameWidth
+        let outHeight = rotated ? frameWidth : frameHeight
+        // preferredTransform 的旋转方向 → CoreImage 方向枚举。
+        // [0,1,-1,0]（b>0,c<0，逆时针90）实测对应 .right（顺时针90）后画面正立，
+        // [0,-1,1,0]（b<0,c>0）对应 .left。其余 180° 用 .down，identity 不旋转。
+        let orientation: CGImagePropertyOrientation? = {
+            if !rotated { return nil }
+            if abs(abs(angle) - 180) < 1 { return .down }
+            return transform.b > 0 ? .right : .left
+        }()
+        let rotateContext = orientation == nil ? nil : CIContext()
 
         let reader = try AVAssetReader(asset: asset)
         // 解码帧直接进 Metal 纹素：必须显式声明 Metal 兼容。iOS 上解码器默认给的是
@@ -311,13 +329,11 @@ final class VideoFramePipeline: @unchecked Sendable {
 
         try? FileManager.default.removeItem(at: destination)
         let writer = try AVAssetWriter(outputURL: destination, fileType: .mov)
+        // 输出尺寸用显示方向：像素在帧泵里已真实旋转到该方向，故不设 transform 元数据。
         let videoInput = AVAssetWriterInput(
             mediaType: .video,
-            outputSettings: Self.videoSettings(codec: codec, width: frameWidth, height: frameHeight, fps: 24))
+            outputSettings: Self.videoSettings(codec: codec, width: outWidth, height: outHeight, fps: 24))
         videoInput.expectsMediaDataInRealTime = false
-        // 旋转写成输出 track 的 transform 元数据：视频数据保持传感器方向，
-        // 播放器/相册据此自动转正，等效于参考帧的 appliesPreferredTrackTransform。
-        if !transform.isIdentity { videoInput.transform = transform }
         guard writer.canAdd(videoInput) else { throw VideoError.exportFailed("无法添加视频写入器") }
         writer.add(videoInput)
 
@@ -393,8 +409,27 @@ final class VideoFramePipeline: @unchecked Sendable {
                     }
                     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
                     let dur = CMSampleBufferGetDuration(sample)
+
+                    // 竖拍：把渲染结果（传感器方向）真实旋转到显示方向的像素，
+                    // 再交给编码器。像素本身转正，不依赖 transform 元数据，
+                    // 避免存进系统相册后元数据丢失导致横屏。横拍直接走原帧。
+                    let encodeBuffer: CVPixelBuffer
+                    if let orientation, let rotateContext,
+                       let rotatedBuffer = Self.rotatePixelBuffer(
+                        dst, orientation: orientation, context: rotateContext,
+                        width: outWidth, height: outHeight) {
+                        encodeBuffer = rotatedBuffer
+                    } else if orientation != nil {
+                        // 旋转失败时宁可中止，也不要静默产出横躺成片。
+                        videoInput.markAsFinished()
+                        state.finishVideo(error: VideoError.exportFailed("旋转输出帧失败"))
+                        return
+                    } else {
+                        encodeBuffer = dst
+                    }
+
                     guard let developed = PixelBufferPool.sampleBuffer(
-                        from: dst, presentationTime: pts, duration: dur) else {
+                        from: encodeBuffer, presentationTime: pts, duration: dur) else {
                         videoInput.markAsFinished()
                         state.finishVideo(error: VideoError.exportFailed("构造输出帧失败"))
                         return
@@ -438,6 +473,26 @@ final class VideoFramePipeline: @unchecked Sendable {
             }
         }
         return state.renderedCount
+    }
+
+    /// 用 CoreImage（GPU 加速）把 CVPixelBuffer 按方向旋转到指定显示尺寸，写回新的
+    /// CVPixelBuffer。CI 的 oriented 方向经验证无黑边、方向正确；逐像素/纯 Swift
+    /// 旋转 688ms/帧太慢，vImage 在本素材的 BGRA 上方向错乱，故选 CoreImage。
+    private static func rotatePixelBuffer(_ src: CVPixelBuffer,
+                                          orientation: CGImagePropertyOrientation,
+                                          context: CIContext,
+                                          width: Int, height: Int) -> CVPixelBuffer? {
+        let ci = CIImage(cvPixelBuffer: src).oriented(orientation)
+        var dst: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+        ]
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                         kCVPixelFormatType_32BGRA, attrs as CFDictionary, &dst)
+        guard status == kCVReturnSuccess, let out = dst else { return nil }
+        context.render(ci, to: out, bounds: ci.extent, colorSpace: nil)
+        return out
     }
 
     private static func videoSettings(codec: VideoCodec, width: Int, height: Int, fps: Int) -> [String: Any] {
