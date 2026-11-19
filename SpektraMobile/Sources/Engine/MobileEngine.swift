@@ -48,6 +48,9 @@ final class MobileEngine: ObservableObject {
     /// 主页网格的数据源：当前选中相簿/智能筛选对应的相册资产。
     @Published private(set) var assets: [MLibraryAsset] = []
     @Published private(set) var assetPhase: AssetPhase = .idle
+    /// 视频访达的数据源：直接映射系统相册的视频列表，不做筛选。
+    @Published private(set) var videoAssets: [PHAsset] = []
+    @Published private(set) var videoPhase: AssetPhase = .idle
     /// 主页筛选：全部 / 收藏 / RAW / 已调色 / 某个相簿。
     @Published private(set) var scope: MAssetScope = .all
     /// 系统相册里的用户相簿，供顶部类型按钮使用。
@@ -59,6 +62,12 @@ final class MobileEngine: ObservableObject {
     @Published private(set) var isImporting = false
     /// 正在按需取原片的资产 id（iCloud 下载 + 入库），用于格子上显示转圈。
     @Published private(set) var importingAssetID: String?
+    /// 取原片失败的精确原因（iCloud 离线/超时/无可用原片），供主页提示真实文案。
+    @Published private(set) var importFailureMessage: String?
+    /// 相册是「有限访问」：主页只显示用户选中的照片，需要显式入口管理。
+    @Published private(set) var isPhotoAccessLimited = false
+    /// 导入时写入系统相册失败的张数（主页按相册映射，失败=看不到照片）。
+    @Published private(set) var albumWriteFailures: Int = 0
     /// 文件名 → 相册资产：软件里的收藏/删除要同步回系统相册。
     private var phAssetByFilename: [String: PHAsset] = [:]
 
@@ -274,9 +283,12 @@ final class MobileEngine: ObservableObject {
         guard status == .authorized || status == .limited else {
             assets = []
             assetPhase = .denied
+            isPhotoAccessLimited = false
             index.resetScopes()
             return
         }
+        // 有限访问：只返回用户选中的照片，主页需要说明「为什么照片变少」并给出管理入口。
+        isPhotoAccessLimited = (status == .limited)
         ensurePhotoObserver()
         assetRefreshToken += 1
         let token = assetRefreshToken
@@ -297,7 +309,10 @@ final class MobileEngine: ObservableObject {
             if scope.isOriginFilter,
                let cachedAll = index.entry(.all, allowNonRaw: allowNonRaw),
                cachedAll.generation == index.generation {
-                assets = filterOrigin(cachedAll.assets, for: scope)
+                // 必须先 relink：缓存里的 MPhoto 是上次扫描的快照，库内记录在
+                // App 运行期间可能已变动（导入 / 删除 / 去重）。直接用旧快照挂到
+                // asset.photo 上，点击时会把失效的 photoID 传进 openDevelop 被静默吞掉。
+                apply(filterOrigin(cachedAll.assets, for: scope))
                 index.store(assets, for: scope, allowNonRaw: allowNonRaw,
                             generation: cachedAll.generation)
                 assetPhase = .ready
@@ -677,15 +692,20 @@ final class MobileEngine: ObservableObject {
     /// 点开一张还没入库的相册照片：取回原片（iCloud 上也允许下载）→ 入库。
     /// 返回可用的 photoID；失败返回 nil。
     func importAsset(assetID: String) async -> String? {
+        importFailureMessage = nil
         guard importingAssetID == nil else { return nil }
         if let existing = assets.first(where: { $0.id == assetID })?.photo {
             return existing.id
         }
         guard let asset = PHAsset.fetchAssets(
             withLocalIdentifiers: [assetID], options: nil
-        ).firstObject else { return nil }
+        ).firstObject else {
+            importFailureMessage = "这张照片已不在相册里，请刷新后重试"
+            return nil
+        }
         guard let info = Self.displayResource(for: asset,
                                               allowNonRaw: MobileSettings.allowNonRaw) else {
+            importFailureMessage = "这张照片没有可用的原片数据"
             return nil
         }
         let resource = info.resource
@@ -735,6 +755,9 @@ final class MobileEngine: ObservableObject {
             }
         } catch {
             NSLog("MAssets fetch failed %@ — %@", assetID, error.localizedDescription)
+            // 把引擎里已有的精确文案透传给 UI（超时文案来自上面的 408 NSError）。
+            let detail = error.localizedDescription
+            importFailureMessage = detail.isEmpty ? "取回原片失败，请检查网络后重试" : detail
             return nil
         }
 
@@ -952,13 +975,40 @@ final class MobileEngine: ObservableObject {
     /// `baseline` 是含拍摄曝光的快速控制基线；缺省才退回中性基线。
     func applyDirectResult(photoID: String, edit: PhotoEdit, grade: GradeRecipe,
                            baseline: PhotoEdit? = nil,
-                           renderedURL: URL) async {
+                           renderedURL: URL,
+                           aspect: MDirectAspect = .portrait3_4,
+                           capturedLandscape: Bool? = nil,
+                           mirrorFront: Bool = false) async {
         guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
         photo.edit = edit
         photo.gradeData = try? JSONEncoder().encode(grade)
         // 快速控制的基线必须包含拍摄曝光：直出预设的快速量是相对「拍摄基线」计算的，
         // 若把已套用的直出参数当基线，快速滑条回到 0 时无法回到原始曝光 / 亮度。
         photo.quickBaselineData = try? JSONEncoder().encode(baseline ?? PhotoEdit())
+        // 相机页选的画幅写进裁切数据：调色台打开就是同一构图，
+        // 后续调色导出沿用裁切。横拍按快门朝向把比例旋转（9:16 → 16:9），
+        // 与直出渲染的裁切保持同一构图。
+        let rawURL = store.originalURL(for: photo)
+        let rawSize = LibraryStore.pixelSize(url: rawURL)
+        let landscape = capturedLandscape ?? (rawSize.width > rawSize.height)
+        // RAW 的 TIFF 尺寸是传感器 buffer 朝向（横拍时可能是竖的），而 crop 会被
+        // 应用到 EXIF 转正后的交接图上。必须先把尺寸换到转正坐标系，否则横拍
+        // 9:16 会按竖幅 buffer 算出细长条 crop，与直出 16:9 成片不一致。
+        let oriented = landscape && rawSize.width < rawSize.height
+            ? (width: rawSize.height, height: rawSize.width)
+            : (width: rawSize.width, height: rawSize.height)
+        var geometry = MPhotoGeometry()
+        if let data = photo.cropData,
+           let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
+            geometry = decoded
+        }
+        geometry.crop = MPhotoGeometry.centerCrop(
+            ratio: aspect.ratio(landscape: landscape),
+            width: oriented.width, height: oriented.height)
+        // 前置镜像拍摄：直出成片已翻成预览所见，调色台（显影交接图 + 导出）
+        // 走 geometry.apply 同一翻转，两个成片方向一致。显影台仍显示 RAW 原始画面。
+        if mirrorFront { geometry.flippedH = true }
+        photo.cropData = try? JSONEncoder().encode(geometry.normalized())
         try? store.update(photo)
 
         var wroteThumbnail = false
@@ -1019,17 +1069,27 @@ final class MobileEngine: ObservableObject {
             try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
 
+            var failures = 0
             for photo in imported {
                 let source = store.originalURL(for: photo)
                 let filename = photo.filename
                 guard let temp = await Task.detached(priority: .utility, operation: {
                     Self.prepareAlbumFile(source: source, filename: filename, root: root)
-                }).value else { continue }
-                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                    PhotoLibraryExport.save(temp) { _ in
-                        continuation.resume()
-                    }
+                }).value else { failures += 1; continue }
+                let outcome = await withCheckedContinuation { (continuation: CheckedContinuation<PhotoLibraryExport.Outcome, Never>) in
+                    PhotoLibraryExport.save(temp) { continuation.resume(returning: $0) }
                 }
+                switch outcome {
+                case .failed:
+                    failures += 1
+                    NSLog("MAlbum write failed for %@ — 主页按相册映射，这张可能看不到", filename)
+                case .saved, .denied:
+                    break
+                }
+            }
+            self.albumWriteFailures = failures
+            if failures > 0 {
+                NSLog("MAlbum wrote %d/%d — %d failed", imported.count - failures, imported.count, failures)
             }
             self.requestAssetsRefresh()
         }
@@ -1257,11 +1317,108 @@ final class MobileEngine: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
 
+    // MARK: - 视频相册映射
+
+    /// 视频访达：直接映射系统相册的视频列表，不做任何筛选/分类。
+    /// 与照片扫描互不干扰，只借用同一套相册授权。
+    func refreshVideos(force: Bool = false) async {
+        if !force, !videoAssets.isEmpty, videoPhase == .ready { return }
+        let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        guard status == .authorized || status == .limited else {
+            videoAssets = []
+            videoPhase = .denied
+            return
+        }
+        videoPhase = .scanning
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        let result = PHAsset.fetchAssets(with: .video, options: options)
+        var list: [PHAsset] = []
+        list.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in list.append(asset) }
+        videoAssets = list
+        videoPhase = .ready
+        NSLog("MVideos count=%d", list.count)
+    }
+
+    /// 把相册视频的原始资源写到临时文件；调用方拷贝进工程后负责删除。
+    /// iCloud 视频可能很大，超时放宽到 180s，但仍要有上限，避免无限等待。
+    func exportVideoResource(for asset: PHAsset) async -> (url: URL, filename: String)? {
+        importFailureMessage = nil
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let resource = resources.first(where: { $0.type == .fullSizeVideo })
+            ?? resources.first(where: { $0.type == .video })
+            ?? resources.first else {
+            importFailureMessage = "这个视频没有可用的原片数据"
+            return nil
+        }
+        let ext = UTType(resource.uniformTypeIdentifier)?.preferredFilenameExtension ?? "mov"
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(ext)
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let once = MOnceResume()
+                var timeoutWork: DispatchWorkItem?
+                PHAssetResourceManager.default().writeData(
+                    for: resource, toFile: url, options: options
+                ) { error in
+                    timeoutWork?.cancel()
+                    once.run {
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                }
+                let timeout = DispatchWorkItem {
+                    once.run {
+                        continuation.resume(throwing: NSError(
+                            domain: "Spektrafilm.VideoImport", code: 408, userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "从 iCloud 取回视频超时，请检查网络后重试"
+                            ]))
+                    }
+                }
+                timeoutWork = timeout
+                DispatchQueue.global(qos: .utility).asyncAfter(
+                    deadline: .now() + 180, execute: timeout)
+            }
+        } catch {
+            NSLog("MVideo fetch failed %@ — %@", asset.localIdentifier, error.localizedDescription)
+            let detail = error.localizedDescription
+            importFailureMessage = detail.isEmpty ? "取回视频失败，请检查网络后重试" : detail
+            return nil
+        }
+        let rawName = (resource.originalFilename as NSString).deletingPathExtension
+        return (url, rawName.isEmpty ? "视频" : rawName)
+    }
+
     // MARK: - 显影会话
 
     @discardableResult
-    func openDevelop(photoID: String) -> MobileDevelopSession? {
-        guard let photo = store.photos.first(where: { $0.id == photoID }) else { return nil }
+    func openDevelop(photoID: String, filename: String? = nil) -> MobileDevelopSession? {
+        var resolved = store.photos.first(where: { $0.id == photoID })
+        // 卡片可能持有 relink 之前的 MPhoto 快照：id 已失效，但文件名稳定
+        // （删除重导会换 id、文件名不变）。优先用入口传来的文件名回查当前记录——
+        // 即使卡片渲染后库已刷新（台前调度 force refresh）也能打开。
+        if resolved == nil, let filename,
+           let current = store.photos.first(where: { $0.filename == filename }) {
+            resolved = current
+        }
+        // 没有 filename 的调用点（相机 / 直出）：从仍持有旧快照的 asset 取文件名兜底。
+        if resolved == nil,
+           let stale = assets.first(where: { $0.photo?.id == photoID })?.filename,
+           let current = store.photos.first(where: { $0.filename == stale }) {
+            resolved = current
+        }
+        guard let photo = resolved else {
+            NSLog("MOpen develop session nil id=%@ filename=%@", photoID, filename ?? "-")
+            return nil
+        }
         transientDevelopSession?.cancel()
         transientDevelopSession = nil
         developSession?.cancel()
@@ -1303,13 +1460,31 @@ final class MobileEngine: ObservableObject {
     /// 从主页直接进调色台时，临时建一个不显示的显影会话，只为产出交接像素。
     /// `.direct` 入口：有可复用的显影交接图缓存时按 `.developed` 秒开，
     /// 没有缓存才退回原片直接调色（不跑显影）。
-    func openGrade(photoID: String, entry: MGradeEntry) -> MobileGradeSession? {
-        guard let photo = store.photos.first(where: { $0.id == photoID }) else { return nil }
+    func openGrade(photoID: String, filename: String? = nil,
+                   entry: MGradeEntry) -> MobileGradeSession? {
+        // 与 openDevelop 同源：卡片可能持有 relink 前的 MPhoto 快照，id 已失效
+        // 但文件名稳定。iPad 多场景/台前调度会频繁 force refresh 触发 relink，
+        // 用户点「直接调色」时传来的 photoID 可能已过期，必须按文件名回查当前记录。
+        var resolved = store.photos.first(where: { $0.id == photoID })
+        if resolved == nil, let filename,
+           let current = store.photos.first(where: { $0.filename == filename }) {
+            resolved = current
+        }
+        if resolved == nil,
+           let stale = assets.first(where: { $0.photo?.id == photoID })?.filename,
+           let current = store.photos.first(where: { $0.filename == stale }) {
+            resolved = current
+        }
+        guard let photo = resolved else {
+            NSLog("MOpen grade session nil id=%@ filename=%@", photoID, filename ?? "-")
+            return nil
+        }
+        let stableID = photo.id   // 回退命中后 id 已更新，后续查询一律用它
         let hasHandoffCache = MDevelopHandoffCache.hasEntry(
-            root: store.root, photoID: photoID,
+            root: store.root, photoID: stableID,
             fingerprint: MobileDevelopSession.handoffFingerprint(for: photo))
         let develop: MobileDevelopSession
-        if let current = developSession, current.photoID == photoID {
+        if let current = developSession, current.photoID == stableID {
             transientDevelopSession?.cancel()
             transientDevelopSession = nil
             develop = current

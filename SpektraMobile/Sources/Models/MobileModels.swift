@@ -723,7 +723,71 @@ enum MScreen: Hashable {
     case camera
     case develop
     case grade
+    case video
     case settings
+}
+
+/// 直出模式的画幅比例：拍摄永远是 RAW 全幅（4:3），比例只在渲染时居中裁切，
+/// 同时写入库记录的 cropData，让调色台的裁切功能保持同一构图。
+enum MDirectAspect: String, CaseIterable, Identifiable {
+    /// 传感器 4:3 与 3:4 是同一比例，只保留竖幅一档（也是默认）。
+    case portrait3_4 = "3:4"
+    case square = "1:1"
+    case portrait9_16 = "9:16"
+
+    var id: String { rawValue }
+
+    var label: String { rawValue }
+
+    /// 目标宽高比（宽/高）。
+    var ratio: Double {
+        switch self {
+        case .portrait3_4: return 3.0 / 4
+        case .square: return 1
+        case .portrait9_16: return 9.0 / 16
+        }
+    }
+
+    /// 按拍摄朝向取目标宽高比（宽/高）。档位是竖幅语义；
+    /// 横屏拍摄时取倒数得到「选定比例横过来」的完整横幅（9:16 → 16:9），
+    /// 而不是把横幅硬裁成竖幅。1:1 两种朝向相同。
+    /// 优先用快门瞬间的真实朝向，避免依赖解码后像素方向（EXIF 转正不可靠）。
+    func ratio(landscape: Bool) -> Double {
+        landscape ? 1.0 / ratio : ratio
+    }
+
+    /// 兼容旧调用：没有朝向信息时退回按画布像素宽高判断。
+    func ratio(width: Int, height: Int) -> Double {
+        ratio(landscape: width > height)
+    }
+}
+
+/// 直出分辨率档位：按总像素（MP）显示，换算成长边交给导出预算。
+/// 档位长边超过传感器最大长边时不提供（放大没有意义）。
+enum MDirectResolution: String, CaseIterable, Identifiable {
+    case mp8 = "8MP"
+    case mp12 = "12MP"
+    case mp24 = "24MP"
+    case maximum = "MAX"
+
+    var id: String { rawValue }
+    var label: String { rawValue }
+
+    /// 目标长边；nil 表示原片全尺寸。
+    var longEdge: Int? {
+        switch self {
+        case .mp8: return 3264
+        case .mp12: return 4032
+        case .mp24: return 5712
+        case .maximum: return nil
+        }
+    }
+
+    /// 传感器最大长边能否撑起这一档。
+    func available(forMaxEdge maxEdge: Int) -> Bool {
+        guard let edge = longEdge else { return true }
+        return maxEdge >= edge
+    }
 }
 
 /// 直出保存请求：根视图负责决定是否保留 RAW 与工程。
@@ -736,6 +800,13 @@ struct MDirectSaveRequest {
     var border = MFilmBorderConfig()
     /// 快速控制基线（含拍摄曝光）；重新打开显影台时快速滑条回到 0 不会丢掉拍摄曝光。
     var baseline: PhotoEdit? = nil
+    /// 相机页选择的画幅比例；保存时写进 cropData，与调色台裁切共用。
+    var aspect: MDirectAspect = .portrait3_4
+    /// 快门瞬间的握持方向，决定 cropData 的画幅是否旋转（横拍 9:16 → 16:9）。
+    var capturedLandscape: Bool = false
+    /// 前置镜像拍摄：写进 cropData 的 flippedH，调色台成片与直出成片同一方向。
+    /// 显影台仍显示 RAW 原始画面（原片不翻转）。
+    var mirrorFront: Bool = false
 }
 
 enum MDirectSaveOutcome {
@@ -751,6 +822,12 @@ struct MDirectDevelopRequest {
     let edit: PhotoEdit
     let grade: GradeRecipe
     var baseline: PhotoEdit? = nil
+    /// 相机页选择的画幅比例；入库时写进 cropData，调色台裁切直接呈现同一构图。
+    var aspect: MDirectAspect = .portrait3_4
+    /// 快门瞬间的握持方向，决定 cropData 的画幅是否旋转（横拍 9:16 → 16:9）。
+    var capturedLandscape: Bool = false
+    /// 前置镜像拍摄：写进 cropData 的 flippedH，调色台成片与直出成片同一方向。
+    var mirrorFront: Bool = false
 }
 
 enum MDirectDevelopOutcome {

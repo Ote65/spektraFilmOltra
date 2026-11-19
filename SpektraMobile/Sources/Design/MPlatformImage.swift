@@ -158,6 +158,26 @@ struct MPhotoThumbnail: View {
 }
 
 extension CGImage {
+    /// 按目标宽高比居中裁切：只取中间区域，不改像素内容。
+    /// 用于显影预览图提前呈现成片的画幅（横拍 16:9 / 竖拍 9:16）。
+    func centerCropped(toAspect target: Double) -> CGImage? {
+        let current = Double(width) / Double(height)
+        guard target > 0, width > 1, height > 1 else { return self }
+        let cropW: Int
+        let cropH: Int
+        if current > target {
+            cropH = height
+            cropW = max(1, min(width, Int((Double(height) * target).rounded())))
+        } else {
+            cropW = width
+            cropH = max(1, min(height, Int((Double(width) / target).rounded())))
+        }
+        let rect = CGRect(
+            x: (width - cropW) / 2, y: (height - cropH) / 2,
+            width: cropW, height: cropH)
+        return cropping(to: rect)
+    }
+
     /// 顺时针旋转 90°：纯几何重排，不插值。
     var quarterTurnedClockwise: CGImage? {
         let targetWidth = height
@@ -170,6 +190,22 @@ extension CGImage {
               ) else { return nil }
         context.translateBy(x: CGFloat(targetWidth) / 2, y: CGFloat(targetHeight) / 2)
         context.rotate(by: .pi / 2)
+        context.translateBy(x: -CGFloat(width) / 2, y: -CGFloat(height) / 2)
+        context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+
+    /// 水平镜像：纯几何变换，不插值。前置「镜像前置相机」开时，
+    /// 快门缩略图翻成取景预览所见，成片渲染做同一翻转。
+    var mirroredHorizontally: CGImage? {
+        guard let space = colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        context.translateBy(x: CGFloat(width) / 2, y: CGFloat(height) / 2)
+        context.scaleBy(x: -1, y: 1)
         context.translateBy(x: -CGFloat(width) / 2, y: -CGFloat(height) / 2)
         context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
         return context.makeImage()

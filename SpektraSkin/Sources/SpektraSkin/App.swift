@@ -23,6 +23,7 @@ struct SpektraSkinApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        setvbuf(stdout, nil, _IONBF, 0)
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 

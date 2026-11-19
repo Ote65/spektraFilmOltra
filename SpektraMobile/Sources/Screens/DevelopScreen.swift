@@ -114,6 +114,10 @@ struct DevelopScreen: View {
                 )
             }
         }
+        .onAppear {
+            guard DebugLaunch.autoGrade else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { openGrade() }
+        }
         .onChange(of: stageSize) { _, _ in popCardIfReady() }
         .onChange(of: session.previewImage != nil) { _, hasImage in
             if hasImage { popCardIfReady() }
@@ -523,11 +527,14 @@ struct DevelopScreen: View {
             Spacer(minLength: 0)
 
             // 调色入口从底部页签移到顶栏，和调色台的导出按钮同一套黄铜胶囊。
-            MBrassCircleButton(icon: "bookmark", size: 32) {
+            // 黄铜只留给「调色」这一个主操作：保存预设降为中性玻璃圆钮，
+            // 与左侧返回同一套材质，靠形状与明度编码层级，避免两个实心黄铜并排抢戏。
+            MCircleIconButton(icon: "bookmark", size: 13, frame: 32) {
                 presetSaveOpen = true
             }
+            .accessibilityLabel("保存显影预设")
 
-            MBrassPill(title: "调色", icon: "slider.horizontal.3", height: 32) {
+            MBrassPill(title: "调色", icon: "slider.horizontal.3", height: 32, glass: true) {
                 openGrade()
             }
             .accessibilityLabel("进入调色台")
@@ -555,7 +562,10 @@ struct DevelopScreen: View {
 
     /// 点击调色：把当前预览与落点交给根视图做吸入动画。
     private func openGrade() {
-        let rect = fittedPreviewRect(in: stageSize)
+        // 必须交「屏幕上此刻真正看见的那块照片」，不能交未缩放的基础框。
+        // previewStage 里的图片依次经过 scaledToFit → scaleEffect(zoom) → offset(pan, 纯预览偏移)，
+        // 少算任何一步，飞行图都会从另一个位置起跳，落点再准也会被看成吸入错位。
+        let rect = displayedPreviewRect(in: stageSize)
         onOpenGrade(
             session.previewImage,
             CGRect(
@@ -565,6 +575,21 @@ struct DevelopScreen: View {
                 height: rect.height
             )
         )
+    }
+
+    /// 当前预览图在画布坐标系里的实际矩形（含缩放、平移与纯预览居中偏移）。
+    private func displayedPreviewRect(in size: CGSize) -> CGRect {
+        let base = fittedPreviewRect(in: size)
+        let stageCenter = CGPoint(x: size.width / 2, y: size.height / 2)
+        // scaleEffect 默认以视图中心为锚点，而这里 base 是 scaledToFit 后的内容框，
+        // 所以要以「画布中心」缩放，不是以内容框中心缩放。
+        let scaled = CGRect(
+            x: stageCenter.x + (base.minX - stageCenter.x) * zoom,
+            y: stageCenter.y + (base.minY - stageCenter.y) * zoom,
+            width: base.width * zoom,
+            height: base.height * zoom
+        )
+        return scaled.offsetBy(dx: pan.width, dy: pan.height + hiddenCenterOffsetY)
     }
 
     /// 预览渲染比例菜单：1/8、1/4、1/2、1/1，与 Swift 主线的 previewScale 档位一致。
@@ -715,30 +740,6 @@ struct DevelopScreen: View {
 
             cropMarks
                 .zIndex(2)
-
-            VStack(spacing: 0) {
-                Spacer(minLength: 0)
-
-                LinearGradient(
-                    colors: [Color.clear, Color.black.opacity(0.60)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: 80)
-                .allowsHitTesting(false)
-            }
-            .allowsHitTesting(false)
-            .opacity(chromeHidden ? 0 : 1)
-            .animation(MMotion.quick, value: chromeHidden)
-
-            VStack {
-                Spacer(minLength: 0)
-                previewMeta
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 10)
-            }
-            .opacity(chromeHidden ? 0 : 1)
-            .animation(MMotion.quick, value: chromeHidden)
         }
         // 沉浸式预览不画画布底边线，避免屏幕底部出现一条横线。
         .overlay(alignment: .bottom) {
@@ -784,50 +785,6 @@ struct DevelopScreen: View {
         )
     }
 
-    private var previewMeta: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(showOriginal ? MColor.text3 : MColor.brass)
-                        .frame(width: 4, height: 4)
-
-                    Text(session.filename)
-                        .font(.mSans(9.5, .medium))
-                        .foregroundStyle(MColor.text2)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-
-                Text("\(currentFilm.name) · \(currentPaper.name)")
-                    .font(.mSans(8.5, .medium))
-                    .foregroundStyle(MColor.text3)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 0)
-
-            // 拖动期的 LUT 预测帧精度低于精算帧，必须让用户知道当前看到的是过渡画面。
-            if session.isPredicted, !showOriginal {
-                Text("预测")
-                    .font(.mSans(8.5, .medium))
-                    .foregroundStyle(MColor.brassHigh.opacity(0.92))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .mGlassSurface(Capsule(), fallbackFill: Color.black.opacity(0.42))
-                    .accessibilityLabel("LUT 预测帧，停手后替换为精算帧")
-            }
-
-            if abs(zoom - 1) > 0.001 || showOriginal {
-                Text(showOriginal ? "原片" : "\(Int(zoom * 100))%")
-                    .font(.mSans(8.5, .medium).monospacedDigit())
-                    .foregroundStyle(showOriginal ? MColor.text2 : MColor.text4)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .mGlassSurface(Capsule(), fallbackFill: Color.black.opacity(0.42))
-            }
-        }
-    }
 
     private var cropMarks: some View {
         GeometryReader { geo in
@@ -1720,14 +1677,6 @@ struct DevelopScreen: View {
     }
 
     private let printOnlyQuickNote = "正片扫描模式：管线跳过印相阶段，本项不参与成像"
-
-    private var currentFilm: MFilm {
-        MobileCatalog.film(id: session.filmID) ?? MobileCatalog.films[0]
-    }
-
-    private var currentPaper: MPaper {
-        MobileCatalog.paper(id: session.paperID) ?? MobileCatalog.papers[0]
-    }
 
     private var lightDirtyCount: Int {
         dirtyCount(in: "光调")

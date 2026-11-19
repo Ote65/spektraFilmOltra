@@ -6,6 +6,9 @@ import UniformTypeIdentifiers
 /// 设置项直接落 UserDefaults：显影会话、导出面板与启动页读同一份值。
 enum MobileSettings {
     static let predictivePreviewKey = "mobile.preview.predictive"
+    /// 视频显影颗粒：打开用逐像素 GPU 物理模型，关闭恢复原 valueNoise 近似。
+    /// core 层 VideoGrainModel.physicalGrainKey 读同一个键，开关对所有视频与导出生效。
+    static let videoPhysicalGrainKey = VideoGrainModel.physicalGrainKey
     /// 允许导入并显影 JPEG/HEIC/PNG 等编码图；关闭时主页只映射相册里的 RAW。
     static let allowNonRawKey = "mobile.import.allowNonRaw"
     static let defaultExportFormatKey = "mobile.export.defaultFormatIndex"
@@ -139,6 +142,7 @@ struct SettingsScreen: View {
     var cacheRoot: URL? = nil
 
     @AppStorage(MobileSettings.predictivePreviewKey) private var predictivePreview = true
+    @AppStorage(MobileSettings.videoPhysicalGrainKey) private var videoPhysicalGrain = false
     @AppStorage(MobileSettings.allowNonRawKey) private var allowNonRaw = false
     @AppStorage(MobileSettings.defaultExportFormatKey) private var exportFormat = 0
     @AppStorage(MobileSettings.defaultExportEdgeKey) private var exportEdge = 0
@@ -275,7 +279,7 @@ struct SettingsScreen: View {
                        detail: "取景框中央显示水平与俯拍参考")
 
             MToggleRow(label: "镜像前置相机", isOn: $cameraMirrorFront, compact: true,
-                       detail: "仅镜像取景预览；RAW 原片与成片不翻转")
+                       detail: "前置成片镜像为取景所见（和预览一样）；显影台与 RAW 原片保持原始画面")
 
             MToggleRow(label: "拍摄后进入显影台", isOn: $cameraEnterDevelop, compact: true,
                        detail: "关闭后停留在取景页，可连续拍摄")
@@ -387,6 +391,9 @@ struct SettingsScreen: View {
                 .padding(.top, 18)
 
             MToggleRow(label: "双层预览预测", isOn: $predictivePreview, compact: true)
+
+            MToggleRow(label: "GPU 物理颗粒", isOn: $videoPhysicalGrain, compact: true,
+                       detail: "视频显影用逐像素卤化银粒子，更接近真实胶片，渲染约慢 4 倍；关闭恢复快速颗粒")
         }
     }
 

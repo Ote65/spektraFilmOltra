@@ -126,6 +126,9 @@ struct MBrassPill: View {
     var fullWidth: Bool = false
     var disabled: Bool = false
     var loading: Bool = false
+    /// 铜色玻璃：铜染半透玻璃 + 铜字，与顶栏其它玻璃按钮同一套材质。
+    /// 用「铜色」而非「实心铜块」表达主操作；实心铜仍保留给需要压住画面的场合。
+    var glass: Bool = false
     var action: () -> Void
 
     var body: some View {
@@ -133,31 +136,52 @@ struct MBrassPill: View {
             MHaptic.light()
             action()
         } label: {
-            HStack(spacing: 6) {
-                if loading {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .controlSize(.small)
-                        .tint(MColor.brassInk)
-                        .scaleEffect(0.8)
-                } else if let icon {
-                    Image(systemName: icon)
-                        .font(.system(size: 11, weight: .semibold))
-                }
-                Text(title)
-                    .font(.mSans(11.5, .semibold))
-            }
-            .foregroundStyle(disabled ? MColor.text4 : MColor.brassInk)
-            .padding(.horizontal, 14)
-            .frame(maxWidth: fullWidth ? .infinity : nil)
-            .frame(height: height)
-            .background(
-                Capsule().fill(disabled ? MColor.surface3 : MColor.brass)
-            )
-            .contentShape(Capsule())
+            pillLabel
         }
         .buttonStyle(MPressStyle(scale: 0.94))
         .disabled(disabled)
+    }
+
+    @ViewBuilder private var pillLabel: some View {
+        let core = HStack(spacing: 6) {
+            if loading {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .controlSize(.small)
+                    .tint(glass ? MColor.brassHigh : MColor.brassInk)
+                    .scaleEffect(0.8)
+            } else if let icon {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            Text(title)
+                .font(.mSans(11.5, .semibold))
+        }
+        .foregroundStyle(disabled ? MColor.text4 : (glass ? MColor.brassHigh : MColor.brassInk))
+        .padding(.horizontal, 14)
+        .frame(maxWidth: fullWidth ? .infinity : nil)
+        .frame(height: height)
+
+        if glass {
+            core
+                .mGlassSurface(
+                    Capsule(),
+                    tint: MColor.brass.opacity(disabled ? 0.06 : 0.20),
+                    fallbackFill: MColor.brassWash,
+                    interactive: !disabled
+                )
+                .overlay(
+                    Capsule().strokeBorder(
+                        MColor.brass.opacity(disabled ? 0.14 : 0.34),
+                        lineWidth: 1
+                    )
+                )
+                .contentShape(Capsule())
+        } else {
+            core
+                .background(Capsule().fill(disabled ? MColor.surface3 : MColor.brass))
+                .contentShape(Capsule())
+        }
     }
 }
 

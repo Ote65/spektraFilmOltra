@@ -28,6 +28,29 @@ private enum LibraryFilter: String, CaseIterable, Identifiable {
     }
 }
 
+/// 媒体分类：照片与视频在同一个库里，这里只是筛选。
+private enum LibraryMediaFilter: String, CaseIterable, Identifiable {
+    case all, photo, video
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all: return "全部媒体"
+        case .photo: return "照片"
+        case .video: return "视频"
+        }
+    }
+
+    var kind: MediaKind? {
+        switch self {
+        case .all: return nil
+        case .photo: return .photo
+        case .video: return .video
+        }
+    }
+}
+
 private enum LibraryViewMode {
     case grid
     case list
@@ -47,15 +70,23 @@ private enum LibrarySortMode: String {
 
 struct LibraryView: View {
     let snapshot: LibrarySnapshot
+    var currentID: String? = nil
     let actions: SkinActions
 
     @State private var query = ""
+    @State private var mediaFilter: LibraryMediaFilter = .all
     @State private var filter: LibraryFilter = .all
     @State private var viewMode: LibraryViewMode = .grid
     @State private var sortMode: LibrarySortMode = .recent
 
+    private var activeID: String? { currentID ?? snapshot.currentID }
+
     private var visiblePhotos: [PhotoItem] {
-        let searched = snapshot.photos.filter { photo in
+        let pool = snapshot.photos.filter { item in
+            guard let kind = mediaFilter.kind else { return true }
+            return item.mediaKind == kind
+        }
+        let searched = pool.filter { photo in
             let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return true }
             return photo.filename.localizedCaseInsensitiveContains(text)
@@ -79,6 +110,10 @@ struct LibraryView: View {
                 $0.filename.localizedStandardCompare($1.filename) == .orderedAscending
             }
         }
+    }
+
+    private var poolIsEmpty: Bool {
+        snapshot.photos.isEmpty
     }
 
     var body: some View {
@@ -109,12 +144,12 @@ struct LibraryView: View {
     private var titleRow: some View {
         HStack(alignment: .center, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text("照片库")
+                Text("媒体库")
                     .font(.pageTitle)
                     .tracking(0.4)
                     .foregroundStyle(SkinColor.text1)
 
-                Text("\(snapshot.folderCount) 个文件夹 · \(snapshot.photoCount) 张照片")
+                Text("\(snapshot.folderCount) 个文件夹 · \(snapshot.photoCount) 张照片 · \(snapshot.videoCount) 个视频")
                     .font(.pageSubtitle.monospacedDigit())
                     .foregroundStyle(SkinColor.text3)
                     .lineLimit(1)
@@ -123,7 +158,7 @@ struct LibraryView: View {
             Spacer(minLength: 20)
 
             SkinButton("导入文件夹", icon: "folder", kind: .secondary) { actions.importFolder() }
-            SkinButton("导入照片", icon: "square.and.arrow.down", kind: .primary) { actions.importPhotos() }
+            SkinButton("导入媒体", icon: "square.and.arrow.down", kind: .primary) { actions.importMedia() }
         }
         .frame(height: 32)
     }
@@ -131,13 +166,26 @@ struct LibraryView: View {
     private var controlRow: some View {
         HStack(spacing: 10) {
             HStack(spacing: 6) {
-                ForEach([LibraryFilter.all, .favorite, .adjusted]) { item in
+                ForEach(LibraryMediaFilter.allCases) { item in
+                    SkinChip(
+                        title: item.title,
+                        tone: nil,
+                        selected: mediaFilter == item
+                    ) {
+                        withAnimation(SkinMotion.state) { mediaFilter = item }
+                    }
+                }
+
+                SkinVerticalHairline(height: 16)
+                    .padding(.horizontal, 2)
+
+                ForEach([LibraryFilter.favorite, .adjusted]) { item in
                     SkinChip(
                         title: item.title,
                         tone: nil,
                         selected: filter == item
                     ) {
-                        withAnimation(SkinMotion.state) { filter = item }
+                        withAnimation(SkinMotion.state) { filter = filter == item ? .all : item }
                     }
                 }
 
@@ -150,7 +198,7 @@ struct LibraryView: View {
                         tone: item.tone,
                         selected: filter == item
                     ) {
-                        withAnimation(SkinMotion.state) { filter = item }
+                        withAnimation(SkinMotion.state) { filter = filter == item ? .all : item }
                     }
                 }
             }
@@ -158,7 +206,7 @@ struct LibraryView: View {
             Spacer(minLength: 12)
 
             SkinSearchField(
-                placeholder: "搜索照片、胶片或相纸",
+                placeholder: "搜索文件名、胶片或相纸",
                 text: $query,
                 width: 240
             )
@@ -177,12 +225,12 @@ struct LibraryView: View {
             VStack(alignment: .leading, spacing: 0) {
                 sectionHead
 
-                if snapshot.photos.isEmpty {
+                if poolIsEmpty {
                     LibraryEmptyView(actions: actions)
                         .padding(.top, 64)
                 } else if visiblePhotos.isEmpty {
                     VStack(spacing: 8) {
-                        Text("没有匹配的照片")
+                        Text("没有匹配的媒体")
                             .font(.skin(14, .medium))
                             .foregroundStyle(SkinColor.text2)
                         Text("试试清除搜索或切换筛选")
@@ -213,12 +261,12 @@ struct LibraryView: View {
 
     private var sectionHead: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(snapshot.sectionTitle)
+            Text(mediaFilter == .all ? "全部媒体" : mediaFilter.title)
                 .font(.sectionTitle)
                 .tracking(0.2)
                 .foregroundStyle(SkinColor.text2)
 
-            Text("\(visiblePhotos.count) 张照片")
+            Text("\(visiblePhotos.count) 项")
                 .font(.skin(10.5).monospacedDigit())
                 .foregroundStyle(SkinColor.text3)
 
@@ -232,14 +280,10 @@ struct LibraryView: View {
 
     private var grid: some View {
         LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 22) {
-            ForEach(snapshot.folders) { folder in
-                LibraryFolderCard(folder: folder) {}
-            }
-
             ForEach(visiblePhotos) { photo in
                 LibraryPhotoCard(
                     photo: photo,
-                    selected: photo.id == snapshot.currentID,
+                    selected: photo.id == activeID,
                     actions: actions
                 ) {
                     actions.openPhoto(photo.id)
@@ -253,7 +297,7 @@ struct LibraryView: View {
             ForEach(visiblePhotos) { photo in
                 LibraryPhotoRow(
                     photo: photo,
-                    isCurrent: photo.id == snapshot.currentID,
+                    isCurrent: photo.id == activeID,
                     actions: actions
                 ) {
                     actions.openPhoto(photo.id)
@@ -355,62 +399,6 @@ private struct LibraryViewToggle: View {
 
 // MARK: - Grid cards
 
-private struct LibraryFolderCard: View {
-    let folder: FolderItem
-    let action: () -> Void
-
-    @State private var hovered = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Rectangle()
-                .fill(folder.isCurrent || hovered ? SkinColor.surface2 : SkinColor.surface1)
-                .aspectRatio(4.0 / 3.0, contentMode: .fit)
-                .overlay {
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.028), .clear],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                }
-                .overlay {
-                    Image(systemName: "folder")
-                        .font(.system(size: 34, weight: .regular))
-                        .foregroundStyle(folder.isCurrent ? SkinColor.accent : (hovered ? SkinColor.text2 : SkinColor.text3))
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(
-                            folder.isCurrent ? SkinColor.accent.opacity(0.8) : (hovered ? SkinColor.hairlineStrong : SkinColor.hairline),
-                            lineWidth: folder.isCurrent ? 1.4 : 1
-                        )
-                )
-
-            Spacer().frame(height: 9)
-
-            Text(folder.name)
-                .font(.skin(12, .medium))
-                .foregroundStyle(SkinColor.text1)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(height: 18, alignment: .leading)
-
-            Spacer().frame(height: 3)
-
-            Text("\(folder.count) 张照片")
-                .font(.skin(10.5).monospacedDigit())
-                .foregroundStyle(SkinColor.text3)
-                .lineLimit(1)
-                .frame(height: 15, alignment: .leading)
-        }
-        .contentShape(Rectangle())
-        .onTapGesture(perform: action)
-        .onHover { hovered = $0 }
-        .animation(SkinMotion.hover, value: hovered)
-    }
-}
-
 private struct LibraryPhotoCard: View {
     let photo: PhotoItem
     let selected: Bool
@@ -473,7 +461,7 @@ private struct LibraryPhotoCard: View {
                     Rectangle()
                         .fill(SkinColor.surface2)
                         .overlay(
-                            Image(systemName: "photo")
+                            Image(systemName: photo.isVideo ? "film" : "photo")
                                 .font(.system(size: 26, weight: .light))
                                 .foregroundStyle(SkinColor.text4)
                         )
@@ -488,6 +476,24 @@ private struct LibraryPhotoCard: View {
                         lineWidth: selected ? 1.5 : 1
                     )
             )
+            .overlay {
+                if photo.isVideo {
+                    ZStack {
+                        Circle()
+                            .fill(Color.black.opacity(0.46))
+                            .frame(width: 40, height: 40)
+                        Circle()
+                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
+                            .frame(width: 40, height: 40)
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.9))
+                            .offset(x: 1)
+                    }
+                    .opacity(hovered || selected ? 1 : 0.78)
+                    .animation(SkinMotion.hover, value: hovered)
+                }
+            }
             .overlay(alignment: .topLeading) {
                 if photo.isGraded {
                     Text("已调色")
@@ -506,6 +512,17 @@ private struct LibraryPhotoCard: View {
                         .padding(8)
                 }
             }
+            .overlay(alignment: .bottomTrailing) {
+                if photo.isVideo, let duration = photo.durationText {
+                    Text(duration)
+                        .font(.skin(10).monospacedDigit())
+                        .foregroundStyle(Color.white.opacity(0.92))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.black.opacity(0.62)))
+                        .padding(8)
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 HStack(spacing: 4) {
                     if photo.color != nil || hovered {
@@ -517,7 +534,7 @@ private struct LibraryPhotoCard: View {
                     }
                 }
                 .padding(8)
-                .opacity(controlsVisible || photo.favorite || photo.color != nil || selected ? 1 : 0)
+                .opacity(controlsVisible ? 1 : 0)
             }
     }
 
@@ -618,10 +635,21 @@ private struct LibraryPhotoRow: View {
                         Rectangle()
                             .fill(SkinColor.surface2)
                             .overlay(
-                                Image(systemName: "photo")
+                                Image(systemName: photo.isVideo ? "film" : "photo")
                                     .font(.system(size: 18, weight: .light))
                                     .foregroundStyle(SkinColor.text4)
                             )
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if photo.isVideo, let duration = photo.durationText {
+                        Text(duration)
+                            .font(.skin(9).monospacedDigit())
+                            .foregroundStyle(Color.white.opacity(0.92))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.black.opacity(0.62)))
+                            .padding(4)
                     }
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -707,7 +735,7 @@ private struct LibraryEmptyView: View {
                     .fill(SkinColor.surface1)
                 Circle()
                     .strokeBorder(SkinColor.hairlineStrong, lineWidth: 1)
-                Image(systemName: "film")
+                Image(systemName: "photo.on.rectangle.angled")
                     .font(.system(size: 30, weight: .regular))
                     .foregroundStyle(SkinColor.text2)
             }
@@ -715,19 +743,19 @@ private struct LibraryEmptyView: View {
 
             Spacer().frame(height: 18)
 
-            Text("照片库还是空的")
+            Text("媒体库还是空的")
                 .font(.skin(16, .medium))
                 .foregroundStyle(SkinColor.text1)
 
             Spacer().frame(height: 7)
 
-            Text("把照片拖到这里，或点右上角导入。")
+            Text("照片和视频都在同一个库里，导入后点卡片进入显影台。")
                 .font(.skin(12))
                 .foregroundStyle(SkinColor.text3)
 
             Spacer().frame(height: 12)
 
-            Text("RAW · TIFF · PNG · JPEG")
+            Text("RAW · TIFF · PNG · JPEG · MOV · MP4")
                 .font(.skin(9).monospacedDigit())
                 .tracking(1.3)
                 .foregroundStyle(SkinColor.text4)
@@ -735,7 +763,7 @@ private struct LibraryEmptyView: View {
             Spacer().frame(height: 20)
 
             HStack(spacing: 8) {
-                SkinButton("导入照片", icon: "square.and.arrow.down", kind: .primary) { actions.importPhotos() }
+                SkinButton("导入媒体", icon: "square.and.arrow.down", kind: .primary) { actions.importMedia() }
                 SkinButton("导入文件夹", icon: "folder", kind: .secondary) { actions.importFolder() }
             }
         }

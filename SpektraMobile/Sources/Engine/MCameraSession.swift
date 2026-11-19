@@ -13,6 +13,12 @@ struct MCameraCaptureMeta: Equatable {
     var exposureBias: Double = 0
     /// nil 表示自动白平衡。
     var temperature: Int?
+    /// 快门瞬间的握持方向：横拍为 true。成片画幅据此决定，
+    /// 不依赖解码后像素的宽高（RAW 的 EXIF 转正会让像素方向判断失准）。
+    var capturedLandscape: Bool = false
+    /// 前置 + 「镜像前置相机」开：成片镜像为取景所见（预览默认就是镜子），
+    /// RAW 原片保持原始数据。缩略图与直出渲染都按这个标志翻转。
+    var mirrorFront: Bool = false
 }
 
 /// 一次 RAW 拍摄的结果：临时 DNG 文件 + 取景器里用的缩略图。
@@ -36,14 +42,13 @@ final class MCameraSession: NSObject, ObservableObject {
     }
 
     enum FlashMode: String, CaseIterable, Identifiable {
-        case off, auto, on
+        case off, on
 
         var id: String { rawValue }
 
         var title: String {
             switch self {
             case .off: return "关闭"
-            case .auto: return "自动"
             case .on: return "开启"
             }
         }
@@ -51,21 +56,31 @@ final class MCameraSession: NSObject, ObservableObject {
         var symbol: String {
             switch self {
             case .off: return "bolt.slash"
-            case .auto: return "bolt"
             case .on: return "bolt.fill"
             }
         }
     }
 
-    /// 取景器里的焦段按钮：焦距与相对主摄的倍数都从真实摄像头读取，
-    /// 不同机型会得到各自的光学焦段（如 13/26/77 或 13/24/120）。
+    /// 取景器里的焦段按钮：光学焦段从真实摄像头读取，
+    /// 不同机型会得到各自的光学焦段（如 13/26/77 或 13/24/120）；
+    /// 光学档位之间再按主摄裁切补 2×、4× 虚拟焦段（48 MP 机型的 2×
+    /// 与系统相机的原生主摄裁切是同一条路径）。
     struct Lens: Identifiable, Equatable {
-        /// 物理摄像头的 uniqueID。
+        /// 物理摄像头的 uniqueID；裁切焦段用 "crop-倍数" 合成 id。
         let id: String
         /// 35mm 等效焦距。
         let focal: Int
         /// 相对主摄的显示倍数。
         let zoom: CGFloat
+        /// 选中时要在源摄像头上设置的 videoZoomFactor；光学镜头为 1。
+        let crop: CGFloat
+
+        init(id: String, focal: Int, zoom: CGFloat, crop: CGFloat = 1) {
+            self.id = id
+            self.focal = focal
+            self.zoom = zoom
+            self.crop = crop
+        }
 
         static let placeholder = Lens(id: "wide", focal: 26, zoom: 1)
 
@@ -95,8 +110,10 @@ final class MCameraSession: NSObject, ObservableObject {
     @Published private(set) var isCapturing = false
     @Published private(set) var rawAvailable = false
     @Published private(set) var hasFlash = false
-    /// 当前机型真实可用的光学焦段，由 DiscoverySession 枚举生成。
+    /// 光学焦段（DiscoverySession 枚举）+ 主摄裁切焦段（2×/4×）合并后的按钮列表。
     @Published private(set) var availableLenses: [Lens] = [.placeholder]
+    /// 当前摄像头可输出的最大照片长边（含 48 MP 高分辨率模式），直出分辨率档位用。
+    @Published private(set) var maxPhotoEdge: Int = 0
     /// 正在换物理镜头：交换输入期间禁止快门。
     @Published private(set) var isSwitchingLens = false
     @Published private(set) var zoom: CGFloat = 1
@@ -257,12 +274,14 @@ final class MCameraSession: NSObject, ObservableObject {
             let lensMap = self.pendingLensDevices
             let currentLens = self.pendingLens(for: self.device)
             let wide = self.pendingWideDevice
+            let maxEdge = self.device.map(Self.maxPhotoLongEdge) ?? 0
 
             DispatchQueue.main.async {
                 self.rawFormat = format
                 self.rawAvailable = format != nil
                 self.hasFlash = flash
                 self.maxZoom = zoomLimit
+                self.maxPhotoEdge = maxEdge
                 if firstConfigure {
                     // wideDevice 只在主线程写：sessionQueue 的结果经 pending 值发布过来。
                     self.wideDevice = wide
@@ -374,8 +393,35 @@ final class MCameraSession: NSObject, ObservableObject {
             mapping[wide.uniqueID] = wide
         }
 
+        // 在主摄上补裁切变焦：光学档位之间（如 1× 与 3×/5× 之间）插 2×，
+        // 只有主摄的老机型在主摄变焦范围内补到 4×。已有接近倍数的光学镜头就不补。
+        let wideMaxZoom = max(1, wide.activeFormat.videoMaxZoomFactor)
+        let maxOptical = lenses.map { $0.zoom }.max() ?? 1
+        for factor: CGFloat in [2, 4] {
+            let id = "crop-\(Int(factor))"
+            guard factor <= wideMaxZoom, !failed.contains(id) else { continue }
+            guard !lenses.contains(where: { abs($0.zoom - factor) < factor * 0.25 }) else { continue }
+            if maxOptical > 1.25 {
+                // 裁切档位必须明显低于最高的光学档位，否则不如直接用光学。
+                guard factor < maxOptical * 0.8 else { continue }
+            }
+            lenses.append(Lens(id: id, focal: Int((baseFocal * factor).rounded()),
+                               zoom: factor, crop: factor))
+            mapping[id] = wide
+        }
+
         lenses.sort { $0.focal < $1.focal }
         return (lenses, mapping)
+    }
+
+    /// 摄像头可输出的最大照片长边：当前格式支持的尺寸档位取最大
+    /// （48 MP 机型这里会包含 8064×6048，普通机型是 4032×3024）。
+    static func maxPhotoLongEdge(of device: AVCaptureDevice) -> Int {
+        var edge = 0
+        for dims in device.activeFormat.supportedMaxPhotoDimensions {
+            edge = max(edge, max(Int(dims.width), Int(dims.height)))
+        }
+        return edge
     }
 
     /// 用水平视场角折算 35mm 等效焦距：f = 18 / tan(FOV / 2)。
@@ -400,27 +446,26 @@ final class MCameraSession: NSObject, ObservableObject {
         if hasFlash {
             let mode = flash.avMode
             if photoOutput.supportedFlashModes.contains(mode) {
-                if flash == .auto, !photoOutput.isFlashScene {
-                    // 自动档在亮场景不触发是系统行为；明示出来，免得以为开关坏了。
-                    message = "自动闪光：场景亮度足够，本次未触发闪光"
-                } else {
-                    settings.flashMode = mode
-                }
+                settings.flashMode = mode
             } else if flash == .on {
                 message = "当前设备或模式不支持强制闪光"
             }
         }
 
+        // 拍摄瞬间的重力方向决定出片朝向：横屏拍的 DNG 在快门那一刻就按重力转正，
+        // 显影台拿到的是正图，不需要再手动旋转。
+        let angle = Self.captureRotationAngle(for: UIDevice.current.orientation)
+        // 横拍（0° / 180°）记为横向，成片画幅据此把所选比例旋转过来：
+        // 9:16 横拍输出 16:9 横幅。竖向只认 90°/270°，flat 等中间态回退竖幅。
+        let capturedLandscape = angle == 0 || angle == 180
         let delegate = MCaptureDelegate(
-            meta: MCameraCaptureMeta(exposureBias: exposureBias, temperature: temperature)
+            meta: MCameraCaptureMeta(exposureBias: exposureBias, temperature: temperature,
+                                     capturedLandscape: capturedLandscape,
+                                     mirrorFront: isFront && MobileSettings.cameraMirrorFront)
         ) { [weak self] result in
             DispatchQueue.main.async { self?.finish(result) }
         }
         captureDelegate = delegate
-
-        // 拍摄瞬间的重力方向决定出片朝向：横屏拍的 DNG 在快门那一刻就按重力转正，
-        // 显影台拿到的是正图，不需要再手动旋转。
-        let angle = Self.captureRotationAngle(for: UIDevice.current.orientation)
         sessionQueue.async { [photoOutput] in
             if let connection = photoOutput.connection(with: .video) {
                 if #available(iOS 17.0, *) {
@@ -497,7 +542,7 @@ final class MCameraSession: NSObject, ObservableObject {
         flash = all[(index + 1) % all.count]
     }
 
-    /// 选焦段：每个按钮都对应一颗真实摄像头，切换后使用该镜头的原生倍率。
+    /// 选焦段：光学按钮对应一颗真实摄像头，裁切按钮落在主摄的变焦倍率上。
     func select(_ lens: Lens) {
         #if os(iOS)
         guard !isSwitchingLens, let target = lensDevices[lens.id] else { return }
@@ -513,14 +558,15 @@ final class MCameraSession: NSObject, ObservableObject {
     private func applyNativeZoom(for lens: Lens) {
         guard let device else { return }
         let limit = max(1, device.activeFormat.videoMaxZoomFactor)
+        let factor = min(max(1, lens.crop), limit)
         do {
             try device.lockForConfiguration()
-            device.videoZoomFactor = 1
+            device.videoZoomFactor = factor
             device.unlockForConfiguration()
         } catch {
             return
         }
-        zoom = 1
+        zoom = device.videoZoomFactor
         maxZoom = limit
         self.lens = lens
     }
@@ -582,13 +628,15 @@ final class MCameraSession: NSObject, ObservableObject {
             }
 
             let limit = max(1, target.activeFormat.videoMaxZoomFactor)
+            let factor = min(max(1, lens.crop), limit)
             do {
                 try target.lockForConfiguration()
-                target.videoZoomFactor = 1
+                target.videoZoomFactor = factor
                 target.unlockForConfiguration()
             } catch {
-                // 输入已经切好，倍率保持 1× 也能拍。
+                // 输入已经切好，倍率保持现状也能拍。
             }
+            let appliedZoom = target.videoZoomFactor
 
             DispatchQueue.main.async {
                 guard self.lensSwitchToken == token else { return }
@@ -598,7 +646,8 @@ final class MCameraSession: NSObject, ObservableObject {
                 self.rawAvailable = true
                 self.hasFlash = target.hasFlash
                 self.maxZoom = limit
-                self.zoom = 1
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: target)
+                self.zoom = appliedZoom
                 self.lens = lens
             }
         }
@@ -674,6 +723,7 @@ final class MCameraSession: NSObject, ObservableObject {
                 }
                 self.hasFlash = wide.hasFlash
                 self.maxZoom = limit
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: wide)
                 self.zoom = 1
                 self.applyWideLensState()
             }
@@ -753,6 +803,7 @@ final class MCameraSession: NSObject, ObservableObject {
                 self.rawAvailable = true
                 self.hasFlash = next.hasFlash
                 self.maxZoom = next.activeFormat.videoMaxZoomFactor
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: next)
                 self.availableLenses = built.lenses
                 self.lensDevices = built.devices
                 self.lens = built.lenses.first(where: { $0.id == next.uniqueID }) ?? .placeholder
@@ -936,7 +987,6 @@ private extension MCameraSession.FlashMode {
     var avMode: AVCaptureDevice.FlashMode {
         switch self {
         case .off: return .off
-        case .auto: return .auto
         case .on: return .on
         }
     }
@@ -977,7 +1027,10 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
             completion(.failure(error))
             return
         }
-        completion(.success(MCameraShot(url: url, thumbnail: Self.thumbnail(url: url), meta: meta)))
+        completion(.success(MCameraShot(
+            url: url,
+            thumbnail: Self.thumbnail(url: url, mirrored: meta.mirrorFront),
+            meta: meta)))
     }
 
     /// 出片前就失败（如采集被中断）时只会回调这里；不复位的话 `isCapturing` 会永远卡住。
@@ -997,7 +1050,8 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     }
 
     /// 只读 DNG 内嵌预览，避免为了取景器缩略图去解码整张 RAW。
-    private static func thumbnail(url: URL) -> MPlatformImage? {
+    /// 前置镜像拍摄时把缩略图翻成预览所见，成片渲染同样会镜像，两边一致。
+    private static func thumbnail(url: URL, mirrored: Bool) -> MPlatformImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             // 先用 DNG 内嵌的小预览；只有缺失时才解整张 RAW，避免快门后立刻吃一大块内存。
@@ -1008,7 +1062,10 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
             return nil
         }
-        return MImage.make(cgImage: image)
+        guard mirrored, let flipped = image.mirroredHorizontally else {
+            return MImage.make(cgImage: image)
+        }
+        return MImage.make(cgImage: flipped)
     }
 }
 #endif

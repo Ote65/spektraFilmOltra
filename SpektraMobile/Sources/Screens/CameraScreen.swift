@@ -9,6 +9,11 @@ private enum MDirectCardPhase {
     case developing
     case ready(MDirectRenderResult)
     case failed(String)
+
+    var isDeveloping: Bool {
+        if case .developing = self { return true }
+        return false
+    }
 }
 
 /// 拍摄页：4:3 取景 + iOS 风格快门。
@@ -34,7 +39,6 @@ struct CameraScreen: View {
     @AppStorage("mobile.camera.grid") private var gridEnabled = false
     @AppStorage(MobileSettings.cameraLevelKey) private var levelEnabled = true
     @AppStorage(MobileSettings.cameraVolumeShutterKey) private var volumeShutter = true
-    @AppStorage(MobileSettings.cameraMirrorFrontKey) private var mirrorFront = false
     @AppStorage(MobileSettings.cameraEnterDevelopKey) private var enterDevelopAfterShot = true
 
     @State private var timerMenuOpen = false
@@ -49,6 +53,20 @@ struct CameraScreen: View {
     @State private var directLongPressed = false
     @State private var directCard: MDirectCardPhase?
     @State private var directProgress: Double = 0
+    /// 显影进度条的丝滑显示值：真实进度分段跳变时向目标缓动，避免细条瞬跳。
+    @State private var directEasedProgress: Double = 0
+    /// 缓动任务句柄：切卡片 / 重拍时取消，避免旧任务回调覆盖新一次显影。
+    @State private var directEaseTask: Task<Void, Never>?
+    /// 上一次给过触感的百分比位：数字每滚过一格（每 1%）轻点一次，像拨轮滚动。
+    @State private var directHapticPercent: Int = 0
+    /// 复用的最轻选择触感发生器：频繁触发时必须持有实例，否则每次新建会被系统丢弃不振动。
+    #if os(iOS)
+    private static let progressHaptic = UISelectionFeedbackGenerator()
+    #endif
+    /// 本次直出快门瞬间的握持方向：横拍为 true，驱动成片与 cropData 的画幅旋转。
+    @State private var directCapturedLandscape: Bool = false
+    /// 本次直出是否为前置镜像拍摄：成片与 cropData 的 flippedH 都按它翻转。
+    @State private var directMirrorFront: Bool = false
     @State private var directPhoto: MPlatformImage?
     @State private var directPreviewToken = 0
     @State private var directRawURL: URL?
@@ -71,6 +89,49 @@ struct CameraScreen: View {
     @State private var directBorderPanelHeight: CGFloat = 480
     /// 未加片边的成片预览：换片边时只重合成这一张，不重新显影。
     @State private var directPreviewCG: CGImage?
+    /// 直出画幅比例：拍摄仍是 RAW 全幅，渲染时居中裁切，并写进 cropData。
+    @AppStorage("m.directAspect") private var directAspectRaw: String = MDirectAspect.portrait3_4.rawValue
+    /// 直出分辨率档位：按总像素显示，渲染时按目标长边解码。
+    @AppStorage("m.directResolution") private var directResolutionRaw: String = MDirectResolution.maximum.rawValue
+    /// 画幅 / 分辨率菜单是否展开：展开后徽标移到左端，选项占据右侧。
+    @State private var aspectPanelOpen = false
+    /// 徽标实测宽度：展开时用它给左侧徽标精确让位。
+    @State private var aspectBadgeWidth: CGFloat = 90
+    /// 选中块在两条选项胶囊之间滑动的几何匹配命名空间。
+    @Namespace private var aspectSlideSpace
+
+    private var directAspect: MDirectAspect {
+        MDirectAspect(rawValue: directAspectRaw) ?? .portrait3_4
+    }
+
+    private var directResolution: MDirectResolution {
+        MDirectResolution(rawValue: directResolutionRaw) ?? .maximum
+    }
+
+    /// 传感器撑不起所选档位时（如切到前置）退回 MAX，避免放大出图。
+    private var effectiveResolution: MDirectResolution {
+        let edge = camera.maxPhotoEdge
+        if edge > 0, !directResolution.available(forMaxEdge: edge) { return .maximum }
+        return directResolution
+    }
+
+    /// 分辨率菜单：传感器尺寸未知时先全量展示，就绪后按最大长边过滤。
+    private var selectableResolutions: [MDirectResolution] {
+        let edge = camera.maxPhotoEdge
+        guard edge > 0 else { return MDirectResolution.allCases }
+        return MDirectResolution.allCases.filter { $0.available(forMaxEdge: edge) }
+    }
+
+    /// 取景框长宽比（宽/高）：跟随所选画幅，非直出模式保持传感器 3:4 竖幅。
+    private var finderRatio: CGFloat {
+        guard directMode else { return 3.0 / 4.0 }
+        return CGFloat(directAspect.ratio)
+    }
+
+    /// 只有 9:16 需要放大到贴住底部按钮上沿，其余比例在可用区域内居中。
+    private var finderBottomAligned: Bool {
+        directMode && directAspect == .portrait9_16
+    }
 
     @State private var flashOpacity: Double = 0
     @State private var focusMark: CGPoint?
@@ -93,15 +154,40 @@ struct CameraScreen: View {
 
             // 显影独立页：不再把相机取景留在背后。相机已 stop，黑色背景只承载相纸与进度。
             if directCard == nil {
-                VStack(spacing: 0) {
+                // 根视图忽略了安全区，这里手动让出状态栏：取景槽从状态栏下沿开始，
+                // 顶栏按钮恢复原位（状态栏下 4pt）悬浮在取景框内。
+                // 9:16 放大到贴住底部三按钮上沿，其余比例在槽内居中。
+                ZStack(alignment: .top) {
+                    VStack(spacing: 0) {
+                        GeometryReader { _ in
+                            ZStack(alignment: finderBottomAligned ? .bottom : .center) {
+                                Color.black
+                                viewfinder
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
+                            .overlay(alignment: .bottom) {
+                                lensBar
+                                    .padding(.bottom, 10)
+                            }
+                            // 菜单展开时，点取景框任意位置收回顶栏。
+                            .overlay {
+                                if aspectPanelOpen {
+                                    Color.black.opacity(0.001)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            withAnimation(Self.topBarSlide) { aspectPanelOpen = false }
+                                        }
+                                }
+                            }
+                        }
+
+                        controlRow
+                            .frame(height: 60)
+                        bottomRow
+                    }
+                    .padding(.top, insets.top)
+
                     topBar
-                    Spacer(minLength: 0)
-                    viewfinder
-                    controlRow
-                        .frame(height: 72)
-                        .padding(.top, 22)
-                    Spacer(minLength: 20)
-                    bottomRow
                 }
 
                 Color.white
@@ -130,12 +216,17 @@ struct CameraScreen: View {
         }
         .coordinateSpace(name: "cameraRoot")
         .onPreferenceChange(MDirectButtonFrameKey.self) { directButtonFrame = $0 }
+        .onPreferenceChange(MTopBadgeWidthKey.self) { aspectBadgeWidth = $0 }
         .background(MColor.canvas)
         .preferredColorScheme(.dark)
         .onAppear {
             camera.start()
             syncLevelMonitor()
             normalizeDirectSelection()
+            // 旧版本存过已下线的画幅（全幅 / 4:3 / 16:9）：回落到 3:4。
+            if MDirectAspect(rawValue: directAspectRaw) == nil {
+                directAspectRaw = MDirectAspect.portrait3_4.rawValue
+            }
             showDebugDirectImageIfNeeded()
             if DebugLaunch.directPicker {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
@@ -186,62 +277,176 @@ struct CameraScreen: View {
             default: badgeAngle = 0
             }
         }
+        .onChange(of: directProgress) { _, value in
+            easeDirectProgress(to: value)
+        }
+        .onDisappear { directEaseTask?.cancel() }
     }
 
     // MARK: - 顶栏
 
     private var topBar: some View {
-        ZStack {
-            HStack(spacing: 8) {
-                Button {
-                    onClose()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(MColor.text1)
-                        .frame(width: 38, height: 38)
-                        .background(Circle().fill(Color.white.opacity(0.08)))
-                }
-                .buttonStyle(MPressStyle(scale: 0.9))
-                .accessibilityLabel("关闭相机")
-
-                Spacer()
-
-                rawBadge
-            }
-
-            // 工具按钮整体居中，RAW 标签仍在右侧。
-            HStack(spacing: 8) {
-                cameraToolButton(icon: "timer", active: timerSeconds > 0,
-                                 badge: timerSeconds > 0 ? "\(timerSeconds)s" : nil,
-                                 label: timerMenuOpen ? "收起计时器菜单" : "拍摄计时器") {
-                    withAnimation(MMotion.pill) { timerMenuOpen.toggle() }
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                // 关闭按钮：菜单展开后让位给徽标。
+                if !aspectPanelOpen {
+                    closeButton
+                        .transition(.opacity)
                 }
 
-                if timerMenuOpen {
-                    timerMenuRow
-                        .transition(.asymmetric(
-                            insertion: .scale(scale: 0.45, anchor: .leading)
-                                .combined(with: .opacity),
-                            removal: .scale(scale: 0.45, anchor: .leading)
-                                .combined(with: .opacity)
-                        ))
-                } else {
-                    cameraToolButton(icon: "square.grid.3x3", active: gridEnabled,
-                                     label: gridEnabled ? "关闭网格线" : "显示网格线") {
-                        withAnimation(MMotion.quick) { gridEnabled.toggle() }
+                // 工具按钮绝对居中，不随左右内容变化偏移。
+                if !aspectPanelOpen {
+                    HStack(spacing: 8) {
+                        cameraToolButton(icon: "timer", active: timerSeconds > 0,
+                                         badge: timerSeconds > 0 ? "\(timerSeconds)s" : nil,
+                                         label: timerMenuOpen ? "收起计时器菜单" : "拍摄计时器") {
+                            withAnimation(MMotion.pill) { timerMenuOpen.toggle() }
+                        }
+
+                        if timerMenuOpen {
+                            timerMenuRow
+                                .transition(.asymmetric(
+                                    insertion: .scale(scale: 0.45, anchor: .leading)
+                                        .combined(with: .opacity),
+                                    removal: .scale(scale: 0.45, anchor: .leading)
+                                        .combined(with: .opacity)
+                                ))
+                        } else {
+                            cameraToolButton(icon: "square.grid.3x3", active: gridEnabled,
+                                             label: gridEnabled ? "关闭网格线" : "显示网格线") {
+                                withAnimation(MMotion.quick) { gridEnabled.toggle() }
+                            }
+
+                            directModeButton
+                        }
                     }
+                    .animation(MMotion.pill, value: timerMenuOpen)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .transition(.opacity)
+                }
 
-                    directModeButton
+                // 画幅徽标：收起时停在右端；展开时滑到左端，右侧让给选项行。
+                if directMode {
+                    aspectBadgeButton
+                        .offset(x: aspectPanelOpen
+                                ? 0
+                                : max(0, geo.size.width - aspectBadgeWidth))
+                        .zIndex(1)
+                } else {
+                    rawBadge
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+
+                if directMode, aspectPanelOpen {
+                    aspectMenuOptions
+                        .padding(.leading, aspectBadgeWidth + 8)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
-            .animation(MMotion.pill, value: timerMenuOpen)
         }
-        .padding(.horizontal, 16)
-        // 先定 44pt 内容高度，再加安全区上边距；顺序反过来会让 51pt 的 padding
-        // 被 44pt 的 frame 居中压缩，按钮实际会跑到状态栏 / 灵动岛下面。
+        // 根视图忽略了安全区：顶栏按真实安全区下移，回到原来的位置。
         .frame(height: 44)
+        .padding(.horizontal, 16)
         .padding(.top, insets.top + 4)
+    }
+
+    private var closeButton: some View {
+        Button {
+            onClose()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(MColor.text1)
+                .frame(width: 38, height: 38)
+                .background(Circle().fill(Color.white.opacity(0.08)))
+        }
+        .buttonStyle(MPressStyle(scale: 0.9))
+        .accessibilityLabel("关闭相机")
+    }
+
+    /// 画幅按钮：收起时停在右端，展开后移动到左端成为菜单标题。
+    private var aspectBadgeButton: some View {
+        Button {
+            MHaptic.tick()
+            withAnimation(Self.topBarSlide) {
+                aspectPanelOpen.toggle()
+                if aspectPanelOpen { timerMenuOpen = false }
+            }
+        } label: {
+            // 命中区是整个 44pt 方块，不是文字或胶囊轮廓：
+            // 用户点在图标、留白、边角都必须响应。
+            aspectBadge
+                .frame(height: 44)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: MTopBadgeWidthKey.self, value: proxy.size.width)
+            }
+        )
+        .accessibilityLabel("画幅与直出分辨率")
+    }
+
+    /// 展开后的选项：两条长胶囊，类别用矢量图标标注，选中块像变焦条一样滑动。
+    private var aspectMenuOptions: some View {
+        HStack(spacing: 6) {
+            aspectSegment(icon: "crop", slideID: "aspect",
+                          items: MDirectAspect.allCases.map(\.label),
+                          selectedIndex: MDirectAspect.allCases.firstIndex(of: directAspect) ?? 0) { index in
+                directAspectRaw = MDirectAspect.allCases[index].rawValue
+            }
+
+            aspectSegment(icon: "arrow.up.left.and.arrow.down.right", slideID: "resolution",
+                          items: selectableResolutions.map(\.label),
+                          selectedIndex: selectableResolutions.firstIndex(of: effectiveResolution) ?? 0) { index in
+                directResolutionRaw = selectableResolutions[index].rawValue
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 一条长胶囊：左侧矢量图标标类别，选项等宽铺满，选中块用几何匹配滑动。
+    private func aspectSegment(icon: String, slideID: String,
+                               items: [String], selectedIndex: Int,
+                               pick: @escaping (Int) -> Void) -> some View {
+        HStack(spacing: 2) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(MColor.text3)
+                .frame(width: 20, height: 30)
+
+            ForEach(items.indices, id: \.self) { index in
+                let selected = index == selectedIndex
+                Button {
+                    MHaptic.tick()
+                    pick(index)
+                } label: {
+                    Text(items[index])
+                        .font(.mSans(10, .semibold).monospacedDigit())
+                        .foregroundStyle(selected ? MColor.brassInk : MColor.text1)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 30)
+                        .background {
+                            if selected {
+                                Capsule()
+                                    .fill(MColor.brass)
+                                    .padding(.vertical, 2)
+                                    .matchedGeometryEffect(id: slideID, in: aspectSlideSpace)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(items[index])
+            }
+        }
+        .padding(3)
+        .background(Capsule().fill(Color.black.opacity(0.45)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
     }
 
     /// Spektra 只拍 RAW：这里只做状态显示，不提供开关。
@@ -261,6 +466,27 @@ struct CameraScreen: View {
         .frame(height: 28)
         .background(Capsule().fill(Color.white.opacity(0.07)))
         .accessibilityLabel("正在拍 RAW")
+    }
+
+    /// 直出模式的画幅按钮：与 RAW 标签同位同尺寸，显示当前比例。
+    private var aspectBadge: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "crop")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(MColor.brass)
+            Text(directAspect.label)
+                .font(.mSans(10, .semibold))
+                .foregroundStyle(MColor.text1)
+            Text(effectiveResolution.label)
+                .font(.mSans(10, .semibold))
+                .foregroundStyle(MColor.brassHigh)
+        }
+        .padding(.horizontal, 10)
+        // 与右侧画幅 / 分辨率长胶囊同高（30 + 上下 3pt 内边距）。
+        .frame(height: 36)
+        .background(Capsule().fill(Color.white.opacity(0.07)))
+        .allowsHitTesting(false)
+        .accessibilityLabel("画幅比例 \(directAspect.label)")
     }
 
     private func cameraToolButton(icon: String, active: Bool, badge: String? = nil,
@@ -306,6 +532,7 @@ struct CameraScreen: View {
             MHaptic.tick()
             withAnimation(MMotion.quick) {
                 directMode.toggle()
+                if !directMode { aspectPanelOpen = false }
             }
             if directMode {
                 showHint("长按选择预设")
@@ -418,6 +645,18 @@ struct CameraScreen: View {
             Color.black
 
             preview
+                // 黑白预设时取景框实时去色：纯 GPU 显示滤镜，不碰 RAW、不烧录，
+                // 切回彩色预设立刻恢复。只作用于画面，覆盖层（网格/水平仪/对焦框）保持原色。
+                .grayscale(directPresetIsMono ? 1 : 0)
+                .animation(.easeInOut(duration: 0.25), value: directPresetIsMono)
+
+            // 预设色彩参考：一层极淡的代表色罩，给色调方向感（纯屏幕合成，不烧录）。
+            // 放在画面之上、UI 覆盖层之下，网格/水平仪/对焦框不被染色。
+            if let tint = directPresetTint {
+                tint
+                    .allowsHitTesting(false)
+                    .animation(.easeInOut(duration: 0.25), value: directPresetIsMono)
+            }
 
             if gridEnabled {
                 gridOverlay
@@ -449,24 +688,20 @@ struct CameraScreen: View {
             }
             .allowsHitTesting(false)
 
-            VStack {
-                Spacer()
-                lensBar
-                    .padding(.bottom, 12)
-            }
-
             noticeCard
         }
         .animation(MMotion.state, value: levelEnabled)
         .animation(MMotion.state, value: camera.permission)
-        // 传感器是 4:3，竖着拿就是 3:4：取景框按 3:4 才和默认相机一致，不会上下裁掉一大截。
-        .aspectRatio(3.0 / 4.0, contentMode: .fit)
+        // 默认按传感器 3:4 竖幅；直出选了画幅比例后取景框跟着变。
+        .aspectRatio(finderRatio, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
         )
         .padding(.horizontal, 12)
+        .animation(MMotion.pill, value: directAspectRaw)
+        .animation(MMotion.pill, value: directMode)
     }
 
     @ViewBuilder
@@ -475,7 +710,6 @@ struct CameraScreen: View {
         if camera.permission == .authorized, camera.unusableReason == nil {
             MCameraPreview(
                 session: camera.session,
-                mirrorPreview: mirrorFront && camera.isFront,
                 volumeShutter: volumeShutter,
                 onVolumeShutter: { capture() },
                 onTap: { devicePoint, viewPoint in
@@ -608,7 +842,8 @@ struct CameraScreen: View {
                     icon: camera.flash.symbol,
                     label: camera.flash.title,
                     active: camera.flash != .off,
-                    enabled: camera.isRawReady && camera.hasFlash
+                    enabled: camera.isRawReady && camera.hasFlash,
+                    showsLabel: false
                 ) {
                     MHaptic.tick()
                     camera.cycleFlash()
@@ -620,7 +855,8 @@ struct CameraScreen: View {
 
     private func axisButton(_ axis: MCaptureAxis, icon: String,
                             label: String, active: Bool) -> some View {
-        MCaptureControl(icon: icon, label: label, active: active, enabled: camera.isRawReady) {
+        MCaptureControl(icon: icon, label: label, active: active,
+                        enabled: camera.isRawReady, showsLabel: false) {
             MHaptic.tick()
             scaleValue = axis.seedValue(temperature: camera.temperature,
                                         exposure: camera.exposureBias)
@@ -672,7 +908,10 @@ struct CameraScreen: View {
             .accessibilityLabel("翻转相机")
         }
         .padding(.horizontal, 30)
-        .padding(.bottom, max(14, insets.bottom))
+        // 快门栏与三按钮栏之间补 10pt：三按钮上移、快门留在原位（已比原来低 10pt），
+        // 变焦条↔三按钮、三按钮↔快门都变成 17pt。
+        .padding(.top, 10)
+        .padding(.bottom, max(10, insets.bottom - 10))
     }
 
     /// 只显示本次拍摄的照片：`lastShot` 随这个页面一起创建 / 销毁。
@@ -722,6 +961,8 @@ struct CameraScreen: View {
         }
         .buttonStyle(MPressStyle(scale: 0.9))
         .disabled(!camera.canCapture)
+        // 色温 / 曝光刻度条展开时快门缩小 10%，给刻度条让出空间。
+        .scaleEffect(activeAxis == nil ? 1 : 0.9)
         .accessibilityLabel("拍照")
     }
 
@@ -839,6 +1080,45 @@ struct CameraScreen: View {
         MDevelopPresetStore.shared.preset(id: directDevelopID)
     }
 
+    /// 直出当前选的显影预设是否为黑白：用于取景框实时去色预览（纯显示滤镜，不烧录）。
+    private var directPresetIsMono: Bool {
+        guard directMode else { return false }
+        if let user = selectedDevelopUser { return user.monochrome }
+        return selectedDevelopBuiltin?.monochrome == true
+    }
+
+    /// 取景框的预设色彩参考：一层很淡的代表色罩，只给色调方向感，不是精确成片色。
+    /// 纯 GPU 屏幕合成，不碰 RAW、不烧录。黑白预设返回 nil（已单独去色）。
+    private var directPresetTint: Color? {
+        guard directMode, !directPresetIsMono else { return nil }
+        let filmID: String
+        var temperature: Double = 0
+        if let user = selectedDevelopUser {
+            filmID = user.filmID
+            // 用户预设的色温若存在，作为暖/冷微调。
+            if case .number(let t)? = user.pro["temperature"] { temperature = t }
+        } else if let builtin = selectedDevelopBuiltin {
+            filmID = builtin.filmID
+            temperature = builtin.quick["temperature"] ?? 0
+        } else {
+            return nil
+        }
+        // 色温优先：明显暖/冷时按色温给色罩，否则按胶片的典型倾向。
+        if temperature >= 8 {
+            return Color(hex: 0xE8A765).opacity(0.13)     // 暖：淡橙
+        }
+        if temperature <= -6 {
+            return Color(hex: 0x7FB8C4).opacity(0.12)     // 冷：淡青
+        }
+        switch filmID {
+        case "kodak_vision3_500t": return Color(hex: 0x6F9E8E).opacity(0.13)  // 电影夜色：青绿
+        case "kodak_portra_400", "kodak_portra_800": return Color(hex: 0xE0B185).opacity(0.10)  // 波特拉：暖
+        case "kodak_ektar_100": return Color(hex: 0xE6C48A).opacity(0.10)      // 伊克塔：鲜艳偏暖
+        case "fujifilm_pro_400h": return Color(hex: 0x9FC3C0).opacity(0.10)    // 富士：冷净
+        default: return nil
+        }
+    }
+
     private var selectedGradePreset: GradePreset? {
         GradePresetStore.shared.all.first { $0.id == directGradeID }
             ?? GradePresetStore.shared.preset(id: "builtin:neutral")
@@ -891,6 +1171,9 @@ struct CameraScreen: View {
 
     /// 预设面板的渐显：短促的淡入淡出，不做缩放。
     private static let directPickerFade = Animation.easeOut(duration: 0.18)
+
+    /// 顶栏横移：四段贝塞尔（快出慢收），横移过程不带弹簧过冲。
+    private static let topBarSlide = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.42)
 
     private func directPickerPanel(cardWidth: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1215,16 +1498,26 @@ struct CameraScreen: View {
                     VStack(spacing: 12) {
                         switch phase {
                         case .developing:
-                            VStack(spacing: 8) {
-                                ProgressView(value: min(max(directProgress, 0), 1))
-                                    .progressViewStyle(.linear)
-                                    .tint(MColor.brass)
-                                    .frame(width: 176)
-                                Text("正在显影 \(Int(min(max(directProgress, 0), 1) * 100))%")
-                                    .font(.mSans(10, .medium).monospacedDigit())
-                                    .foregroundStyle(MColor.text2)
+                            // 照搬调色台导出的两拍动效：大号滚动百分比 → 白色对勾。
+                            // 不显示进度条。整数位变化才滚动，完成瞬间切对勾 bounce。
+                            Group {
+                                if directDisplayPercent >= 100 {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 30, weight: .semibold))
+                                        .foregroundStyle(.white)
+                                        .symbolEffect(.bounce, options: .speed(1.05))
+                                        .transition(.opacity)
+                                } else {
+                                    Text("\(directDisplayPercent)%")
+                                        .font(.system(size: 34, weight: .semibold, design: .rounded))
+                                        .monospacedDigit()
+                                        .foregroundStyle(MColor.text1)
+                                        .contentTransition(.numericText(countsDown: false))
+                                        .animation(.smooth(duration: 0.28), value: directDisplayPercent)
+                                        .transition(.opacity.combined(with: .scale(0.8)))
+                                }
                             }
-                            .frame(height: 52)
+                            .frame(height: 48)
 
                         case .ready(let result):
                             VStack(spacing: 8) {
@@ -1354,6 +1647,18 @@ struct CameraScreen: View {
         }
     }
 
+    /// 相纸相框尺寸：跟随成片画幅，横拍显示横幅相纸、竖拍保持竖幅。
+    /// 这样显影预览图与最终成片是同一构图，不再"预览竖、成片横"。
+    private var directCardSize: (width: CGFloat, height: CGFloat) {
+        let ratio = directAspect.ratio(landscape: directCapturedLandscape)
+        let longSide: CGFloat = 344
+        if ratio >= 1 {  // 横幅：宽固定 344，高 = 宽 / 比例（4:3→258、16:9→193.5）
+            return (longSide, max(120, min(longSide, longSide / CGFloat(ratio))))
+        }
+        // 竖幅：高固定 344，宽 = 高 × 比例（3:4→258、9:16→193.5）
+        return (max(120, min(longSide, longSide * CGFloat(ratio))), longSide)
+    }
+
     /// 白色相纸卡：显影阶段盖一层逐渐褪去的白雾，不打断相机页的其他状态。
     /// 一旦启用片边，就撤掉白色卡纸与内边距，让带片边的画面完整显示，不再被白框遮住。
     private func directPhotoCard(_ phase: MDirectCardPhase) -> some View {
@@ -1361,24 +1666,31 @@ struct CameraScreen: View {
             if case .ready = phase { return directBorder.enabled }
             return false
         }()
+        let card = directCardSize
+        let developing = phase.isDeveloping
+        // 黑白预设时预览也去色，避免显影时显示彩色、成品却是黑白的违和感。
+        let mono = directEdit?.monochrome == true
         return ZStack {
             if let directPhoto {
                 MImage.swiftUI(directPhoto)
                     .resizable()
-                    .aspectRatio(contentMode: framed ? .fit : .fill)
+                    // 缩略图已按成片比例裁好、最终 preview 也是成片比例，用 fit 完整呈现。
+                    .aspectRatio(contentMode: .fit)
+                    .grayscale(mono ? 1 : 0)
                     .id(directPreviewToken)
                     .transition(.opacity)
+
+                if developing {
+                    // 从暗到明：白雾随显影进度褪去，影像逐渐浮现。
+                    Color.white.opacity(max(0.04, 0.92 - directProgress * 0.88))
+                }
             } else {
                 Color(white: 0.93)
-            }
-
-            if case .developing = phase {
-                Color.white.opacity(max(0.05, 0.95 - directProgress * 0.9))
             }
         }
         .animation(MMotion.state, value: directPreviewToken)
         .animation(.linear(duration: 0.16), value: directProgress)
-        .frame(width: framed ? 316 : 258, height: framed ? 380 : 344)
+        .frame(width: framed ? 316 : card.width, height: framed ? 380 : card.height)
         .clipped()
         .padding(.horizontal, framed ? 0 : 9)
         .padding(.top, framed ? 0 : 9)
@@ -1429,6 +1741,46 @@ struct CameraScreen: View {
         }
     }
 
+    /// 显影百分比：只随整数位变化，配合 numericText 滚动，避免亚像素抖动切碎动画。
+    private var directDisplayPercent: Int {
+        Int((min(max(directEasedProgress, 0), 1) * 100).rounded(.down))
+    }
+
+    /// 真实进度按 10% 粗粒度跳变（渲染分段 + 1% 节流），在相邻跳点之间补伪过渡：
+    /// 小步、每步带 ±30% 随机微抖、越接近越慢，让数字一格一格平滑爬过去，
+    /// 而不是从 10% 硬跳到 20%。节奏与调色台导出的 creep 伪进度一致。
+    @MainActor
+    private func easeDirectProgress(to target: Double) {
+        directEaseTask?.cancel()
+        let goal = min(max(target, 0), 1)
+        guard goal - directEasedProgress > 0.002 else {
+            directEasedProgress = max(directEasedProgress, goal)
+            return
+        }
+        directEaseTask = Task { @MainActor in
+            while !Task.isCancelled {
+                let remaining = goal - directEasedProgress
+                if remaining <= 0.002 { directEasedProgress = goal; break }
+                // 每步最多约 1.5 个百分点，数字一格一格地滚，触感与数字严格同步；
+                // 越接近目标越慢 + 随机抖动，走出细微不匀速的滚轮手感。
+                let raw = max(0.0025, remaining * 0.1) * Double.random(in: 0.7...1.3)
+                let step = min(raw, 0.015)
+                directEasedProgress = min(goal, directEasedProgress + step)
+                // 像 iOS 拨轮：数字每往前滚一格就给一次最轻的选择触感，
+                // 持续细密反馈（55ms 一步），而不是每 10% 才点一下。
+                let percent = Int((directEasedProgress * 100).rounded(.down))
+                if percent > directHapticPercent {
+                    directHapticPercent = percent
+                    #if os(iOS)
+                    Self.progressHaptic.selectionChanged()
+                    Self.progressHaptic.prepare()
+                    #endif
+                }
+                try? await Task.sleep(nanoseconds: 42_000_000)
+            }
+        }
+    }
+
     private func beginDirect(_ shot: MCameraShot) {
         guard let gradePreset = selectedGradePreset else {
             showHint("直出预设不可用，请长按直出按钮重新选择")
@@ -1438,14 +1790,28 @@ struct CameraScreen: View {
         let token = directToken
         directSaving = false
         directProgress = 0
+        directEaseTask?.cancel()
+        directEasedProgress = 0
+        directHapticPercent = 0
+        #if os(iOS)
+        Self.progressHaptic.prepare()
+        #endif
+        directCapturedLandscape = shot.meta.capturedLandscape
+        directMirrorFront = shot.meta.mirrorFront
         // 显影是独立页面：立刻停相机与水平仪，把 CPU / 内存留给显影管线。
         camera.stop()
         level.stop()
         directCancel?.cancel()
         let cancel = MDirectRenderToken()
         directCancel = cancel
+        // 显影预览图从一开始就按成片画幅裁好：横拍 9:16 先裁成 16:9 横幅，
+        // 与最终渲染成片同一构图，避免显影全程显示竖幅取景图、完成后才跳成横幅。
+        let targetRatio = directAspect.ratio(landscape: shot.meta.capturedLandscape)
+        let previewThumb = shot.thumbnail?.cgImage?
+            .centerCropped(toAspect: targetRatio).map(MImage.make(cgImage:))
+            ?? shot.thumbnail
         withAnimation(MMotion.state) {
-            directPhoto = shot.thumbnail
+            directPhoto = previewThumb
             directPreviewToken += 1
             directPreviewCG = nil
             directRawURL = shot.url
@@ -1461,7 +1827,13 @@ struct CameraScreen: View {
         ui.merge(gradePreset.recipe, groups: groups)
         let lutPath = groups.contains(.lut) ? gradePreset.recipe.lut.path : ""
         let recipe = ui.gradeRecipe(lutPath: lutPath)
-        let settings = MDirectRenderSettings.fromPreferences()
+        var settings = MDirectRenderSettings.fromPreferences()
+        settings.aspect = directAspect
+        // 快门瞬间的真实朝向是画幅旋转的权威信号，不依赖解码后像素方向。
+        settings.capturedLandscape = shot.meta.capturedLandscape
+        // 前置镜像拍摄：成片翻成取景所见，缩略图与渲染做同一翻转。
+        settings.mirrorOutput = shot.meta.mirrorFront
+        settings.resolution = effectiveResolution
         if settings.downgradedFromEXR {
             showHint("相册不支持 EXR，直出已使用 JPEG")
         }
@@ -1514,27 +1886,45 @@ struct CameraScreen: View {
         }
     }
 
-    /// 渲染真正完成：进度跳 1.0、切成片卡片、触感与降级提示。
+    /// 渲染真正完成：进度跳 1.0、先显示对勾一拍、再切成片卡片。
     @MainActor
     private func presentDirectReady(_ result: MDirectRenderResult) {
+        let token = directToken
         withAnimation(MMotion.state) {
+            // 完成时取消逐格爬升，直接对齐 100%；数字靠 numericText 的 0.28s
+            // 动画滚到 100%，随后 developing 分支自动切出对勾。
+            directEaseTask?.cancel()
+            directEasedProgress = 1
             directProgress = 1
-            if let preview = result.preview {
-                directPreviewCG = preview
-                directPhoto = MImage.make(cgImage: preview)
-                directPreviewToken += 1
-            }
-            directCard = .ready(result)
         }
-        // 成片页沿用记忆里的片边；没有开启时保持无片边。
-        refreshDirectBorderPreview()
-        #if os(iOS)
-        UINotificationFeedbackGenerator().notificationOccurred(.success)
-        #endif
-        if let clamped = result.clampedEdge {
-            showHint("已按内存上限 \(clamped) px 渲染")
-        } else if result.usedFallback {
-            showHint("RAW 解码较慢 · 已使用内嵌预览")
+        // 成功触感分两段：先一记轻点收束进度滚动，再在对勾出现时给成功确认。
+        MHaptic.light()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 280_000_000)
+            guard token == directToken, directCard != nil else { return }
+            #if os(iOS)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            #endif
+        }
+        // 百分比滚到 100% + 对勾各占一拍，共约 0.85s 再切成片卡片。
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 850_000_000)
+            guard token == directToken, directCard != nil else { return }
+            withAnimation(MMotion.state) {
+                if let preview = result.preview {
+                    directPreviewCG = preview
+                    directPhoto = MImage.make(cgImage: preview)
+                    directPreviewToken += 1
+                }
+                directCard = .ready(result)
+            }
+            // 成片页沿用记忆里的片边；没有开启时保持无片边。
+            refreshDirectBorderPreview()
+            if let clamped = result.clampedEdge {
+                showHint("已按内存上限 \(clamped) px 渲染")
+            } else if result.usedFallback {
+                showHint("RAW 解码较慢 · 已使用内嵌预览")
+            }
         }
     }
 
@@ -1543,6 +1933,9 @@ struct CameraScreen: View {
         directCancel?.cancel()
         directCancel = nil
         directToken += 1
+        directEaseTask?.cancel()
+        directEasedProgress = 0
+        directHapticPercent = 0
         if let result { try? FileManager.default.removeItem(at: result.url) }
         if let raw = directRawURL { try? FileManager.default.removeItem(at: raw) }
         withAnimation(MMotion.state) {
@@ -1594,7 +1987,10 @@ struct CameraScreen: View {
         let request = MDirectSaveRequest(rawURL: raw, renderedURL: result.url,
                                          edit: edit, grade: recipe,
                                          border: directBorder,
-                                         baseline: directBaseline)
+                                         baseline: directBaseline,
+                                         aspect: directAspect,
+                                         capturedLandscape: directCapturedLandscape,
+                                         mirrorFront: directMirrorFront)
         Task {
             let outcome = await onDirectSave(request)
             await MainActor.run {
@@ -1632,7 +2028,9 @@ struct CameraScreen: View {
         directOpeningDevelop = true
         let request = MDirectDevelopRequest(
             rawURL: raw, renderedURL: result.url, edit: edit, grade: recipe,
-            baseline: directBaseline)
+            baseline: directBaseline, aspect: directAspect,
+            capturedLandscape: directCapturedLandscape,
+            mirrorFront: directMirrorFront)
         Task {
             let outcome = await onDirectDevelop(request)
             await MainActor.run {
@@ -1657,6 +2055,9 @@ struct CameraScreen: View {
             return
         }
         timerMenuOpen = false
+        if aspectPanelOpen {
+            withAnimation(Self.topBarSlide) { aspectPanelOpen = false }
+        }
         if timerSeconds > 0 {
             startCountdown()
         } else {
@@ -1753,7 +2154,6 @@ struct CameraScreen: View {
 /// AVCaptureVideoPreviewLayer 的 SwiftUI 容器；点击对焦，长按锁定 AE/AF，按住上下拖动改 ISO。
 struct MCameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
-    let mirrorPreview: Bool
     let volumeShutter: Bool
     let onVolumeShutter: () -> Void
     let onTap: (CGPoint, CGPoint) -> Void
@@ -1779,7 +2179,6 @@ struct MCameraPreview: UIViewRepresentable {
         view.onLongPress = onLongPress
         view.onDragBegin = onDragBegin
         view.onISODrag = onISODrag
-        view.setMirrored(mirrorPreview)
         view.setVolumeShutter(enabled: volumeShutter, handler: onVolumeShutter)
     }
 }
@@ -1800,13 +2199,8 @@ final class MPreviewView: UIView {
     /// iOS 17.2 才有的类型：用 AnyObject 存储，避免整个类被标成 17.2+。
     private var captureInteraction: AnyObject?
 
-    /// 镜像只作用于预览；RAW 原片不翻转（DNG 无法无损镜像）。
-    func setMirrored(_ mirrored: Bool) {
-        guard let connection = previewLayer.connection,
-              connection.isVideoMirroringSupported else { return }
-        connection.automaticallyAdjustsVideoMirroring = false
-        connection.isVideoMirrored = mirrored
-    }
+    /// 预览保持 AVFoundation 默认行为：前置自动镜像（像镜子），后置不镜像。
+    /// 「镜像前置相机」设置只决定成片是否翻成预览所见，不再干预预览本身。
 
     func setVolumeShutter(enabled: Bool, handler: @escaping () -> Void) {
         guard #available(iOS 17.2, *) else { return }
@@ -2023,6 +2417,7 @@ private struct MCaptureControl: View {
     let label: String
     let active: Bool
     let enabled: Bool
+    var showsLabel: Bool = true
     let action: () -> Void
 
     var body: some View {
@@ -2040,9 +2435,11 @@ private struct MCaptureControl: View {
                         )
                     )
 
-                Text(label)
-                    .font(.mSans(9, .medium).monospacedDigit())
-                    .foregroundStyle(active ? MColor.brassHigh : MColor.text4)
+                if showsLabel {
+                    Text(label)
+                        .font(.mSans(9, .medium).monospacedDigit())
+                        .foregroundStyle(active ? MColor.brassHigh : MColor.text4)
+                }
             }
         }
         .buttonStyle(MPressStyle(scale: 0.92))
@@ -2207,6 +2604,14 @@ private final class MDirectRenderToken: @unchecked Sendable {
 private struct MDirectButtonFrameKey: PreferenceKey {
     static var defaultValue: CGRect = .zero
     static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        value = nextValue()
+    }
+}
+
+/// 顶栏画幅徽标宽度：展开菜单时按它把选项行推到徽标右侧。
+private struct MTopBadgeWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 90
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }
 }

@@ -554,11 +554,13 @@ struct GradeScreen: View {
             }
             .accessibilityLabel("重置全部调整")
 
-            MBrassCircleButton(icon: "bookmark", size: 32) {
+            // 同显影台：黄铜只留给「导出」这一个主操作。
+            MCircleIconButton(icon: "bookmark", size: 13, frame: 32) {
                 presetSaveOpen = true
             }
+            .accessibilityLabel("保存调色预设")
 
-            MBrassPill(title: "导出", icon: "square.and.arrow.up", height: 32) {
+            MBrassPill(title: "导出", icon: "square.and.arrow.up", height: 32, glass: true) {
                 withAnimation(MMotion.pill) { exportOpen = true }
             }
         }
@@ -647,21 +649,6 @@ struct GradeScreen: View {
                     .transition(.opacity)
             }
 
-            VStack {
-                Spacer(minLength: 0)
-
-                LinearGradient(
-                    colors: [Color.clear, Color.black.opacity(0.58)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: 78)
-                .allowsHitTesting(false)
-                .opacity(chromeHidden || drawerHeight > 500 ? 0 : 1)
-                .animation(MMotion.quick, value: chromeHidden)
-                .animation(MMotion.quick, value: drawerHeight)
-            }
-            .allowsHitTesting(false)
 
             VStack {
                 HStack(alignment: .top, spacing: 6) {
@@ -695,42 +682,6 @@ struct GradeScreen: View {
                 .allowsHitTesting(!chromeHidden)
 
                 Spacer()
-
-                HStack(alignment: .bottom) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(recipe.lutName == "无 LUT" ? "原始线性" : recipe.lutName)
-                            .font(.mSans(10, .medium))
-                            .foregroundStyle(MColor.text2)
-                            .shadow(color: .black.opacity(0.85), radius: 3, y: 1)
-                        if session.isRendering || !session.sourceReady {
-                            Text(session.phaseLabel.isEmpty ? "显影中" : session.phaseLabel)
-                                .font(.mSans(9, .medium))
-                                .foregroundStyle(MColor.brass)
-                                .shadow(color: .black.opacity(0.85), radius: 3, y: 1)
-                        } else {
-                            Text(recipe.lutName == "无 LUT" ? "未套用 LUT" : "LUT 强度 \(Int(recipe.lutStrength))%")
-                                .font(.mSans(9, .medium).monospacedDigit())
-                                .foregroundStyle(MColor.text3)
-                                .shadow(color: .black.opacity(0.85), radius: 3, y: 1)
-                        }
-                    }
-
-                    Spacer()
-
-                    if showOriginal || abs(zoom - 1) > 0.001 {
-                        Text(showOriginal ? "原片" : "\(Int(zoom * 100))%")
-                            .font(.mSans(9, .medium).monospacedDigit())
-                            .foregroundStyle(showOriginal ? MColor.text2 : MColor.text4)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Capsule().fill(Color.black.opacity(0.42)))
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.bottom, 10)
-                .opacity(chromeHidden || drawerHeight > 500 ? 0 : 1)
-                .animation(MMotion.quick, value: chromeHidden)
-                .animation(MMotion.quick, value: drawerHeight)
             }
             .allowsHitTesting(!chromeHidden)
         }

@@ -5,6 +5,8 @@ import SwiftUI
 /// 导出面板：居中浮卡、四个圆角、无顶部横条。
 /// 选项按参考图排成「标签 + 下拉行」；保存动画走「百分比 → 对勾」两拍。
 /// 传入 `progress` 时进行中显示滚动的 N%；不传（显影台）保持系统转圈。
+/// 真实进度上报前（显影交接等长耗时阶段）先走 0–50% 伪进度爬升，
+/// 真实进度一到即映射 50–100%，避免开头长时间停在 0% 引发焦虑。
 struct MExportSheet: View {
     let filename: String
     let phaseLabel: String
@@ -34,6 +36,9 @@ struct MExportSheet: View {
     @State private var watermarkAvailable = MWatermarkStore.load().enabled
     @State private var showMore = false
     @State private var phase: MExportPhase = .idle
+    /// 伪进度 0–0.5：真实进度未上报前的爬升值。
+    @State private var creep: Double = 0
+    @State private var creepTask: Task<Void, Never>?
     @Environment(\.mSafeInsets) private var insets
 
     private enum MExportPhase {
@@ -88,6 +93,14 @@ struct MExportSheet: View {
             try? await Task.sleep(nanoseconds: 300_000_000)
             if phase == .idle { beginExport() }
         }
+        // 真实进度一到就交棒给 50–100% 映射，伪进度任务立即停止。
+        .onChange(of: progress) { _, value in
+            if (value ?? 0) > 0 {
+                creepTask?.cancel()
+                creepTask = nil
+            }
+        }
+        .onDisappear { creepTask?.cancel() }
     }
 
     private var card: some View {
@@ -390,7 +403,7 @@ struct MExportSheet: View {
                     infoRow("色彩空间", format.space)
                     infoRow("位深", format.bitDepth)
                     infoRow("输出长边", edgeMeta)
-                    infoRow("保存位置", "相册 · 文件 App")
+                    infoRow("保存位置", "相册 · OltraFilm")
                 }
                 .padding(.top, 6)
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -405,8 +418,8 @@ struct MExportSheet: View {
         Group {
             switch phase {
             case .exporting:
-                if let progress {
-                    rollingPercent(progress)
+                if progress != nil {
+                    rollingPercent(displayedProgress)
                 } else {
                     ProgressView()
                         .tint(MColor.text2)
@@ -513,16 +526,42 @@ struct MExportSheet: View {
         }
     }
 
+    /// 展示进度：真实进度未上报时用伪爬升（上限 50%）；
+    /// 真实进度一到映射到 50–100%，且只前进不回退。
+    private var displayedProgress: Double {
+        let actual = progress ?? 0
+        guard actual > 0 else { return creep }
+        return max(creep, 0.5 + 0.5 * actual)
+    }
+
+    /// 伪进度爬升：每 0.15s 一步，越接近 50% 越慢、步长带随机，
+    /// 约 3 秒到 25%、11 秒到 45%，之后保持 50% 等待真实进度交棒。
+    private func startCreep() {
+        creepTask?.cancel()
+        creep = 0
+        creepTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                if Task.isCancelled || phase != .exporting { break }
+                let remaining = 0.5 - creep
+                guard remaining > 0 else { continue }
+                let step = max(0.0015, remaining * 0.03) * Double.random(in: 0.6...1.2)
+                creep = min(0.5, creep + step)
+            }
+        }
+    }
+
     private func beginExport() {
         guard phase == .idle, canExport else { return }
         MHaptic.medium()
         withAnimation(MMotion.state) { phase = .exporting }
+        startCreep()
         let quality = isJPEG ? Double(qualityValues[min(qualityIndex, qualityValues.count - 1)]) / 100 : 0.95
         onExport(format.id, edgeIndex, quality, addWatermark && watermarkAvailable) { result in
             switch result {
             case .success(let url):
-                // 默认保存到相册：成功不打扰，失败/被拒时必须告诉用户文件还在 App 内。
-                PhotoLibraryExport.save(url) { outcome in
+                // 默认保存到相册的 OltraFilm 相簿：成功不打扰，失败/被拒时必须告诉用户文件还在 App 内。
+                PhotoLibraryExport.save(url, album: PhotoLibraryExport.albumTitle) { outcome in
                     switch outcome {
                     case .saved:
                         break

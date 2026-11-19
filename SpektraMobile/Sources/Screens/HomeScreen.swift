@@ -1,14 +1,21 @@
 import SwiftUI
 import Photos
+import PhotosUI
 import UniformTypeIdentifiers
 
 struct HomeScreen: View {
     @ObservedObject var engine: MobileEngine
     let onOpenDevelop: (MPhoto) -> Void
     let onOpenGrade: (MPhoto) -> Void
+    let onOpenVideo: (PHAsset) -> Void
     let onOpenCamera: () -> Void
     let onOpenSettings: () -> Void
     let onToast: (String) -> Void
+    /// 每次从其它页面进入访达时由 root 递增；0 = 还没进过访达。
+    let hintToken: Int
+
+    /// 顶部标题可点：照片库 ↔ 视频库。视频访达只映射系统相册的视频，不做筛选。
+    @State private var showsVideos = DebugLaunch.videoLibrary
 
     /// 颜色标签是跨相簿的附加筛选，固定在筛选行右侧。
     @State private var colorFilter: MColorLabel?
@@ -16,6 +23,10 @@ struct HomeScreen: View {
     @State private var actionPhoto: MPhoto?
     @State private var folderPickerOpen = false
     @State private var didDebugOpen = false
+    /// 启动提示：标题右侧的「点这里切到视频库」，出现 3 秒后淡出。
+    @State private var showSwitchHint = false
+    /// 已经消费过的访达访问序号，避免同一次进入重复弹提示。
+    @State private var lastHintToken = 0
     @State private var searchOpen = false
     @State private var query = ""
     /// 多选：主页右上角「…」进入，点照片勾选，底部执行收藏 / 从相册删除。
@@ -28,26 +39,58 @@ struct HomeScreen: View {
     @Environment(\.mSafeInsets) private var insets
     @Environment(\.scenePhase) private var scenePhase
 
+    /// 只在「进入访达」时弹一次切换提示。
+    /// 打开 App 默认落在相机页，首页虽然已挂载，但那次不能算数，
+    /// 否则提示会在相机页期间自己走完，用户切到访达时什么也看不到。
+    private func armSwitchHint(_ token: Int) {
+        guard token > 0, token != lastHintToken else { return }
+        lastHintToken = token
+        guard !MLaunchHint.switchHintShown, !showsVideos else { return }
+        MLaunchHint.switchHintShown = true
+        // 用 asyncAfter 而不是 task：首页在相册扫描完成时会重建，
+        // task 会被取消、提示就永远出不来。
+        withAnimation(MMotion.state.delay(0.35)) { showSwitchHint = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.4) {
+            withAnimation(MMotion.state) { showSwitchHint = false }
+        }
+    }
+
     var body: some View {
         ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
                 header
 
                 // 筛选栏固定在顶部，不跟随下面的照片网格一起滚走。
-                filterRow
-                    .padding(.bottom, 12)
+                // 视频访达不做筛选，整行隐藏。
+                if !showsVideos {
+                    filterRow
+                        .padding(.bottom, 12)
+                }
 
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 0) {
-                        sectionHead
-                        photoGrid
-                        emptyHint
+                        if showsVideos {
+                            videoSectionHead
+                            videoGrid
+                            videoEmptyHint
+                        } else {
+                            sectionHead
+                            limitedAccessBanner
+                            photoGrid
+                            emptyHint
+                        }
                     }
                     .padding(.bottom, 106)
                 }
                 .scrollIndicators(.never)
-                // 下拉刷新＝强制重新扫描相册。
-                .refreshable { await engine.refreshAssets(force: true) }
+                // 下拉刷新＝强制重新扫描相册（视频页只重扫视频）。
+                .refreshable {
+                    if showsVideos {
+                        await engine.refreshVideos(force: true)
+                    } else {
+                        await engine.refreshAssets(force: true)
+                    }
+                }
             }
 
             if selecting {
@@ -89,6 +132,10 @@ struct HomeScreen: View {
             // 主页直接映射系统相册，不需要先「导入」。
             await engine.refreshAssets()
         }
+        .task(id: showsVideos) {
+            // 切到视频访达时才扫视频，照片模式下不额外读相册。
+            if showsVideos { await engine.refreshVideos() }
+        }
         .onChange(of: scenePhase) { _, phase in
             // 从后台回来必须强制重扫：应用挂起期间 PhotoKit 的变化回调可能不会送达，
             // 只靠变更计数会命中缓存，导致相册里新加的照片一直不出现。
@@ -102,6 +149,8 @@ struct HomeScreen: View {
             engine.refreshPhotos()
             Task { await engine.refreshAssets(force: true) }
         }
+        .onAppear { armSwitchHint(hintToken) }
+        .onChange(of: hintToken) { _, token in armSwitchHint(token) }
         .task {
             guard !didDebugOpen else { return }
             didDebugOpen = true
@@ -185,34 +234,69 @@ struct HomeScreen: View {
                     }
                     .buttonStyle(MPressStyle(scale: 0.94))
                 } else {
-                    Text("照片库")
-                        .font(.pageTitle)
-                        .tracking(0.3)
-                        .foregroundStyle(MColor.text1)
+                    // 标题本身是切换入口，样式保持 pageTitle 不变。
+                    Button {
+                        MHaptic.tick()
+                        withAnimation(MMotion.state) { showsVideos.toggle() }
+                    } label: {
+                        Text(showsVideos ? "视频库" : "照片库")
+                            .font(.pageTitle)
+                            .tracking(0.3)
+                            .foregroundStyle(MColor.text1)
+                    }
+                    .buttonStyle(.plain)
+                    // 标题永远不换行、不被提示挤走。
+                    .fixedSize()
+                    .accessibilityHint(showsVideos ? "切换到照片库" : "切换到视频库")
+
+                    // 首次进入访达的引导：箭头指向左侧标题，文字左右轻跳。
+                    // 不加胶囊边框，直接把字放在标题右侧，不抢标题的视觉重量。
+                    if showSwitchHint, !showsVideos {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.left")
+                                .font(.system(size: 7.5, weight: .bold))
+                            Text("点击切换视频库")
+                                .font(.mSans(8, .medium))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(.white)
+                        .layoutPriority(-1)
+                        .phaseAnimator([false, true]) { content, phase in
+                            content.offset(x: phase ? 4 : -4)
+                        } animation: { _ in
+                            .easeInOut(duration: 0.46)
+                        }
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                    }
 
                     Spacer(minLength: 0)
 
-                    MCircleIconButton(icon: "arrow.up.arrow.down", size: 13) {
-                        MHaptic.tick()
-                        withAnimation(MMotion.state) {
-                            sortMode = sortMode == .recent ? .filename : .recent
+                    if !showsVideos {
+                        MCircleIconButton(icon: "arrow.up.arrow.down", size: 13) {
+                            MHaptic.tick()
+                            withAnimation(MMotion.state) {
+                                sortMode = sortMode == .recent ? .filename : .recent
+                            }
                         }
-                    }
-                    .accessibilityLabel("排序方式")
-                    .accessibilityValue(sortMode.title)
+                        .accessibilityLabel("排序方式")
+                        .accessibilityValue(sortMode.title)
 
-                    MCircleIconButton(icon: "magnifyingglass", size: 15) {
-                        withAnimation(MMotion.state) {
-                            searchOpen = true
+                        MCircleIconButton(icon: "magnifyingglass", size: 15) {
+                            withAnimation(MMotion.state) {
+                                searchOpen = true
+                            }
+                            searchFocused = true
                         }
-                        searchFocused = true
                     }
 
                     Menu {
-                        Button {
-                            beginSelection()
-                        } label: {
-                            Label("选择", systemImage: "checkmark.circle")
+                        if !showsVideos {
+                            Button {
+                                beginSelection()
+                            } label: {
+                                Label("选择", systemImage: "checkmark.circle")
+                            }
                         }
                         Button {
                             onOpenSettings()
@@ -234,8 +318,13 @@ struct HomeScreen: View {
             }
 
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\(visibleAssets.count) 张\(countUnit) · \(gradedCount) 张已调色")
-                    .mMeta(10, color: MColor.text3)
+                if showsVideos {
+                    Text("\(engine.videoAssets.count) 个视频 · 来自系统相册")
+                        .mMeta(10, color: MColor.text3)
+                } else {
+                    Text("\(visibleAssets.count) 张\(countUnit) · \(gradedCount) 张已调色")
+                        .mMeta(10, color: MColor.text3)
+                }
 
                 Spacer(minLength: 0)
             }
@@ -422,6 +511,65 @@ struct HomeScreen: View {
         .padding(.horizontal, MMetric.pageMargin)
     }
 
+    // MARK: - 视频访达（直接映射系统相册视频，不做筛选）
+
+    private var videoSectionHead: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("视频")
+                .font(.mSans(11, .semibold))
+                .foregroundStyle(MColor.text2)
+
+            Text("\(engine.videoAssets.count)")
+                .mMeta(9.5, color: MColor.text4)
+
+            Spacer(minLength: 0)
+
+            if engine.videoPhase == .scanning {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(MColor.text3)
+            }
+        }
+        .padding(.horizontal, MMetric.pageMargin)
+        .padding(.top, 16)
+        .padding(.bottom, 10)
+    }
+
+    private var videoGrid: some View {
+        LazyVGrid(
+            columns: gridColumns,
+            alignment: .leading,
+            spacing: 18
+        ) {
+            ForEach(Array(engine.videoAssets.enumerated()), id: \.element.localIdentifier) { item in
+                MVideoCard(asset: item.element, index: item.offset + 1) {
+                    onOpenVideo(item.element)
+                }
+            }
+        }
+        .padding(.horizontal, MMetric.pageMargin)
+    }
+
+    @ViewBuilder private var videoEmptyHint: some View {
+        if engine.videoAssets.isEmpty, engine.videoPhase != .scanning {
+            VStack(spacing: 8) {
+                Image(systemName: "video.slash")
+                    .font(.system(size: 26, weight: .light))
+                    .foregroundStyle(MColor.text4)
+                Text(engine.videoPhase == .denied ? "没有相册访问权限" : "相册里没有视频")
+                    .font(.mSans(12, .medium))
+                    .foregroundStyle(MColor.text3)
+                Text(engine.videoPhase == .denied
+                     ? "请在系统设置里允许访问照片与视频"
+                     : "用系统相机拍摄的视频会自动出现在这里")
+                    .font(.mSans(10))
+                    .foregroundStyle(MColor.text4)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.top, 70)
+        }
+    }
+
     // MARK: - 底部
 
     private var bottomBar: some View {
@@ -431,7 +579,9 @@ struct HomeScreen: View {
                     Image(systemName: "square.grid.2x2")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(MColor.text3)
-                    Text("\(currentScopeTitle) · \(visibleAssets.count)")
+                    Text(showsVideos
+                         ? "视频 · \(engine.videoAssets.count)"
+                         : "\(currentScopeTitle) · \(visibleAssets.count)")
                         .font(.mSans(10, .medium))
                         .foregroundStyle(MColor.text3)
                 }
@@ -442,27 +592,38 @@ struct HomeScreen: View {
 
                 Spacer(minLength: 0)
 
-                Button {
-                    MHaptic.tick()
-                    folderPickerOpen = true
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 12, weight: .semibold))
-                        Text("导入")
-                            .font(.mSans(12, .semibold))
+                // 视频访达直接映射系统相册，不需要导入入口。
+                if !showsVideos {
+                    Button {
+                        MHaptic.tick()
+                        folderPickerOpen = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("导入")
+                                .font(.mSans(12, .semibold))
+                        }
+                        // 快门是这一屏唯一的实心黄铜主操作；导入是次级入口，
+                        // 用同一套铜染玻璃表达"可选"，两个实心黄铜并排会互相抵消。
+                        .foregroundStyle(MColor.brassHigh)
+                        .padding(.horizontal, 18)
+                        .frame(height: 46)
+                        .mGlassSurface(
+                            Capsule(),
+                            tint: MColor.brass.opacity(0.20),
+                            fallbackFill: MColor.brassWash,
+                            interactive: true
+                        )
+                        .overlay(Capsule().strokeBorder(MColor.brass.opacity(0.34), lineWidth: 1))
+                        .contentShape(Capsule())
                     }
-                    .foregroundStyle(MColor.brassInk)
-                    .padding(.horizontal, 18)
-                    .frame(height: 46)
-                    .background(Capsule().fill(MColor.brass))
-                    .contentShape(Capsule())
+                    .buttonStyle(MPressStyle(scale: 0.94))
                 }
-                .buttonStyle(MPressStyle(scale: 0.94))
             }
 
-            // iPad 不做相机功能，入口直接隐藏。
-            if !MLayout.isPad {
+            // iPad 不做相机功能，入口直接隐藏；视频页也不出现相机。
+            if !MLayout.isPad && !showsVideos {
                 cameraEntry
             }
         }
@@ -890,6 +1051,54 @@ struct HomeScreen: View {
         .frame(height: 50)
     }
 
+    /// 有限访问提示：只显示部分照片时说明原因，并给出系统管理入口。
+    @ViewBuilder
+    private var limitedAccessBanner: some View {
+        if engine.isPhotoAccessLimited {
+            Button {
+                presentLimitedPhotoPicker()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("仅显示你允许的照片 · 点此管理")
+                        .font(.mSans(10.5, .medium))
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .foregroundStyle(MColor.text2)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(MColor.surface1)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+        }
+    }
+
+    /// 拉起系统的「有限访问照片」选择器；iPad 上系统按 presenting VC 自动定位弹层。
+    private func presentLimitedPhotoPicker() {
+        guard let vc = Self.topViewController() else { return }
+        PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: vc)
+    }
+
+    private static func topViewController(
+        base: UIViewController? = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .flatMap({ $0.windows })
+            .first(where: { $0.isKeyWindow })?.rootViewController
+    ) -> UIViewController? {
+        if let nav = base as? UINavigationController { return topViewController(base: nav.visibleViewController) }
+        if let tab = base as? UITabBarController, let sel = tab.selectedViewController {
+            return topViewController(base: sel)
+        }
+        if let presented = base?.presentedViewController { return topViewController(base: presented) }
+        return base
+    }
+
     /// 空态：没权限 / 没可显影的照片 / 还在扫描，三种情况说清下一步。
     @ViewBuilder
     private var emptyHint: some View {
@@ -1070,7 +1279,8 @@ struct HomeScreen: View {
         Task {
             guard let photoID = await engine.importAsset(assetID: asset.id),
                   let photo = engine.photos.first(where: { $0.id == photoID }) else {
-                onToast("这张 RAW 没能取回：可能还在 iCloud 且网络不可用")
+                // 用引擎给出的精确原因（iCloud 超时/离线/无原片），不再笼统一句。
+                onToast(engine.importFailureMessage ?? "这张 RAW 没能取回，请检查网络后重试")
                 return
             }
             onOpenDevelop(photo)
@@ -1125,14 +1335,14 @@ private struct MPhotoCard: View {
                 }
             }
             .contentShape(Rectangle())
-            // 长按用高优先级手势：识别后点击不再触发，松手不会误进入照片。
-            .highPriorityGesture(
-                LongPressGesture(minimumDuration: 0.45, maximumDistance: 14)
-                    .onEnded { _ in
-                        guard !selectionMode else { return }
-                        onLongPress()
-                    }
-            )
+            // 用 SwiftUI 原生的 onLongPressGesture 修饰符：它与 onTapGesture 是官方
+            // 配套，系统会自动协调二者，长按不会吞掉点击。此前用
+            // simultaneousGesture(LongPressGesture)，在 iPad 上长按把 tap 全吃了，
+            // 导致点照片进不了显影（日志实证：只有 LONGPRESS、没有 TAP）。
+            .onLongPressGesture(minimumDuration: 0.5, pressing: nil) {
+                guard !selectionMode else { return }
+                onLongPress()
+            }
             .onTapGesture {
                 if selectionMode {
                     MHaptic.tick()
@@ -1296,6 +1506,102 @@ private struct MPhotoCard: View {
     }
 }
 
+/// 视频访达卡片：与照片卡同一网格、同一比例，只把胶片标签换成时长与播放标识。
+private struct MVideoCard: View {
+    let asset: PHAsset
+    let index: Int
+    let onOpen: () -> Void
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                Rectangle().fill(MColor.surface2)
+
+                MAssetThumb(asset: asset)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .clipped()
+
+                LinearGradient(
+                    colors: [Color.black.opacity(0.24), .clear, Color.black.opacity(0.46)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+
+                HStack(alignment: .top) {
+                    Text("视频")
+                        .font(.mSans(7.5, .semibold))
+                        .tracking(0.8)
+                        .foregroundStyle(MColor.text1.opacity(0.9))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                .fill(Color.black.opacity(0.52))
+                        )
+
+                    Spacer(minLength: 0)
+
+                    Text(String(format: "%02d", index))
+                        .font(.mSans(8, .medium).monospacedDigit())
+                        .foregroundStyle(Color.white.opacity(0.62))
+                }
+                .padding(8)
+
+                Circle()
+                    .fill(Color.black.opacity(0.40))
+                    .frame(width: 38, height: 38)
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.28), lineWidth: 1))
+                    .overlay(
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.92))
+                            .offset(x: 1)
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                HStack {
+                    Spacer(minLength: 0)
+                    Text(durationText)
+                        .font(.mSans(8, .medium).monospacedDigit())
+                        .foregroundStyle(Color.white.opacity(0.92))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                .fill(Color.black.opacity(0.60))
+                        )
+                }
+                .padding(8)
+                .frame(maxHeight: .infinity, alignment: .bottom)
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
+        }
+        // 与照片卡锁定同一比例，两个访达的网格节奏完全一致。
+        .aspectRatio(165 / 128, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: MRadius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: MRadius.card, style: .continuous)
+                .strokeBorder(MColor.hairline, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            MHaptic.light()
+            onOpen()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("视频 \(index)，时长 \(durationText)")
+    }
+
+    private var durationText: String {
+        let total = Int(max(0, asset.duration).rounded())
+        if total >= 3600 {
+            return String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+        }
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
 /// 相册缩略图内存缓存：滚动回来或重进主页时不重复向 PhotoKit 取图。
 private enum MAssetThumbCache {
     static let shared: NSCache<NSString, UIImage> = {
@@ -1313,6 +1619,8 @@ private struct MAssetThumb: View {
     @State private var image: UIImage?
     @State private var requested = false
     @State private var requestID: PHImageRequestID?
+    /// iCloud 缩略图下载失败：空占位分不清"在下载"还是"失败"，显式给个图标。
+    @State private var loadFailed = false
 
     var body: some View {
         ZStack {
@@ -1321,6 +1629,10 @@ private struct MAssetThumb: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
+            } else if loadFailed {
+                Image(systemName: "icloud.slash")
+                    .font(.system(size: 20, weight: .light))
+                    .foregroundStyle(MColor.text4)
             }
         }
         .onAppear(perform: request)
@@ -1331,6 +1643,7 @@ private struct MAssetThumb: View {
                 self.requestID = nil
             }
             requested = false
+            loadFailed = false
         }
     }
 
@@ -1354,14 +1667,22 @@ private struct MAssetThumb: View {
             contentMode: .aspectFill,
             options: options
         ) { result, info in
-            guard let result else { return }
             let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            // result 为 nil：区分 iCloud 下载失败 / 还在下载。
+            // 有 error 才是真失败；纯 in-cloud 且无 error 视为仍在下载，不标失败。
+            let hasError = info?[PHImageErrorKey] != nil
             DispatchQueue.main.async {
                 guard requested else { return }
-                image = result
-                if !degraded {
-                    MAssetThumbCache.shared.setObject(
-                        result, forKey: key, cost: 480 * 480 * 4)
+                if let result {
+                    image = result
+                    loadFailed = false
+                    if !degraded {
+                        MAssetThumbCache.shared.setObject(
+                            result, forKey: key, cost: 480 * 480 * 4)
+                    }
+                } else if hasError {
+                    // 下载失败（离线/资源不可用）：显式图标，别让用户以为是空照片。
+                    loadFailed = true
                 }
             }
         }

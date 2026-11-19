@@ -37,8 +37,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: Spektrafilm
-        CFBundleShortVersionString: 0.4.5
-        CFBundleVersion: 8
+        CFBundleShortVersionString: 0.7.11
+        CFBundleVersion: 39
         LSRequiresIPhoneOS: true
         UILaunchScreen:
           UIColorName: LaunchBackground
