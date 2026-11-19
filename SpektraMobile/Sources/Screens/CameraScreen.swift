@@ -303,9 +303,6 @@ struct CameraScreen: View {
         .sheet(isPresented: $sessionListOpen) {
             sessionListSheet
         }
-        .sheet(item: $previewingShot) { shot in
-            sessionPreviewSheet(shot)
-        }
     }
 
     // MARK: - 本次拍摄列表 / 预览
@@ -371,26 +368,51 @@ struct CameraScreen: View {
                         .foregroundStyle(MColor.brass)
                 }
             }
+            // 预览必须挂在列表 sheet 内部：列表已全屏展示时，父视图无法再 present 第二个 sheet。
+            .sheet(item: $previewingShot) { shot in
+                sessionPreviewSheet(shot)
+            }
         }
         .presentationDetents([.large])
         .presentationBackground(MColor.surface1)
     }
 
-    /// 大图预览：看清晰缩略图，并可进入这张照片的显影台。
+    /// 本次拍摄大图预览：极简——一张带相纸框的照片 + 左上角无框返回 + 一个显影台按钮。
     private func sessionPreviewSheet(_ shot: MSessionShot) -> some View {
-        VStack(spacing: 0) {
-            ZStack {
-                MColor.canvas.ignoresSafeArea()
-                if let thumb = shot.thumbnail {
-                    MImage.swiftUI(thumb)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .padding(.horizontal, 12)
-                }
-            }
-            .frame(maxHeight: .infinity)
+        ZStack {
+            MColor.canvas.ignoresSafeArea()
 
-            VStack(spacing: 12) {
+            // 照片 + 相纸框：白卡纸包围，随画幅自适应，不用固定 frame 裁切。
+            if let thumb = shot.thumbnail {
+                MImage.swiftUI(thumb)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .padding(9)
+                    .background(Color(hex: 0xF6F2E9),
+                                in: RoundedRectangle(cornerRadius: 3, style: .continuous))
+                    .shadow(color: .black.opacity(0.5), radius: 26, y: 12)
+                    .padding(.horizontal, 32)
+            }
+
+            // 左上角返回箭头：纯图标，不套圆框。
+            VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    MHaptic.light()
+                    previewingShot = nil
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundStyle(MColor.text1)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 12)
+                .padding(.top, 8)
+
+                Spacer(minLength: 0)
+
+                // 唯一的显影台按钮。
                 Button {
                     MHaptic.medium()
                     previewingShot = nil
@@ -408,18 +430,12 @@ struct CameraScreen: View {
                     .background(MColor.brass, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
                 .buttonStyle(MPressStyle(scale: 0.98))
-
-                Button("返回列表") { previewingShot = nil }
-                    .font(.rowLabel)
-                    .foregroundStyle(MColor.text3)
-                    .frame(height: 40)
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 18)
-            .background(MColor.surface1)
         }
         .presentationDetents([.large])
-        .presentationBackground(MColor.surface1)
+        .presentationBackground(MColor.canvas)
     }
 
     // MARK: - 顶栏

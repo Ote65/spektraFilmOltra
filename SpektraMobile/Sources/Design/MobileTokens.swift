@@ -583,9 +583,9 @@ final class MSoundEngine {
     func prepare() {
         guard !isPrepared else { return }
         #if os(iOS)
-        // 和相机一样：静音键下仍响，且用 mixWithOthers 不打断用户正在听的音乐。
+        // ambient 类别：拨到静音键时快门 / 闪光音效一起静音，且仍与背景音乐混播不打断听歌。
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try? session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
         try? session.setActive(true)
         #endif
         for tone in ShutterTone.allCases {

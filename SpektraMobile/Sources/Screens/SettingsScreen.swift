@@ -299,24 +299,18 @@ struct SettingsScreen: View {
             MSectionHead(title: "相机")
                 .padding(.top, 18)
 
-            MToggleRow(label: "水平仪", isOn: $cameraLevel, compact: true,
-                       detail: "取景框中央显示水平与俯拍参考")
+            MToggleRow(label: "水平仪", isOn: $cameraLevel, compact: true)
 
-            MToggleRow(label: "镜像前置相机", isOn: $cameraMirrorFront, compact: true,
-                       detail: "前置成片镜像为取景所见（和预览一样）；显影台与 RAW 原片保持原始画面")
+            MToggleRow(label: "镜像前置相机", isOn: $cameraMirrorFront, compact: true)
 
-            MToggleRow(label: "拍摄立即进入显影台", isOn: $cameraEnterDevelop, compact: true,
-                       detail: "关闭后拍完存进相册，点左下角缩略图查看本次拍摄并进入显影台")
+            MToggleRow(label: "拍摄立即进入显影台", isOn: $cameraEnterDevelop, compact: true)
 
             MToggleRow(label: "音量键拍摄", isOn: $cameraVolumeShutter,
-                       isEnabled: volumeShutterAvailable, compact: true,
-                       detail: volumeShutterDetail)
+                       isEnabled: volumeShutterAvailable, compact: true)
 
-            MToggleRow(label: "直出模式保存原图", isOn: $cameraDirectSaveOriginal, compact: true,
-                       detail: "开启后保留 RAW 与可回放的显影 / 调色工程")
+            MToggleRow(label: "直出模式保存原图", isOn: $cameraDirectSaveOriginal, compact: true)
 
-            MToggleRow(label: "快门声音", isOn: $cameraShutterSound, compact: true,
-                       detail: "拍照时播放快门音效，静音键下仍响")
+            MToggleRow(label: "快门声音", isOn: $cameraShutterSound, compact: true)
 
             MChoiceRow(label: "快门音色", value: shutterToneLabel,
                        options: shutterToneOptions) { raw in
@@ -329,8 +323,7 @@ struct SettingsScreen: View {
             }
             .disabled(!cameraShutterSound)
 
-            MToggleRow(label: "闪光灯音效", isOn: $cameraFlashSound, compact: true,
-                       detail: "用闪光灯时只放闪光音效，不与快门声重叠")
+            MToggleRow(label: "闪光灯音效", isOn: $cameraFlashSound, compact: true)
 
             MChoiceRow(label: "闪光音色", value: flashToneLabel,
                        options: flashToneOptions) { raw in
@@ -380,13 +373,6 @@ struct SettingsScreen: View {
         return false
     }
 
-    private var volumeShutterDetail: String {
-        if #available(iOS 17.2, *) {
-            return "音量键或相机控制键触发快门"
-        }
-        return "需要 iOS 17.2 或更高版本"
-    }
-
     // MARK: 导出
 
     private var exportSection: some View {
@@ -405,14 +391,6 @@ struct SettingsScreen: View {
                 guard let value = Int(raw) else { return }
                 exportEdge = value
             }
-            // 尺寸档位只缩小、不放大：原图长边不足所选值时按原图输出，
-            // 所以 12 MP 原机上 4096 档与最大可用尺寸输出相同——保存成功提示里
-            // 会带实际长边，可当场核对。
-            Text("档位只缩小不放大：原图长边不足所选值时按原图输出")
-                .font(.mSans(9))
-                .foregroundStyle(MColor.text4)
-                .padding(.top, 2)
-
             MChoiceRow(label: "图像品质",
                        value: isJPEGExport ? exportQualityTitle : "无损",
                        options: qualityOptions,
@@ -733,18 +711,13 @@ struct SettingsScreen: View {
             }
             .padding(.vertical, 7)
 
-            Text("清理交接图与缩略图内存缓存；原片、导出成片与调色参数不受影响。")
-                .font(.mSans(9, .medium))
-                .foregroundStyle(MColor.text4)
-                .fixedSize(horizontal: false, vertical: true)
-
             hairline.padding(.top, 10)
         }
     }
 
     private var handoffCacheDetail: String {
         guard handoffCacheCount > 0 else { return "暂无缓存" }
-        return "\(handoffCacheCount) 张 · \(cacheSizeText(handoffCacheBytes)) · 用于调色台秒开"
+        return "\(handoffCacheCount) 张 · \(cacheSizeText(handoffCacheBytes))"
     }
 
     private func cacheSizeText(_ bytes: Int64) -> String {
