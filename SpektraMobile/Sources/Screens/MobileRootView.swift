@@ -15,6 +15,8 @@ struct MobileRootView: View {
     @State private var openingVideo = false
     @State private var gradeEntry: MGradeEntry = .direct
     @State private var gradeReturn: MScreen = .home
+    /// 显影台的返回目标：从相机进（直出/本次列表/拍完即进）回相机，从主页进回主页。
+    @State private var developReturn: MScreen = .home
     @State private var toast: String? = nil
     @State private var toastAction: MToastAction? = nil
     @State private var toastToken = 0
@@ -127,7 +129,7 @@ struct MobileRootView: View {
                              onOpenDevelop: { photoID in
                                  // 入库期间用户可能已关掉相机：只保留结果，不强行跳页。
                                  guard screen == .camera else { return }
-                                 openDevelop(photoID)
+                                 openDevelop(photoID, returningTo: .camera)
                              },
                              onDirectSave: { request in
                                  await saveDirect(request)
@@ -488,11 +490,12 @@ struct MobileRootView: View {
             capturedLandscape: request.capturedLandscape,
             mirrorFront: request.mirrorFront
         )
-        openDevelop(photoID)
+        openDevelop(photoID, returningTo: .camera)
         return .opened
     }
 
-    private func openDevelop(_ photoID: String, filename: String? = nil) {
+    private func openDevelop(_ photoID: String, filename: String? = nil,
+                             returningTo target: MScreen = .home) {
         engine.closeGrade()
         resetFlight()
         grade = nil
@@ -504,6 +507,7 @@ struct MobileRootView: View {
             return
         }
         withAnimation(MMotion.push) {
+            developReturn = target
             develop = session
             screen = .develop
         }
@@ -512,9 +516,10 @@ struct MobileRootView: View {
     private func closeDevelop() {
         engine.closeDevelop()
         resetFlight()
+        let target = developReturn
         withAnimation(MMotion.push) {
             develop = nil
-            screen = .home
+            screen = target
         }
     }
 
