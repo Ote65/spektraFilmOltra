@@ -1260,6 +1260,13 @@ final class MobileEngine: ObservableObject {
         )
     }
 
+    /// 按 photoID 取入库原片 URL（供本次拍摄大图预览加载全尺寸内嵌图）。
+    /// 原片在 App 沙盒 `Originals/` 下，JPEG 直出与 DNG 都适用。
+    func originalURL(forPhotoID id: String) -> URL? {
+        guard let photo = store.photos.first(where: { $0.id == id }) else { return nil }
+        return store.originalURL(for: photo)
+    }
+
     private func warmThumbnails() {
         let allowNonRaw = MobileSettings.allowNonRaw
         for photo in store.photos where photo.thumbnailPath == nil {
