@@ -604,10 +604,18 @@ struct HomeScreen: View {
                             Text("导入")
                                 .font(.mSans(12, .semibold))
                         }
-                        .foregroundStyle(MColor.brassInk)
+                        // 快门是这一屏唯一的实心黄铜主操作；导入是次级入口，
+                        // 用同一套铜染玻璃表达"可选"，两个实心黄铜并排会互相抵消。
+                        .foregroundStyle(MColor.brassHigh)
                         .padding(.horizontal, 18)
                         .frame(height: 46)
-                        .background(Capsule().fill(MColor.brass))
+                        .mGlassSurface(
+                            Capsule(),
+                            tint: MColor.brass.opacity(0.20),
+                            fallbackFill: MColor.brassWash,
+                            interactive: true
+                        )
+                        .overlay(Capsule().strokeBorder(MColor.brass.opacity(0.34), lineWidth: 1))
                         .contentShape(Capsule())
                     }
                     .buttonStyle(MPressStyle(scale: 0.94))

@@ -784,7 +784,7 @@ private struct MVideoExportOverlay: View {
         VStack(spacing: 0) {
             Text("编码")
                 .font(.mSans(9.5, .semibold))
-                .tracking(1.2)
+                .tracking(0.4)
                 .foregroundStyle(MColor.text4)
                 .padding(.top, 2)
 

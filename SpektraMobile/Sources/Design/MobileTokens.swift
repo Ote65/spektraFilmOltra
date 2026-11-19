@@ -14,19 +14,30 @@ enum MColor {
     static let clear = Color.clear
     static let app = Color(hex: 0x0E0D0B)
     static let canvas = Color(hex: 0x080706)
-    static let surface1 = Color(hex: 0x17150F)
-    static let surface2 = Color(hex: 0x1F1C15)
-    static let surface3 = Color(hex: 0x28241B)
-    static let surface4 = Color(hex: 0x353024)
+    /// 表面阶。原来相邻几乎同级（步进 1.06 / 1.07 / 1.10 / 1.18），
+    /// 面板、卡片、输入框在暗底上分不出层次，只能靠发丝线硬撑。
+    /// 现在每级约 1.09 / 1.16 / 1.21 / 1.30，平面关系读得出来；
+    /// 发丝线退回"边缘修饰"，不再独自承担结构。
+    static let surface1 = Color(hex: 0x1A1712)
+    static let surface2 = Color(hex: 0x26221A)
+    static let surface3 = Color(hex: 0x332D22)
+    static let surface4 = Color(hex: 0x42392B)
 
-    static let hairline = Color.white.opacity(0.07)
-    static let hairlineStrong = Color.white.opacity(0.13)
-    static let hairlineFaint = Color.white.opacity(0.035)
+    /// 发丝线三档。原来是 3.5% / 7% / 13%，在近黑底上合成后只有 1.07 / 1.17 / 1.39:1，
+    /// 户外或亮屏基本看不见——而全项目靠它分层，于是整屏塌成一块黑。
+    /// 注意：1px 线在 #0E0D0B 上即使 20% 白也只有 1.79:1，永远够不到 3:1，
+    /// 硬追只会变成硬边框。这三档只负责"看得见"，结构厚度交给表面阶。
+    static let hairline = Color.white.opacity(0.115)      // 1.34:1
+    static let hairlineStrong = Color.white.opacity(0.20)  // 1.79:1
+    static let hairlineFaint = Color.white.opacity(0.06)   // 1.14:1
 
     static let text1 = Color(hex: 0xF4F0E7)
     static let text2 = Color(hex: 0xBDB6A8)
     static let text3 = Color(hex: 0x968F81)
-    static let text4 = Color(hex: 0x7C7568)
+    /// 最低一级文本。必须守住 4.5:1：app 5.31、surface1 4.99、surface2 4.65。
+    /// 它被大量 8–9pt 的元信息直接用（87 处），原来 #7C7568 只有 4.26，全线不达 AA。
+    /// 再暗一档就只能当装饰，不能承载信息。
+    static let text4 = Color(hex: 0x8C8578)
 
     static let brass = Color(hex: 0xC7A577)
     static let brassHigh = Color(hex: 0xE2C99F)
@@ -123,8 +134,9 @@ extension EnvironmentValues {
 
 // MARK: - 自适应布局
 //
-// iPad 横屏走左右分栏（左画布 / 右参数），竖屏与分屏（宽度小于高度）保持 iPhone 的单列布局。
-// 判断只看当前真实窗口尺寸，不解析机型：分屏、台前调度、旋转都能自然切换。
+// iPad 横屏（底宽 > 高）走 macOS 左右三栏（左预设轨 / 中画布 / 右参数栏），
+// 竖屏（高 ≥ 宽）走 iOS 单列。切换只认这一条宽高比规则，不叠加任何最小宽度门槛：
+// 分屏、台前调度、旋转都按真实窗口宽高比自然切换。仅作用于显影台与调色台。
 
 enum MLayout {
     static var isPad: Bool {
@@ -135,17 +147,15 @@ enum MLayout {
         #endif
     }
 
-    /// 横屏且画布放得下三栏时才分栏；接近手机竖屏比例的竖条窗口、
-    /// 以及台前调度那种挤不下左右轨的小横窗，一律退回 iPhone 的单列布局。
-    /// 判断只看当前真实窗口尺寸，不解析机型：分屏、台前调度、旋转都能自然切换。
+    /// 唯一的切换规则：iPad 上底宽 > 高（横屏）就走 macOS 三栏，否则（竖屏）走 iOS 单列。
+    /// 不再叠加任何最小宽度 / 高度 / 画布宽度门槛——台前调度小横窗、分屏横窗也一样分栏。
+    /// 判断只看当前真实窗口宽高比，不解析机型：分屏、台前调度、旋转都能自然切换。
     /// `--force-split` 为截图验收用：在竖屏窗口上也强制走分栏版式。
     static func usesSplit(_ size: CGSize) -> Bool {
         if DebugLaunch.forceSplit { return true }
         let size = DebugLaunch.windowOverride ?? size
-        guard isPad, size.width > size.height * 1.02 else { return false }
-        // 左轨 + 右栏之外要给画布留出最小宽度，放不下就别硬分。
-        let canvas = size.width - inspectorWidth(for: size) - sideRailWidth(for: size)
-        return size.width >= 800 && size.height >= 640 && canvas >= 470
+        guard isPad else { return false }
+        return size.width > size.height
     }
 
     /// 台前调度窗口最窄形状锁到 iPhone 竖屏比例（393:852）：
@@ -202,16 +212,34 @@ enum MScreenMetrics {
     }
 }
 
+// MARK: - 字阶
+//
+// 全项目只允许这六档。原先有 16 个字号（7 / 7.5 / 8 / 8.5 / 9 / 9.5 / 10 / 10.5 /
+// 11 / 11.5 / 12 / 12.5 / 13 / 13.5 / 15 / 22）挤在 0.5pt 的连续体上：
+// 眼睛分不出 12 和 12.5，于是"层级"只能靠微调假装，结果是没有层级。
+// 现在所有调用按最近档吸附（最多差 ±2pt，绝大多数是 ±0.5），
+// 不逐个改 179 处调用，也保证任何新代码写不出第七档。
+
+enum MType {
+    static let scale: [CGFloat] = [9, 10.5, 12, 13.5, 22, 30]
+
+    static func snap(_ size: CGFloat) -> CGFloat {
+        scale.min { abs($0 - size) < abs($1 - size) } ?? size
+    }
+}
+
 // MARK: - 字体
 
 extension Font {
     /// 全局使用苹方：中文与数字都走同一套字族，不再混 SF Pro。
+    /// `relativeTo:` 让字号跟随系统「文字大小」缩放；不传这个参数时
+    /// `Font.custom(_:size:)` 是定死的，系统调到最大 App 里也一个字不变。
     static func mSans(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
-        .custom(pingFangName(weight), size: size)
+        .custom(pingFangName(weight), size: MType.snap(size), relativeTo: .body)
     }
 
     static func mSerif(_ size: CGFloat, _ weight: Font.Weight = .medium) -> Font {
-        .custom(pingFangName(weight), size: size)
+        .custom(pingFangName(weight), size: MType.snap(size), relativeTo: .body)
     }
 
     private static func pingFangName(_ weight: Font.Weight) -> String {
@@ -237,10 +265,13 @@ extension Font {
 }
 
 extension View {
-    /// 小字距的全大写标签，欧创的“样张说明”语气。
-    func mLabel(_ size: CGFloat = 9.5, color: Color = MColor.text3) -> some View {
+    /// 小号分组标签。字距默认按**中文**给（0.4）：CJK 是等宽方块字，
+    /// 原来的 1.35 在 8pt 上是 17% 字距，会把「直方图」拆成「直 方 图」。
+    /// 拉丁全大写字标（如 SPEKTRAFILMOLTRA）自带宽字距需求，调用处显式传参。
+    func mLabel(_ size: CGFloat = 9.5, color: Color = MColor.text3,
+                tracking: CGFloat = 0.4) -> some View {
         self.font(.mSans(size, .semibold))
-            .tracking(1.35)
+            .tracking(tracking)
             .foregroundStyle(color)
     }
 
@@ -433,6 +464,8 @@ enum DebugLaunch {
 
     /// 验收用：`--grade-handoff` 从显影交接入口进调色台（写入/复用交接图缓存）。
     static var gradeHandoff: Bool { args.contains("--grade-handoff") }
+    /// 自检用：显影台加载后自动点「调色」，配合 --probe-geometry 读飞行起终点。
+    static var autoGrade: Bool { args.contains("--auto-grade") }
 
     /// 验收用：`--direct-image name.jpg` 直接把 App Documents 里的图片当作直出成片展示。
     static var directImage: String? {
