@@ -539,18 +539,38 @@ final class MSoundEngine {
         case crisp
         case mechanical
         case dslr
+        case snappy
+        case electronic
 
         var resourceName: String {
             switch self {
             case .crisp: return "shutter-crisp"
             case .mechanical: return "shutter-mechanical"
             case .dslr: return "shutter-dslr"
+            case .snappy: return "shutter-snappy"
+            case .electronic: return "shutter-electronic"
+            }
+        }
+    }
+
+    /// 闪光音效音色。注意这些素材本身就含快门/闪光炸响，是"一次完整闪光"的录音；
+    /// 播放其中任意一个都不该再叠加独立的快门音效（见 CameraScreen.fire）。
+    enum FlashTone: String, CaseIterable {
+        case vintage
+        case combined
+        case cinematic
+
+        var resourceName: String {
+            switch self {
+            case .vintage: return "flash-vintage"
+            case .combined: return "flash-combined"
+            case .cinematic: return "flash-cinematic"
             }
         }
     }
 
     private var shutterPlayers: [ShutterTone: AVAudioPlayer] = [:]
-    private var flashPlayer: AVAudioPlayer?
+    private var flashPlayers: [FlashTone: AVAudioPlayer] = [:]
     private var isPrepared = false
 
     private init() {}
@@ -567,7 +587,9 @@ final class MSoundEngine {
         for tone in ShutterTone.allCases {
             shutterPlayers[tone] = makePlayer(tone.resourceName, volume: 0.9)
         }
-        flashPlayer = makePlayer("flash-vintage", volume: 0.75)
+        for tone in FlashTone.allCases {
+            flashPlayers[tone] = makePlayer(tone.resourceName, volume: 0.75)
+        }
         // 放到最后：资源若首次读取失败，下一次调用还能重试。
         isPrepared = true
     }
@@ -581,11 +603,13 @@ final class MSoundEngine {
         }
     }
 
-    func playFlash() {
-        let player = flashPlayer ?? makePlayer("flash-vintage", volume: 0.75)
-        guard let player else { return }
-        flashPlayer = player
-        restart(player)
+    func playFlash(_ tone: FlashTone) {
+        if let player = flashPlayers[tone] {
+            restart(player)
+        } else if let player = makePlayer(tone.resourceName, volume: 0.75) {
+            flashPlayers[tone] = player
+            restart(player)
+        }
     }
 
     private func makePlayer(_ resource: String, volume: Float) -> AVAudioPlayer? {

@@ -5,6 +5,7 @@ import ImageIO
 #if os(iOS)
 import AVFoundation
 import CoreMotion
+import AudioToolbox
 #endif
 
 /// 按下快门那一刻的拍摄参数。RAW 的 EXIF 不一定记录曝光补偿，
@@ -434,7 +435,9 @@ final class MCameraSession: NSObject, ObservableObject {
 
     // MARK: - 拍摄
 
-    func capture() {
+    /// - Parameter onWillCapture: 真实曝光时刻的反馈（音效）。由相机页注入，
+    ///   在系统播放快门音、物理闪光点亮的同一刻触发，避免音效比画面早半拍。
+    func capture(onWillCapture: (() -> Void)? = nil) {
         #if os(iOS)
         guard canCapture, let rawFormat else { return }
         isCapturing = true
@@ -461,7 +464,8 @@ final class MCameraSession: NSObject, ObservableObject {
         let delegate = MCaptureDelegate(
             meta: MCameraCaptureMeta(exposureBias: exposureBias, temperature: temperature,
                                      capturedLandscape: capturedLandscape,
-                                     mirrorFront: isFront && MobileSettings.cameraMirrorFront)
+                                     mirrorFront: isFront && MobileSettings.cameraMirrorFront),
+            onWillCapture: onWillCapture
         ) { [weak self] result in
             DispatchQueue.main.async { self?.finish(result) }
         }
@@ -997,11 +1001,27 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     private let completion: (Result<MCameraShot, Error>) -> Void
     /// 快门按下时的曝光/色温：异步回调里不能再读已经变化的相机状态。
     private let meta: MCameraCaptureMeta
+    /// 真实曝光时刻的反馈回调。系统在这个回调之后立刻播系统快门音、点亮物理闪光，
+    /// 所以自定义音效必须放在这里触发，才不会比真实闪光早半拍。
+    private let onWillCapture: (() -> Void)?
     private var finished = false
 
-    init(meta: MCameraCaptureMeta, completion: @escaping (Result<MCameraShot, Error>) -> Void) {
+    init(meta: MCameraCaptureMeta, onWillCapture: (() -> Void)?,
+         completion: @escaping (Result<MCameraShot, Error>) -> Void) {
         self.meta = meta
+        self.onWillCapture = onWillCapture
         self.completion = completion
+    }
+
+    /// 系统在这个回调之后才会播放系统快门音。这里释放它的 SystemSound(1108) 资源，
+    /// 让系统音哑掉，只留下 App 自己的快门/闪光音效——否则两个声音会重叠成双响。
+    /// 1108 是 iOS 系统快门音的遗留 ID，社区广泛使用；释放是幂等的，重复拍照安全。
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        #if os(iOS)
+        AudioServicesDisposeSystemSoundID(SystemSoundID(1108))
+        #endif
+        onWillCapture?()
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput,

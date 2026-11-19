@@ -26,6 +26,7 @@ enum MobileSettings {
     static let cameraShutterSoundKey = "mobile.camera.shutterSound"
     static let cameraShutterToneKey = "mobile.camera.shutterTone"
     static let cameraFlashSoundKey = "mobile.camera.flashSound"
+    static let cameraFlashToneKey = "mobile.camera.flashTone"
 
     /// 与导出面板的 formats 顺序一致：JPEG / TIFF sRGB / TIFF ProPhoto / EXR。
     static let exportFormatTitles = [
@@ -138,6 +139,10 @@ enum MobileSettings {
         UserDefaults.standard.object(forKey: cameraFlashSoundKey) as? Bool ?? true
     }
 
+    static var cameraFlashTone: String {
+        UserDefaults.standard.string(forKey: cameraFlashToneKey) ?? "vintage"
+    }
+
     private static func index(forKey key: String, count: Int, fallback: Int) -> Int {
         guard let number = UserDefaults.standard.object(forKey: key) as? Int else {
             return fallback
@@ -172,6 +177,7 @@ struct SettingsScreen: View {
     @AppStorage(MobileSettings.cameraShutterSoundKey) private var cameraShutterSound = true
     @AppStorage(MobileSettings.cameraShutterToneKey) private var cameraShutterTone = "crisp"
     @AppStorage(MobileSettings.cameraFlashSoundKey) private var cameraFlashSound = true
+    @AppStorage(MobileSettings.cameraFlashToneKey) private var cameraFlashTone = "vintage"
 
     @State private var watermark = MWatermarkStore.load()
     @State private var watermarkEditorOpen = false
@@ -324,7 +330,18 @@ struct SettingsScreen: View {
             .disabled(!cameraShutterSound)
 
             MToggleRow(label: "闪光灯音效", isOn: $cameraFlashSound, compact: true,
-                       detail: "开启物理闪光灯时，闪光与快门同步响")
+                       detail: "用闪光灯时只放闪光音效，不与快门声重叠")
+
+            MChoiceRow(label: "闪光音色", value: flashToneLabel,
+                       options: flashToneOptions) { raw in
+                cameraFlashTone = raw
+                // 切换即试听；闪光素材自带快门炸响，试听时同样不叠加快门音。
+                guard cameraFlashSound,
+                      let tone = MSoundEngine.FlashTone(rawValue: raw) else { return }
+                MSoundEngine.shared.prepare()
+                MSoundEngine.shared.playFlash(tone)
+            }
+            .disabled(!cameraFlashSound)
 
             hairline
         }
@@ -335,7 +352,21 @@ struct SettingsScreen: View {
             MProOption(value: "crisp", label: "清脆"),
             MProOption(value: "mechanical", label: "复古机械"),
             MProOption(value: "dslr", label: "数码单反"),
+            MProOption(value: "snappy", label: "短促咔哒"),
+            MProOption(value: "electronic", label: "电子快门"),
         ]
+    }
+
+    private var flashToneOptions: [MProOption] {
+        [
+            MProOption(value: "vintage", label: "复古炸响"),
+            MProOption(value: "combined", label: "闪光+快门"),
+            MProOption(value: "cinematic", label: "电影感"),
+        ]
+    }
+
+    private var flashToneLabel: String {
+        flashToneOptions.first { $0.value == cameraFlashTone }?.label ?? "复古炸响"
     }
 
     private var shutterToneLabel: String {

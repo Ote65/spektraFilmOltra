@@ -2069,19 +2069,28 @@ struct CameraScreen: View {
 
     private func fire() {
         MHaptic.medium()
-        // 音效与触感、闪白在同一帧触发：播放器已预加载，这里只做 seek + play。
+        // 触感与 UI 闪白是按下瞬间的即时反馈，留在主线程立即给。
+        // 音效则交给拍照代理，在系统快门音/物理闪光那一精确时刻触发（见 onWillCapture），
+        // 否则会比真实曝光早半拍，且和系统音叠成双响。
         MSoundEngine.shared.prepare()
-        if MobileSettings.cameraShutterSound,
-           let tone = MSoundEngine.ShutterTone(rawValue: MobileSettings.cameraShutterTone) {
-            MSoundEngine.shared.playShutter(tone)
-        }
-        // 闪光灯音效只在物理闪光真正会亮时响；UI 闪白是纯视觉效果，不单独配音。
-        if MobileSettings.cameraFlashSound && camera.flash == .on && camera.hasFlash {
-            MSoundEngine.shared.playFlash()
-        }
         withAnimation(.easeOut(duration: 0.06)) { flashOpacity = 0.8 }
         withAnimation(.easeIn(duration: 0.24).delay(0.07)) { flashOpacity = 0 }
-        camera.capture()
+
+        // 把此刻的设置快照下来：willCapture 在拍摄队列回调，不能再读已变化的相机状态。
+        // 物理闪光真会亮时，闪光素材本身就是"一次完整闪光"的录音（自带炸响/快门声），
+        // 只放它、绝不再叠独立快门音，否则会双响；UI 闪白是纯视觉，不单独配音。
+        let flashWillFire = camera.flash == .on && camera.hasFlash
+        let shutterTone = MSoundEngine.ShutterTone(rawValue: MobileSettings.cameraShutterTone)
+        let flashTone = MSoundEngine.FlashTone(rawValue: MobileSettings.cameraFlashTone)
+        let wantShutter = MobileSettings.cameraShutterSound && !flashWillFire
+        let wantFlash = MobileSettings.cameraFlashSound && flashWillFire
+        camera.capture(onWillCapture: {
+            if wantFlash, let flashTone {
+                MSoundEngine.shared.playFlash(flashTone)
+            } else if wantShutter, let shutterTone {
+                MSoundEngine.shared.playShutter(shutterTone)
+            }
+        })
     }
 
     private func startCountdown() {
