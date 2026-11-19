@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 #if os(macOS)
 import AppKit
 #else
@@ -524,6 +525,84 @@ enum MHaptic {
         #if os(iOS)
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         #endif
+    }
+}
+
+// MARK: - 直出相机音效
+/// 拍照音效引擎：播放器在相机出现时一次性创建并 prepareToPlay，
+/// 触发时只做 currentTime=0 + play，避免首次读盘/解码让"咔嚓"慢半拍。
+/// 音效素材为 CC0，放在 Bundle 的 Sounds 目录，闪光音效已裁掉前导静音，起音在 0.02s。
+final class MSoundEngine {
+    static let shared = MSoundEngine()
+
+    enum ShutterTone: String, CaseIterable {
+        case crisp
+        case mechanical
+        case dslr
+
+        var resourceName: String {
+            switch self {
+            case .crisp: return "shutter-crisp"
+            case .mechanical: return "shutter-mechanical"
+            case .dslr: return "shutter-dslr"
+            }
+        }
+    }
+
+    private var shutterPlayers: [ShutterTone: AVAudioPlayer] = [:]
+    private var flashPlayer: AVAudioPlayer?
+    private var isPrepared = false
+
+    private init() {}
+
+    /// 幂等；相机 onAppear 调用，fire() 里再兜底一次防止漏调。
+    func prepare() {
+        guard !isPrepared else { return }
+        #if os(iOS)
+        // 和相机一样：静音键下仍响，且用 mixWithOthers 不打断用户正在听的音乐。
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try? session.setActive(true)
+        #endif
+        for tone in ShutterTone.allCases {
+            shutterPlayers[tone] = makePlayer(tone.resourceName, volume: 0.9)
+        }
+        flashPlayer = makePlayer("flash-vintage", volume: 0.75)
+        // 放到最后：资源若首次读取失败，下一次调用还能重试。
+        isPrepared = true
+    }
+
+    func playShutter(_ tone: ShutterTone) {
+        if let player = shutterPlayers[tone] {
+            restart(player)
+        } else if let player = makePlayer(tone.resourceName, volume: 0.9) {
+            shutterPlayers[tone] = player
+            restart(player)
+        }
+    }
+
+    func playFlash() {
+        let player = flashPlayer ?? makePlayer("flash-vintage", volume: 0.75)
+        guard let player else { return }
+        flashPlayer = player
+        restart(player)
+    }
+
+    private func makePlayer(_ resource: String, volume: Float) -> AVAudioPlayer? {
+        guard let url = Bundle.main.url(forResource: resource,
+                                        withExtension: "wav",
+                                        subdirectory: "Sounds") else { return nil }
+        guard let player = try? AVAudioPlayer(contentsOf: url) else { return nil }
+        player.volume = volume
+        player.prepareToPlay()
+        return player
+    }
+
+    private func restart(_ player: AVAudioPlayer) {
+        // 快速连拍时从头开始，不叠加成一片糊声。
+        if player.isPlaying { player.stop() }
+        player.currentTime = 0
+        player.play()
     }
 }
 

@@ -396,6 +396,10 @@ private struct MVideoDrawer: View {
     @ObservedObject var session: MVideoSession
     let onCollapse: () -> Void
 
+    /// 黑白模式下停用的色彩调参项：与照片显影台「色彩」页的两条快速轴同口径。
+    /// 去色后这两条轴不再改变画面，置灰并禁止拖动，避免用户误以为参数失效。
+    private static let colorAxisIDs: Set<String> = ["color_density", "temperature"]
+
     var body: some View {
         VStack(spacing: 0) {
             // 把手换成向下箭头：点一下整块面板下沉收起，画布同时长高。
@@ -454,8 +458,20 @@ private struct MVideoDrawer: View {
                         .buttonStyle(.plain)
                     }
 
+                    // 黑白模式：显影之后的亮度归一，不是一条显影轴，故单独置于参数组标题下、滑条之前。
+                    MToggleRow(label: "黑白模式",
+                               isOn: Binding(
+                                get: { session.isMonochrome },
+                                set: { session.setMonochrome($0) }
+                               ),
+                               compact: true)
+
                     ForEach(session.videoAxes()) { axis in
-                        MVideoAxisRow(axis: axis, session: session)
+                        MVideoAxisRow(
+                            axis: axis,
+                            session: session,
+                            isEnabled: !Self.colorAxisIDs.contains(axis.id) || !session.isMonochrome
+                        )
                     }
 
                     Text("参数只重显影当前帧；点右上角「渲染视频」才对全片逐帧显影。")
@@ -501,6 +517,7 @@ private struct MVideoDrawer: View {
 private struct MVideoAxisRow: View {
     let axis: MVideoAxis
     @ObservedObject var session: MVideoSession
+    var isEnabled: Bool = true
     @State private var value: Double = 0
 
     var body: some View {
@@ -512,6 +529,7 @@ private struct MVideoAxisRow: View {
             step: axis.step,
             decimals: axis.decimals,
             suffix: axis.suffix,
+            isEnabled: isEnabled,
             compact: true
         )
         .onAppear { value = axis.value }

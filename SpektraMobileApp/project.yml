@@ -32,6 +32,8 @@ targets:
         type: folder
       - path: ../SpektraMobile/Resources/Fonts
         type: folder
+      - path: ../SpektraMobile/Resources/Sounds
+        type: folder
       - path: Assets.xcassets
     info:
       path: Info.plist

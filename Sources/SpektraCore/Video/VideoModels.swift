@@ -205,6 +205,8 @@ struct VideoFrameUniforms {
     var grainPixelScale: Float = 1
     /// 印相冷暖：-1…1，正值偏暖（显示域 R/B 互补增益）。
     var gradeTemperature: Float = 0
+    /// 黑白模式：1 = 显影结果之后做亮度归一。显示域变换，不进 LUT 烘焙。
+    var monochrome: Float = 0
 
     // ---- 物理颗粒（实验性）----
     /// 0 = 原 valueNoise 密度域颗粒；1 = 逐像素 Poisson-Binomial 卤化银粒子 + 微结构。

@@ -221,6 +221,7 @@ struct CameraScreen: View {
         .preferredColorScheme(.dark)
         .onAppear {
             camera.start()
+            MSoundEngine.shared.prepare()
             syncLevelMonitor()
             normalizeDirectSelection()
             // 旧版本存过已下线的画幅（全幅 / 4:3 / 16:9）：回落到 3:4。
@@ -2028,6 +2029,7 @@ struct CameraScreen: View {
         directOpeningDevelop = true
         let request = MDirectDevelopRequest(
             rawURL: raw, renderedURL: result.url, edit: edit, grade: recipe,
+            border: directBorder,
             baseline: directBaseline, aspect: directAspect,
             capturedLandscape: directCapturedLandscape,
             mirrorFront: directMirrorFront)
@@ -2067,6 +2069,16 @@ struct CameraScreen: View {
 
     private func fire() {
         MHaptic.medium()
+        // 音效与触感、闪白在同一帧触发：播放器已预加载，这里只做 seek + play。
+        MSoundEngine.shared.prepare()
+        if MobileSettings.cameraShutterSound,
+           let tone = MSoundEngine.ShutterTone(rawValue: MobileSettings.cameraShutterTone) {
+            MSoundEngine.shared.playShutter(tone)
+        }
+        // 闪光灯音效只在物理闪光真正会亮时响；UI 闪白是纯视觉效果，不单独配音。
+        if MobileSettings.cameraFlashSound && camera.flash == .on && camera.hasFlash {
+            MSoundEngine.shared.playFlash()
+        }
         withAnimation(.easeOut(duration: 0.06)) { flashOpacity = 0.8 }
         withAnimation(.easeIn(duration: 0.24).delay(0.07)) { flashOpacity = 0 }
         camera.capture()

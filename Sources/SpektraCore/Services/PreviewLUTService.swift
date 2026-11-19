@@ -565,6 +565,9 @@ final class PreviewLUTService: @unchecked Sendable {
     static func cacheKey(edit: PhotoEdit, inputColorSpace: String,
                          inputCCTF: Bool) -> String {
         var e = edit
+        // 黑白是显影之后的显示域归一，不改物理链路；若留在键里，
+        // 切换黑白会白烘一张完全相同的 LUT（65³ 重烘会明显卡顿）。
+        e.monochrome = false
         e.camera.autoExposure = false
         e.camera.exposureCompensationEV = 0
         e.enlarger.printExposure = 1

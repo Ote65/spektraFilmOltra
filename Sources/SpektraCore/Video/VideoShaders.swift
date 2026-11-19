@@ -149,7 +149,7 @@ enum VideoShaders {
         float  unifR;            // 228  均匀度
         float  unifG;            // 232
         float  unifB;            // 236
-        float  padE0;            // 240  16 字节对齐补齐
+        float  monochrome;       // 240  复用原 padE0：>0.5 时显示域归一成灰
         float  padE1;            // 244
     };
 
@@ -561,6 +561,14 @@ enum VideoShaders {
         if (abs(p.gradeTemperature) > 0.001f) {
             disp.r *= 1.0f + p.gradeTemperature * 0.12f;
             disp.b *= 1.0f - p.gradeTemperature * 0.12f;
+        }
+
+        // ---- 黑白模式：显影结果之后的亮度归一（与照片路径同义）----
+        // 放在温度之后，冷暖增益也被一并归掉；用同一套 Rec.709 亮度权重，
+        // 输出已是 sRGB 显示域，权重与照片端 sRGB 默认值一致。
+        // 只作用于显示/导出，不改任何核心显影参数，也不进 LUT 烘焙。
+        if (p.monochrome > 0.5f) {
+            disp = float3(dot(disp, lw));
         }
 
         outTex.write(float4(clamp(disp, 0.0f, 1.0f), 1.0f), gid);

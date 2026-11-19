@@ -114,6 +114,9 @@ struct MVideoAxis: Identifiable, Hashable {
 final class MVideoSession: ObservableObject {
     @Published private(set) var project: VideoProject
     @Published private(set) var edit: PhotoEdit
+    /// 黑白模式：显影结果之后的亮度归一。只影响显示/导出，不改核心显影参数，
+    /// 故切换时只重显影当前帧，不重烘 LUT（键里已剔除该字段）。
+    @Published private(set) var isMonochrome = false
 
     // 单帧显影
     @Published private(set) var stillImage: MPlatformImage?
@@ -155,6 +158,7 @@ final class MVideoSession: ObservableObject {
     init(project: VideoProject, renderer: VideoRendering, store: VideoProjectStore) {
         self.project = project
         self.edit = project.edit
+        self.isMonochrome = project.edit.monochrome
         self.baseline = project.edit
         self.store = store
         self.sourceURL = project.sourceURL
@@ -288,6 +292,16 @@ final class MVideoSession: ObservableObject {
         commitEdit(e, rebakeLUT: true)
     }
 
+    /// 黑白模式开关。只改显示域标志：不重烘 LUT、不动任何参数轴，
+    /// 只让当前帧与后续成片走亮度归一（与照片显影台语义一致）。
+    func setMonochrome(_ value: Bool) {
+        guard value != edit.monochrome else { return }
+        var e = edit
+        e.monochrome = value
+        isMonochrome = value
+        commitEdit(e)
+    }
+
     func resetParameters() {
         commitEdit(baseline, rebakeLUT: true)
     }
@@ -303,6 +317,7 @@ final class MVideoSession: ObservableObject {
     ///   参数轴全部走 uniform 或现算模型，重烘 65³ LUT 只会让拖动卡住。
     private func commitEdit(_ e: PhotoEdit, rebakeLUT: Bool = false) {
         edit = e
+        isMonochrome = e.monochrome
         var p = project
         p.edit = e
         project = p

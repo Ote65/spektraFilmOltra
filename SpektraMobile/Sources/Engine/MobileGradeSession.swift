@@ -121,12 +121,15 @@ final class MobileGradeSession: ObservableObject {
         self.previewScale = saved >= 0.125 && saved <= 1.0 ? saved : 1.0
         self.presets = GradePresetStore.shared.all
         self.luts = GradePresetStore.shared.luts()
-        if let remembered = MFilmBorderMemory.load() {
+        // 照片自己的片边优先：直出成片页 / 上一次调色为该照片选定的边，
+        // 必须原样回放，不能被「跨照片全局记忆 + 冷启动强制关闭」覆盖，
+        // 否则同一批直出照片会出现「有的带边、有的没边」的随机观感。
+        if let data = photo.borderData,
+           let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
+            self.border = decoded.normalized()
+        } else if let remembered = MFilmBorderMemory.load() {
+            // 没有照片级边框时（如新导入的照片）才延续全局记忆。
             self.border = remembered
-        } else if let data = photo.borderData,
-                  let decoded = try? JSONDecoder().decode(MFilmBorderConfig.self, from: data) {
-            // 旧版本按照片保存：迁移成记忆参数，片边开关按启动默认关闭。
-            self.border = MFilmBorderMemory.launchDefault(decoded)
         }
         if let data = photo.cropData,
            let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
@@ -197,10 +200,10 @@ final class MobileGradeSession: ObservableObject {
                 self.originalBaseCG = warpedOriginal ?? pristineOriginal
                 if let framedOriginal {
                     self.originalImage = MImage.make(cgImage: framedOriginal)
-                    self.previewAspect = CGFloat(framedOriginal.width) / CGFloat(max(1, framedOriginal.height))
-                } else {
-                    self.previewAspect = CGFloat(warped.width) / CGFloat(max(1, warped.height))
                 }
+                // 舞台比例只由实际显示的 previewImage 派生（见 applyBorderToPreview / schedule），
+                // 这两处都有 flag 保护。交接回调没有版本保护，若在这里也写 previewAspect，
+                // 慢一拍的回调用过期片边状态覆盖，表现为「同一张图比例随机跳动」。
                 self.schedule(immediate: true)
             }
         }
@@ -324,10 +327,9 @@ final class MobileGradeSession: ObservableObject {
                 self.originalBaseCG = warpedOriginal ?? original
                 if let framed {
                     self.originalImage = MImage.make(cgImage: framed)
-                    self.previewAspect = CGFloat(framed.width) / CGFloat(max(1, framed.height))
-                } else {
-                    self.previewAspect = CGFloat(warped.width) / CGFloat(max(1, warped.height))
                 }
+                // 比例交由紧随其后的 schedule / applyBorderToPreview 统一派生，
+                // 避免与渲染回调各写一份、顺序不确定造成跳变。
                 self.isRendering = false
                 self.phaseLabel = ""
                 self.schedule(immediate: true)

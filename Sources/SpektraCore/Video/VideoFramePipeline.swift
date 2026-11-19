@@ -32,10 +32,20 @@ final class VideoFramePipeline: @unchecked Sendable {
     /// 轨道 preferredTransform → 显示方向的唯一推导入口。probe（UI 尺寸）和
     /// export（编码尺寸 + 旋转方向）共用，避免两处各算一遍导致不一致。
     /// 约定：相机竖拍 [0,1,-1,0] 实测对应 CI 的 .right；[0,-1,1,0] 对应 .left。
+    /// 180° 不换宽高（rotated=false），但必须真实旋转像素：相册导入的倒置视频
+    /// 若只当它没旋转，存回相册后仍是倒的。旧版把这一支漏在 rotated 早退之后，
+    /// 重构时又只保留了 ±90/±270，等于一直没生效。
     static func displayGeometry(transform: CGAffineTransform)
         -> (rotated: Bool, orientation: CGImagePropertyOrientation?) {
         let angle = atan2(Double(transform.b), Double(transform.a)) * 180 / .pi
-        let rotated = abs(abs(angle) - 90) < 1 || abs(abs(angle) - 270) < 1
+        let magnitude = abs(angle)
+        // 用行列式排除镜像（a=-1,d=+1 的水平翻转不是 180° 旋转），
+        // 避免把镜像素材误转半圈。纯 180° 旋转的行列式为 +1。
+        let determinant = transform.a * transform.d - transform.b * transform.c
+        if abs(magnitude - 180) < 1, determinant > 0 {
+            return (false, .down)
+        }
+        let rotated = abs(magnitude - 90) < 1 || abs(magnitude - 270) < 1
         guard rotated else { return (false, nil) }
         return (true, transform.b > 0 ? .right : .left)
     }
@@ -193,6 +203,9 @@ final class VideoFramePipeline: @unchecked Sendable {
         u.gradeSaturation = Float(min(max(saturation, 0), 2))
         // 印相冷暖：相纸滤色偏移在 LUT 里被归零，改由显示域 R/B 增益承载。
         u.gradeTemperature = Float(min(max(q["temperature"] ?? 0, -100), 100) / 100)
+        // 黑白：显影之后、显示域的亮度归一。不进烘焙键，切换无需重烘 LUT；
+        // 当前 edit 必须经 developStill(edit:) 传入，export 则从 setup.edit 读取。
+        u.monochrome = e.monochrome ? 1 : 0
 
         // 物理颗粒：设置页「GPU 物理颗粒」开关为唯一主控（命令行可 defaults write 同一个 key）。
         // 关闭即恢复原 valueNoise 密度域颗粒，不受工程 quickIntents 影响。
