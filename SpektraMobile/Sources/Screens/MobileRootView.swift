@@ -118,10 +118,16 @@ struct MobileRootView: View {
             .allowsHitTesting(activeScreen == .home)
 
             if screen == .camera {
-                // 拍完直接入库并进入这张照片的显影台；相册写入在相机页后台继续。
+                // 拍完入库并写相册；是否立即进显影台由相机页按设置决定，
+                // 不进的那张留在「本次拍摄」列表里供稍后打开。
                 CameraScreen(onClose: closeCamera,
-                             onCaptured: { url, enterDevelop, meta in
-                                 openCaptured(url, enterDevelop: enterDevelop, meta: meta)
+                             onCaptured: { url, meta in
+                                 await importCaptured(url, meta: meta)
+                             },
+                             onOpenDevelop: { photoID in
+                                 // 入库期间用户可能已关掉相机：只保留结果，不强行跳页。
+                                 guard screen == .camera else { return }
+                                 openDevelop(photoID)
                              },
                              onDirectSave: { request in
                                  await saveDirect(request)
@@ -366,27 +372,19 @@ struct MobileRootView: View {
         Task { await engine.refreshAssets() }
     }
 
-    /// 拍完 → 入库 → 按设置决定是否直接进入这张照片的显影台。
-    /// `enterDevelop == false` 时停留在相机页，实现连续拍摄。
-    /// 入库会把原片写进相册（与主页相册映射一致），成功后清理相机临时文件。
-    private func openCaptured(_ url: URL, enterDevelop: Bool, meta: MCameraCaptureMeta) {
-        Task {
-            let report = await engine.importPhotos([url], captureMeta: meta)
-            guard let photoID = report.firstID else {
-                showToast(report.reason.isEmpty ? "拍摄的照片没能入库" : report.reason)
-                // 只有仍停留在拍摄页时才退回主页，避免失败回调把用户从其他页面拽走。
-                if screen == .camera { closeCamera() }
-                return
-            }
-            try? FileManager.default.removeItem(at: url)
-            // 入库期间用户可能已经关掉相机：此时只保留入库结果，不再强行跳页。
-            guard screen == .camera else { return }
-            if enterDevelop {
-                openDevelop(photoID)
-            } else {
-                showToast("已保存到访达")
-            }
+    /// 拍完 → 入库 → 写系统相册 → 返回 photoID 给相机页。
+    /// 是否立即进显影台由相机页按设置决定：不进的那张 photoID 会留在「本次拍摄」列表。
+    /// 成功后清理相机临时文件；失败时只在仍停留拍摄页才退回主页，
+    /// 避免异步失败回调把用户从其他页面拽走。
+    private func importCaptured(_ url: URL, meta: MCameraCaptureMeta) async -> String? {
+        let report = await engine.importPhotos([url], captureMeta: meta)
+        guard let photoID = report.firstID else {
+            showToast(report.reason.isEmpty ? "拍摄的照片没能入库" : report.reason)
+            if screen == .camera { closeCamera() }
+            return nil
         }
+        try? FileManager.default.removeItem(at: url)
+        return photoID
     }
 
     /// 直出保存：先把成片写进系统相册，再按设置决定是否保留 RAW 工程。

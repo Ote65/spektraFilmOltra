@@ -559,12 +559,16 @@ final class MSoundEngine {
         case vintage
         case combined
         case cinematic
+        case capacitor
+        case bulb
 
         var resourceName: String {
             switch self {
             case .vintage: return "flash-vintage"
             case .combined: return "flash-combined"
             case .cinematic: return "flash-cinematic"
+            case .capacitor: return "flash-capacitor"
+            case .bulb: return "flash-bulb"
             }
         }
     }

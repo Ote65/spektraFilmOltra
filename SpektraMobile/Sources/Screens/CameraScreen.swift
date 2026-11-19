@@ -16,15 +16,25 @@ private enum MDirectCardPhase {
     }
 }
 
+/// 本次打开相机以来拍下并已入库的一张照片。只留列表所需的最小数据，
+/// 不持有临时 DNG（入库成功后根视图已清理）：photoID 用于进入显影台，缩略图用于预览。
+struct MSessionShot: Identifiable {
+    let photoID: String
+    let thumbnail: MPlatformImage?
+    var id: String { photoID }
+}
+
 /// 拍摄页：4:3 取景 + iOS 风格快门。
 ///
-/// 拍一张 RAW（DNG）→ 交给根视图入库 → 直接进入这张照片的显影台；
+/// 拍一张 RAW（DNG）→ 交给根视图入库 → 按设置决定直接进显影台或留在「本次拍摄」列表；
 /// 相册写入在后台继续，成功后清理临时文件。
 struct CameraScreen: View {
     let onClose: () -> Void
-    /// 拍完把 DNG 交给根视图：入库，并按 `enterDevelop` 决定是否进入显影台。
+    /// 拍完把 DNG 交给根视图入库并写系统相册，返回库里的 photoID 供本次拍摄列表使用。
     /// `meta` 是快门瞬间的曝光/色温，必须一起入库，显影才会复现拍摄意图。
-    let onCaptured: (URL, Bool, MCameraCaptureMeta) -> Void
+    let onCaptured: (URL, MCameraCaptureMeta) async -> String?
+    /// 从本次拍摄列表进入显影台：原片已在库中，直接按 photoID 打开。
+    let onOpenDevelop: (String) -> Void
     /// 直出保存：根视图决定是否保留 RAW 工程，并写系统相册。
     let onDirectSave: (MDirectSaveRequest) async -> MDirectSaveOutcome
     /// 直出成片页进入显影台：原片入库，并沿用拍摄时选择的显影 / 调色预设。
@@ -40,6 +50,14 @@ struct CameraScreen: View {
     @AppStorage(MobileSettings.cameraLevelKey) private var levelEnabled = true
     @AppStorage(MobileSettings.cameraVolumeShutterKey) private var volumeShutter = true
     @AppStorage(MobileSettings.cameraEnterDevelopKey) private var enterDevelopAfterShot = true
+
+    /// 本次拍摄列表：关闭「拍摄立即进入显影台」时，每张入库后的照片追加到这里。
+    /// 纯 @State，随 CameraScreen 创建/销毁——重开相机页即清零。
+    @State private var sessionShots: [MSessionShot] = []
+    /// 左下角缩略图点开的本次拍摄列表弹层。
+    @State private var sessionListOpen = false
+    /// 列表里正在预览的那张（点缩略图进大图预览）。
+    @State private var previewingShot: MSessionShot?
 
     @State private var timerMenuOpen = false
     @State private var countdown: Int?
@@ -282,6 +300,126 @@ struct CameraScreen: View {
             easeDirectProgress(to: value)
         }
         .onDisappear { directEaseTask?.cancel() }
+        .sheet(isPresented: $sessionListOpen) {
+            sessionListSheet
+        }
+        .sheet(item: $previewingShot) { shot in
+            sessionPreviewSheet(shot)
+        }
+    }
+
+    // MARK: - 本次拍摄列表 / 预览
+
+    /// 本次拍摄列表弹层：网格展示已入库的照片，点任意一张进入大图预览。
+    private var sessionListSheet: some View {
+        NavigationStack {
+            Group {
+                if sessionShots.isEmpty {
+                    VStack(spacing: 14) {
+                        Image(systemName: "photo.on.rectangle.angled")
+                            .font(.system(size: 34, weight: .light))
+                            .foregroundStyle(MColor.text4)
+                        Text("还没有拍摄的照片")
+                            .font(.rowLabel)
+                            .foregroundStyle(MColor.text3)
+                        Text("关闭「拍摄立即进入显影台」后，\n拍下的照片会保存在这里和相册")
+                            .font(.caption)
+                            .foregroundStyle(MColor.text4)
+                            .multilineTextAlignment(.center)
+                    }
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())],
+                                  spacing: 10) {
+                            ForEach(sessionShots.reversed()) { shot in
+                                Button {
+                                    MHaptic.light()
+                                    previewingShot = shot
+                                } label: {
+                                    ZStack(alignment: .bottomTrailing) {
+                                        if let thumb = shot.thumbnail {
+                                            MImage.swiftUI(thumb)
+                                                .resizable()
+                                                .aspectRatio(contentMode: .fill)
+                                                .frame(maxWidth: .infinity)
+                                                .aspectRatio(0.75, contentMode: .fill)
+                                                .clipped()
+                                        } else {
+                                            Rectangle().fill(Color.white.opacity(0.06))
+                                                .aspectRatio(0.75, contentMode: .fill)
+                                        }
+                                    }
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
+                                    )
+                                }
+                                .buttonStyle(MPressStyle(scale: 0.96))
+                            }
+                        }
+                        .padding(16)
+                    }
+                }
+            }
+            .background(MColor.canvas)
+            .navigationTitle("本次拍摄 · \(sessionShots.count) 张")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { sessionListOpen = false }
+                        .foregroundStyle(MColor.brass)
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .presentationBackground(MColor.surface1)
+    }
+
+    /// 大图预览：看清晰缩略图，并可进入这张照片的显影台。
+    private func sessionPreviewSheet(_ shot: MSessionShot) -> some View {
+        VStack(spacing: 0) {
+            ZStack {
+                MColor.canvas.ignoresSafeArea()
+                if let thumb = shot.thumbnail {
+                    MImage.swiftUI(thumb)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .padding(.horizontal, 12)
+                }
+            }
+            .frame(maxHeight: .infinity)
+
+            VStack(spacing: 12) {
+                Button {
+                    MHaptic.medium()
+                    previewingShot = nil
+                    sessionListOpen = false
+                    onOpenDevelop(shot.photoID)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "film")
+                        Text("进入显影台")
+                    }
+                    .font(.button)
+                    .foregroundStyle(.black)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 50)
+                    .background(MColor.brass, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .buttonStyle(MPressStyle(scale: 0.98))
+
+                Button("返回列表") { previewingShot = nil }
+                    .font(.rowLabel)
+                    .foregroundStyle(MColor.text3)
+                    .frame(height: 40)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 18)
+            .background(MColor.surface1)
+        }
+        .presentationDetents([.large])
+        .presentationBackground(MColor.surface1)
     }
 
     // MARK: - 顶栏
@@ -884,8 +1022,15 @@ struct CameraScreen: View {
 
     private var bottomRow: some View {
         HStack {
-            lastShotThumbnail
-                .frame(width: 58, height: 58)
+            Button {
+                MHaptic.light()
+                sessionListOpen = true
+            } label: {
+                lastShotThumbnail
+                    .frame(width: 58, height: 58)
+            }
+            .buttonStyle(MPressStyle(scale: 0.92))
+            .accessibilityLabel("本次拍摄列表")
 
             Spacer()
 
@@ -915,32 +1060,45 @@ struct CameraScreen: View {
         .padding(.bottom, max(10, insets.bottom - 10))
     }
 
-    /// 只显示本次拍摄的照片：`lastShot` 随这个页面一起创建 / 销毁。
+    /// 左下角入口图：优先显示本次列表里最新入库的一张（点开可看全部），
+    /// 否则回落到相机刚拍的 lastShot。二者都随页面创建 / 销毁。
     @ViewBuilder
     private var lastShotThumbnail: some View {
-        if let thumbnail = camera.lastShot?.thumbnail {
-            MImage.swiftUI(thumbnail)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(width: 58, height: 58)
-                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
-                )
-        } else {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(Color.white.opacity(0.05))
-                .frame(width: 58, height: 58)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
-                )
-                .overlay(
-                    Image(systemName: "photo")
-                        .font(.system(size: 15, weight: .light))
-                        .foregroundStyle(MColor.text4)
-                )
+        let thumbnail = sessionShots.last?.thumbnail ?? camera.lastShot?.thumbnail
+        ZStack(alignment: .topTrailing) {
+            if let thumbnail {
+                MImage.swiftUI(thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 58, height: 58)
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
+                    )
+            } else {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.white.opacity(0.05))
+                    .frame(width: 58, height: 58)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(MColor.hairlineStrong, lineWidth: 1)
+                    )
+                    .overlay(
+                        Image(systemName: "photo")
+                            .font(.system(size: 15, weight: .light))
+                            .foregroundStyle(MColor.text4)
+                    )
+            }
+            // 张数角标：本次已入库的照片数。
+            if sessionShots.count > 1 {
+                Text("\(sessionShots.count)")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(minWidth: 18, minHeight: 18)
+                    .background(Circle().fill(MColor.brass))
+                    .offset(x: 4, y: -4)
+            }
         }
     }
 
@@ -2129,15 +2287,27 @@ struct CameraScreen: View {
         }
     }
 
-    /// 拍完交给根视图异步入库；入库完成后由根视图删除临时文件，
-    /// 相册写入也由引擎在入库后统一处理，避免两边争抢同一个临时文件。
+    /// 拍完交给根视图异步入库并写相册；入库完成后由根视图删除临时文件。
+    /// 开关决定去向：开→直接进显影台；关→留在取景页并把这张追加到「本次拍摄」列表。
     private func handleShot() {
         guard let shot = camera.lastShot else { return }
         if directMode {
             beginDirect(shot)
-        } else {
-            // 关闭「拍摄后进入显影台」时停留取景页，可继续连拍。
-            onCaptured(shot.url, enterDevelopAfterShot, shot.meta)
+            return
+        }
+        let url = shot.url
+        let enterNow = enterDevelopAfterShot
+        Task {
+            let photoID = await onCaptured(url, shot.meta)
+            guard let photoID else { return }
+            await MainActor.run {
+                if enterNow {
+                    onOpenDevelop(photoID)
+                } else {
+                    sessionShots.append(MSessionShot(photoID: photoID,
+                                                     thumbnail: shot.thumbnail))
+                }
+            }
         }
     }
 

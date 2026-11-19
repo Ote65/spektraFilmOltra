@@ -305,8 +305,8 @@ struct SettingsScreen: View {
             MToggleRow(label: "镜像前置相机", isOn: $cameraMirrorFront, compact: true,
                        detail: "前置成片镜像为取景所见（和预览一样）；显影台与 RAW 原片保持原始画面")
 
-            MToggleRow(label: "拍摄后进入显影台", isOn: $cameraEnterDevelop, compact: true,
-                       detail: "关闭后停留在取景页，可连续拍摄")
+            MToggleRow(label: "拍摄立即进入显影台", isOn: $cameraEnterDevelop, compact: true,
+                       detail: "关闭后拍完存进相册，点左下角缩略图查看本次拍摄并进入显影台")
 
             MToggleRow(label: "音量键拍摄", isOn: $cameraVolumeShutter,
                        isEnabled: volumeShutterAvailable, compact: true,
@@ -362,6 +362,8 @@ struct SettingsScreen: View {
             MProOption(value: "vintage", label: "复古炸响"),
             MProOption(value: "combined", label: "闪光+快门"),
             MProOption(value: "cinematic", label: "电影感"),
+            MProOption(value: "capacitor", label: "电容啸叫"),
+            MProOption(value: "bulb", label: "闪光灯泡"),
         ]
     }
 
