@@ -256,6 +256,10 @@ final class MobileDevelopSession: ObservableObject {
     private let lutQueue = DispatchQueue(label: "spektra.mobile.develop.lut", qos: .userInitiated)
     private let exportQueue = DispatchQueue(label: "spektra.mobile.develop.export", qos: .userInitiated)
 
+    /// 直出 / 调色保存的裁切几何：只作用在显示图上，让显影台画幅与成片一致。
+    /// 线性源 `image` 与导出交接保持全幅；这里不参与显影算法。
+    private var displayGeometry = MPhotoGeometry()
+
     private var edit: PhotoEdit
     private var baseline: PhotoEdit
     /// 导入时状态：显影台重置回到这里（不碰调色台的裁切 / 边框）。
@@ -342,6 +346,12 @@ final class MobileDevelopSession: ObservableObject {
         } else {
             self.baseline = photo.edit
         }
+        // 直出成片（或上次调色）保存的裁切框：显影台据此裁显示图，
+        // 使画幅与成片一致。调色台读的是同一份 cropData，构图保持连续。
+        if let data = photo.cropData,
+           let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
+            self.displayGeometry = decoded.normalized()
+        }
         self.quickIntents = photo.edit.quickIntents
         self.filmID = photo.edit.filmStock
         self.paperID = photo.edit.printStock
@@ -412,6 +422,7 @@ final class MobileDevelopSession: ObservableObject {
         // 解码参数在主线程取好，后台队列只做像素工作。
         let options = rawOptions()
         let rotation = edit.rotationTurns
+        let displayGeometry = self.displayGeometry
         armLoadTimeout(token: token)
         loadQueue.async { [weak self] in
             do {
@@ -422,6 +433,9 @@ final class MobileDevelopSession: ObservableObject {
                 let display = Self.displayImage(preview, colorSpace: loaded.colorSpace,
                                                 cctfDecoding: loaded.cctfDecoding)
                 let original = PreviewRenderer.cgImage(from: display)
+                let croppedOriginal = original.flatMap {
+                    Self.croppedDisplay($0, geometry: displayGeometry)
+                }
                 Task { @MainActor [weak self] in
                     guard let self, self.loadToken == token else { return }
                     self.loadInFlight = false
@@ -439,9 +453,12 @@ final class MobileDevelopSession: ObservableObject {
                     self.inputColorSpace = loaded.colorSpace
                     self.inputCCTF = loaded.cctfDecoding
                     self.isLoaded = true
-                    self.previewAspect = CGFloat(loaded.image.width) / CGFloat(max(1, loaded.image.height))
-                    if let original {
-                        self.originalImage = MImage.make(cgImage: original)
+                    // 画幅按裁切后的显示图派生，与直出成片一致；源图仍全幅，显影/导出不受影响。
+                    if let croppedOriginal {
+                        self.previewAspect = CGFloat(croppedOriginal.width) / CGFloat(max(1, croppedOriginal.height))
+                        self.originalImage = MImage.make(cgImage: croppedOriginal)
+                    } else {
+                        self.previewAspect = CGFloat(loaded.image.width) / CGFloat(max(1, loaded.image.height))
                     }
                     self.isRendering = false
                     self.phaseLabel = ""
@@ -535,6 +552,8 @@ final class MobileDevelopSession: ObservableObject {
         if let originalImage, let rotated = originalImage.quarterTurnedClockwise {
             self.originalImage = rotated
         }
+        // 裁切框跟着画面转，保证旋转后重渲染的裁切方向与显示一致。
+        displayGeometry = displayGeometry.rotatedClockwise()
         persistSoon()
     }
 
@@ -1387,6 +1406,7 @@ final class MobileDevelopSession: ObservableObject {
         phaseProgress = 0
         let monochrome = edit.monochrome
         let outputColorSpace = params.io.outputColorSpace
+        let displayGeometry = self.displayGeometry
         renderer.render(
             params: params,
             image: image,
@@ -1403,10 +1423,13 @@ final class MobileDevelopSession: ObservableObject {
                 ? Self.monochrome(outcome.image, colorSpace: outputColorSpace)
                 : outcome.image
             let display = PreviewRenderer.cgImage(from: rgb)
+            // 裁切像素重排放到渲染队列，主线程只做图片包装与状态赋值。
+            let cropped = display.flatMap { Self.croppedDisplay($0, geometry: displayGeometry) }
             Task { @MainActor [weak self] in
                 guard let self, self.renderToken == token else { return }
-                if let display, !outcome.cancelled {
-                    self.previewImage = MImage.make(cgImage: display)
+                if let cropped, !outcome.cancelled {
+                    self.previewImage = MImage.make(cgImage: cropped)
+                    self.previewAspect = CGFloat(cropped.width) / CGFloat(max(1, cropped.height))
                 }
                 self.isPredicted = false
                 self.isRendering = false
@@ -1453,6 +1476,7 @@ final class MobileDevelopSession: ObservableObject {
         // 交互近似参数在主线程取好，后台只做像素运算。
         let adjustments = previewAdjustments()
         let monochrome = edit.monochrome
+        let displayGeometry = self.displayGeometry
         fastInFlight = true
         fastDirty = false
         lutQueue.async { [weak self] in
@@ -1485,8 +1509,9 @@ final class MobileDevelopSession: ObservableObject {
                 ? Self.monochrome(display, colorSpace: "sRGB")
                 : display
             let cgImage = PreviewRenderer.cgImage(from: finalDisplay)
+            let cropped = cgImage.flatMap { Self.croppedDisplay($0, geometry: displayGeometry) }
             Task { @MainActor [weak self] in
-                self?.finishFast(token: token, cgImage: cgImage)
+                self?.finishFast(token: token, cgImage: cropped ?? cgImage)
             }
         }
     }
@@ -1494,7 +1519,9 @@ final class MobileDevelopSession: ObservableObject {
     private func finishFast(token: Int, cgImage: CGImage?) {
         fastInFlight = false
         if let cgImage, token > accurateDoneFastToken {
+            // 裁切已在 lutQueue 完成，这里只包装与派生比例。
             previewImage = MImage.make(cgImage: cgImage)
+            previewAspect = CGFloat(cgImage.width) / CGFloat(max(1, cgImage.height))
             isPredicted = true
         }
         if fastDirty, !renderInFlight {
@@ -1942,6 +1969,14 @@ final class MobileDevelopSession: ObservableObject {
         case "tile": return "分带显影"
         default: return label
         }
+    }
+
+    /// 把显影后的屏幕图按保存的裁切几何重排，使显影台画幅与直出/调色成片一致。
+    /// identity 时 `apply` 原样返回，普通全幅照片没有额外开销。
+    private nonisolated static func croppedDisplay(_ cgImage: CGImage,
+                                                   geometry: MPhotoGeometry) -> CGImage? {
+        guard !geometry.isIdentity else { return cgImage }
+        return geometry.apply(to: cgImage)
     }
 
     /// 输入原片转成屏幕 sRGB，供长按对比使用。
