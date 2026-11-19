@@ -23,6 +23,9 @@ enum MobileSettings {
     static let cameraEnterDevelopKey = "mobile.camera.enterDevelop"
     static let cameraVolumeShutterKey = "mobile.camera.volumeShutter"
     static let cameraDirectSaveOriginalKey = "mobile.camera.directSaveOriginal"
+    static let cameraShutterSoundKey = "mobile.camera.shutterSound"
+    static let cameraShutterToneKey = "mobile.camera.shutterTone"
+    static let cameraFlashSoundKey = "mobile.camera.flashSound"
 
     /// 与导出面板的 formats 顺序一致：JPEG / TIFF sRGB / TIFF ProPhoto / EXR。
     static let exportFormatTitles = [
@@ -123,6 +126,18 @@ enum MobileSettings {
         UserDefaults.standard.object(forKey: cameraMirrorFrontKey) as? Bool ?? false
     }
 
+    static var cameraShutterSound: Bool {
+        UserDefaults.standard.object(forKey: cameraShutterSoundKey) as? Bool ?? true
+    }
+
+    static var cameraShutterTone: String {
+        UserDefaults.standard.string(forKey: cameraShutterToneKey) ?? "crisp"
+    }
+
+    static var cameraFlashSound: Bool {
+        UserDefaults.standard.object(forKey: cameraFlashSoundKey) as? Bool ?? true
+    }
+
     private static func index(forKey key: String, count: Int, fallback: Int) -> Int {
         guard let number = UserDefaults.standard.object(forKey: key) as? Int else {
             return fallback
@@ -154,6 +169,9 @@ struct SettingsScreen: View {
     @AppStorage(MobileSettings.cameraEnterDevelopKey) private var cameraEnterDevelop = true
     @AppStorage(MobileSettings.cameraVolumeShutterKey) private var cameraVolumeShutter = true
     @AppStorage(MobileSettings.cameraDirectSaveOriginalKey) private var cameraDirectSaveOriginal = false
+    @AppStorage(MobileSettings.cameraShutterSoundKey) private var cameraShutterSound = true
+    @AppStorage(MobileSettings.cameraShutterToneKey) private var cameraShutterTone = "crisp"
+    @AppStorage(MobileSettings.cameraFlashSoundKey) private var cameraFlashSound = true
 
     @State private var watermark = MWatermarkStore.load()
     @State private var watermarkEditorOpen = false
@@ -291,8 +309,37 @@ struct SettingsScreen: View {
             MToggleRow(label: "直出模式保存原图", isOn: $cameraDirectSaveOriginal, compact: true,
                        detail: "开启后保留 RAW 与可回放的显影 / 调色工程")
 
+            MToggleRow(label: "快门声音", isOn: $cameraShutterSound, compact: true,
+                       detail: "拍照时播放快门音效，静音键下仍响")
+
+            MChoiceRow(label: "快门音色", value: shutterToneLabel,
+                       options: shutterToneOptions) { raw in
+                cameraShutterTone = raw
+                // 切换即试听，不用回到相机才能确认选中的音色。
+                guard cameraShutterSound,
+                      let tone = MSoundEngine.ShutterTone(rawValue: raw) else { return }
+                MSoundEngine.shared.prepare()
+                MSoundEngine.shared.playShutter(tone)
+            }
+            .disabled(!cameraShutterSound)
+
+            MToggleRow(label: "闪光灯音效", isOn: $cameraFlashSound, compact: true,
+                       detail: "开启物理闪光灯时，闪光与快门同步响")
+
             hairline
         }
+    }
+
+    private var shutterToneOptions: [MProOption] {
+        [
+            MProOption(value: "crisp", label: "清脆"),
+            MProOption(value: "mechanical", label: "复古机械"),
+            MProOption(value: "dslr", label: "数码单反"),
+        ]
+    }
+
+    private var shutterToneLabel: String {
+        shutterToneOptions.first { $0.value == cameraShutterTone }?.label ?? "清脆"
     }
 
     private var volumeShutterAvailable: Bool {

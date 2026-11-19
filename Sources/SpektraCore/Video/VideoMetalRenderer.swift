@@ -121,7 +121,9 @@ final class VideoMetalRenderer: VideoRendering {
         var unifR: Float = 0.97
         var unifG: Float = 0.99
         var unifB: Float = 0.97
-        var padE0: Float = 0
+        // 复用原 padE0（偏移 240），不新增字段、不改动任何偏移：
+        // 黑白模式是显示域亮度归一，只需一个浮点开关随 uniform 进 kernel。
+        var monochrome: Float = 0
         var padE1: Float = 0
     }
 
@@ -310,6 +312,7 @@ final class VideoMetalRenderer: VideoRendering {
         params.unifR = uniforms.grainUniformity.x
         params.unifG = uniforms.grainUniformity.y
         params.unifB = uniforms.grainUniformity.z
+        params.monochrome = uniforms.monochrome
         uniformBuffer.contents().copyMemory(from: &params,
                                             byteCount: MemoryLayout<FrameParams>.stride)
 

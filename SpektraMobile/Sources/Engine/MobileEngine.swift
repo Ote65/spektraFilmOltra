@@ -974,6 +974,7 @@ final class MobileEngine: ObservableObject {
     /// 直出保存原图：把显影 / 调色参数与成片缩略图写回刚导入的 RAW 工程。
     /// `baseline` 是含拍摄曝光的快速控制基线；缺省才退回中性基线。
     func applyDirectResult(photoID: String, edit: PhotoEdit, grade: GradeRecipe,
+                           border: MFilmBorderConfig = MFilmBorderConfig(),
                            baseline: PhotoEdit? = nil,
                            renderedURL: URL,
                            aspect: MDirectAspect = .portrait3_4,
@@ -982,6 +983,9 @@ final class MobileEngine: ObservableObject {
         guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
         photo.edit = edit
         photo.gradeData = try? JSONEncoder().encode(grade)
+        // 直出成片页选的片边写进这张照片自己的记录；调色台打开时优先回放，
+        // 不再被跨照片的全局记忆（含冷启动强制关闭）覆盖。
+        photo.borderData = try? JSONEncoder().encode(border.normalized())
         // 快速控制的基线必须包含拍摄曝光：直出预设的快速量是相对「拍摄基线」计算的，
         // 若把已套用的直出参数当基线，快速滑条回到 0 时无法回到原始曝光 / 亮度。
         photo.quickBaselineData = try? JSONEncoder().encode(baseline ?? PhotoEdit())

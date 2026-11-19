@@ -39,6 +39,13 @@ struct MExportSheet: View {
     /// 伪进度 0–0.5：真实进度未上报前的爬升值。
     @State private var creep: Double = 0
     @State private var creepTask: Task<Void, Never>?
+    /// 复用相机直出显影的拨轮触感：数字每往前滚一格（1%）给一次最轻选择触感。
+    /// 必须持有实例——频繁触发时每次新建会被系统丢弃，不振动。
+    #if os(iOS)
+    private static let progressHaptic = UISelectionFeedbackGenerator()
+    #endif
+    /// 上一次给过触感的百分比位；只前进不重复，避免同一次跳动连震。
+    @State private var hapticPercent: Int = 0
     @Environment(\.mSafeInsets) private var insets
 
     private enum MExportPhase {
@@ -99,6 +106,16 @@ struct MExportSheet: View {
                 creepTask?.cancel()
                 creepTask = nil
             }
+        }
+        // 复用相机直出显影：滚动数字每跨过 1% 就给一次最轻选择触感。
+        // 与 rollingPercent 读同一个 displayedPercent，手感永远和数字同步。
+        .onChange(of: displayedPercent) { _, percent in
+            guard phase == .exporting, percent > hapticPercent else { return }
+            hapticPercent = percent
+            #if os(iOS)
+            Self.progressHaptic.prepare()
+            Self.progressHaptic.selectionChanged()
+            #endif
         }
         .onDisappear { creepTask?.cancel() }
     }
@@ -534,6 +551,12 @@ struct MExportSheet: View {
         return max(creep, 0.5 + 0.5 * actual)
     }
 
+    /// 滚动数字与触感共用的整数百分比：只在跨过整数位时变化，
+    /// 避免亚像素抖动既切碎 numericText 动画又连续触发触感。
+    private var displayedPercent: Int {
+        Int((min(max(displayedProgress, 0), 1) * 100).rounded(.down))
+    }
+
     /// 伪进度爬升：每 0.15s 一步，越接近 50% 越慢、步长带随机，
     /// 约 3 秒到 25%、11 秒到 45%，之后保持 50% 等待真实进度交棒。
     private func startCreep() {
@@ -554,6 +577,10 @@ struct MExportSheet: View {
     private func beginExport() {
         guard phase == .idle, canExport else { return }
         MHaptic.medium()
+        hapticPercent = 0
+        #if os(iOS)
+        Self.progressHaptic.prepare()
+        #endif
         withAnimation(MMotion.state) { phase = .exporting }
         startCreep()
         let quality = isJPEG ? Double(qualityValues[min(qualityIndex, qualityValues.count - 1)]) / 100 : 0.95
@@ -571,6 +598,11 @@ struct MExportSheet: View {
                         onNote("相册写入失败 · 文件已导出到 App 内")
                     }
                 }
+                // 与相机直出一致：一记轻点收束百分比滚动，再给成功确认。
+                MHaptic.light()
+                #if os(iOS)
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                #endif
                 withAnimation(MMotion.state) { phase = .done }
             case .failure:
                 withAnimation(MMotion.state) { phase = .idle }

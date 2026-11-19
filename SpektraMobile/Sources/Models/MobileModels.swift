@@ -821,6 +821,8 @@ struct MDirectDevelopRequest {
     let renderedURL: URL
     let edit: PhotoEdit
     let grade: GradeRecipe
+    /// 直出成片页选择的片边；入库时写进 borderData，调色台优先回放这张照片自己的选择。
+    var border = MFilmBorderConfig()
     var baseline: PhotoEdit? = nil
     /// 相机页选择的画幅比例；入库时写进 cropData，调色台裁切直接呈现同一构图。
     var aspect: MDirectAspect = .portrait3_4
