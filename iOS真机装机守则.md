@@ -185,6 +185,7 @@ ipa 统一放在 **Spektrafilm 工作区根目录**（不是 iOS 源码仓库）
 |---|---|---|
 | `4016` / `CurrentlyAssertableStates = ( )` | 设备锁屏或休眠 | 等 20s 重试；连续失败让用户解锁 |
 | `device was not, or could not be, unlocked` | 同上 | 同上 |
+| 4016 连续 3 次、且 `list devices` 显示 `unavailable` | **设备已断开**（拔线 / 关机 / 睡到断连），不是锁屏 | 让用户插线并解锁；重试无意义，别空转 |
 | 构建报 `.swiftpm/security` 或 `build.db` 写入被拒 | derivedData 放在项目内 | 挪到 `/tmp` |
 | `Sandbox: deny file-write` | 受限沙箱 | 放行命令重跑 |
 | 装了但桌面看不到 | 首次安装需在「设置 → 通用 → VPN与设备管理」信任开发者证书 | 设备上手动信任一次 |

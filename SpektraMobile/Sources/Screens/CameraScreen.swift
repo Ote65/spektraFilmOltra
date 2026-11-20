@@ -35,6 +35,8 @@ struct CameraScreen: View {
     let onCaptured: (URL, MCameraCaptureMeta) async -> String?
     /// 从本次拍摄列表进入显影台：原片已在库中，直接按 photoID 打开。
     let onOpenDevelop: (String) -> Void
+    /// 按 photoID 取原片文件 URL（主线程隔离）；全尺寸图由预览页在后台解码。
+    let onOriginalURL: (String) -> URL?
     /// 直出保存：根视图决定是否保留 RAW 工程，并写系统相册。
     let onDirectSave: (MDirectSaveRequest) async -> MDirectSaveOutcome
     /// 直出成片页进入显影台：原片入库，并沿用拍摄时选择的显影 / 调色预设。
@@ -58,6 +60,8 @@ struct CameraScreen: View {
     @State private var sessionListOpen = false
     /// 列表里正在预览的那张（点缩略图进大图预览）。
     @State private var previewingShot: MSessionShot?
+    /// 大图预览的全尺寸图（异步取原片内嵌大图；未就绪时用 240px 缩略图占位）。
+    @State private var previewFullImage: MPlatformImage?
 
     @State private var timerMenuOpen = false
     @State private var countdown: Int?
@@ -331,6 +335,7 @@ struct CameraScreen: View {
                             ForEach(sessionShots.reversed()) { shot in
                                 Button {
                                     MHaptic.light()
+                                    previewFullImage = nil
                                     previewingShot = shot
                                 } label: {
                                     ZStack(alignment: .bottomTrailing) {
@@ -363,9 +368,17 @@ struct CameraScreen: View {
             .navigationTitle("本次拍摄 · \(sessionShots.count) 张")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("完成") { sessionListOpen = false }
-                        .foregroundStyle(MColor.brass)
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        MHaptic.light()
+                        sessionListOpen = false
+                    } label: {
+                        HStack(spacing: 2) {
+                            Image(systemName: "chevron.left")
+                            Text("返回")
+                        }
+                    }
+                    .foregroundStyle(MColor.brass)
                 }
             }
             // 预览必须挂在列表 sheet 内部：列表已全屏展示时，父视图无法再 present 第二个 sheet。
@@ -382,16 +395,18 @@ struct CameraScreen: View {
         ZStack {
             MColor.canvas.ignoresSafeArea()
 
-            // 照片 + 相纸框：白卡纸包围，随画幅自适应，不用固定 frame 裁切。
-            if let thumb = shot.thumbnail {
-                MImage.swiftUI(thumb)
+            // 照片 + 相纸框：优先全尺寸原片内嵌图，未就绪/失败时用 240px 缩略图占位。
+            // .fit 完整显示不裁切；相纸框留窄边，画面尽量铺满。
+            if let image = previewFullImage ?? shot.thumbnail {
+                MImage.swiftUI(image)
                     .resizable()
+                    .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
-                    .padding(9)
+                    .padding(7)
                     .background(Color(hex: 0xF6F2E9),
-                                in: RoundedRectangle(cornerRadius: 3, style: .continuous))
+                                in: RoundedRectangle(cornerRadius: 2, style: .continuous))
                     .shadow(color: .black.opacity(0.5), radius: 26, y: 12)
-                    .padding(.horizontal, 32)
+                    .padding(.horizontal, 16)
             }
 
             // 左上角返回箭头：纯图标，不套圆框。
@@ -436,6 +451,17 @@ struct CameraScreen: View {
         }
         .presentationDetents([.large])
         .presentationBackground(MColor.canvas)
+        .task(id: shot.photoID) {
+            // 缩略图先顶上；主线程查原片 URL，后台解码 DNG 内嵌大图，回来再替换（失败保留缩略图）。
+            guard let url = onOriginalURL(shot.photoID) else { return }
+            let task = Task.detached(priority: .userInitiated) { MImage.load(url: url) }
+            guard let full = await task.value else { return }
+            await MainActor.run {
+                // 快速切换照片时旧解码任务可能晚到：只回填当前仍在预览的那张，避免显示错图。
+                guard previewingShot?.photoID == shot.photoID else { return }
+                previewFullImage = full
+            }
+        }
     }
 
     // MARK: - 顶栏

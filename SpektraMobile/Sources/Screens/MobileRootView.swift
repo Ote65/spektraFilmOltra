@@ -131,6 +131,9 @@ struct MobileRootView: View {
                                  guard screen == .camera else { return }
                                  openDevelop(photoID, returningTo: .camera)
                              },
+                             onOriginalURL: { photoID in
+                                 engine.originalURL(forPhotoID: photoID)
+                             },
                              onDirectSave: { request in
                                  await saveDirect(request)
                              },
