@@ -73,6 +73,19 @@ enum MImage {
     }
 }
 
+/// 按实际像素尺寸记账开销，两个缓存共用：固定按 512² 估值会提前挤爆上限，
+/// 滚动回来又要重新解码。
+private func imageCost(_ image: MPlatformImage) -> Int {
+    #if os(macOS)
+    let width = Int(image.size.width.rounded())
+    let height = Int(image.size.height.rounded())
+    #else
+    let width = image.cgImage?.width ?? Int(image.size.width * image.scale)
+    let height = image.cgImage?.height ?? Int(image.size.height * image.scale)
+    #endif
+    return max(1, width * height * 4)
+}
+
 /// 缩略图缓存：同一张缩略图在滚动列表里反复出现，避免每次重建。
 final class MThumbnailCache {
     static let shared = MThumbnailCache()
@@ -112,25 +125,12 @@ final class MThumbnailCache {
 
         lock.lock()
         if let image {
-            cache.setObject(image, forKey: key as NSString, cost: Self.cost(of: image))
+            cache.setObject(image, forKey: key as NSString, cost: imageCost(image))
         }
         inFlight.removeValue(forKey: key)
         lock.unlock()
         group.leave()
         return image
-    }
-
-    /// 按图像实际像素尺寸记账：缩略图实际约 320 px，固定按 512² 记账会
-    /// 提前挤爆 64 MB 上限，滚动回来又要重新解码。
-    private static func cost(of image: MPlatformImage) -> Int {
-        #if os(macOS)
-        let width = Int(image.size.width.rounded())
-        let height = Int(image.size.height.rounded())
-        #else
-        let width = image.cgImage?.width ?? Int(image.size.width * image.scale)
-        let height = image.cgImage?.height ?? Int(image.size.height * image.scale)
-        #endif
-        return max(1, width * height * 4)
     }
 
     /// 只查缓存，不触发读盘：供视图在异步加载前判断是否已有可用图。
@@ -225,7 +225,7 @@ final class MFinishedPreviewCache {
         let key = Self.key(for: photo)
         if let hit = memory.object(forKey: key as NSString) { return hit }
         guard let disk = Self.loadDisk(key: key, store: store) else { return nil }
-        memory.setObject(disk, forKey: key as NSString, cost: Self.cost(of: disk))
+        memory.setObject(disk, forKey: key as NSString, cost: imageCost(disk))
         return disk
     }
 
@@ -244,7 +244,7 @@ final class MFinishedPreviewCache {
         inFlight[key] = task
         defer { inFlight[key] = nil }
         guard let image = await task.value else { return nil }
-        memory.setObject(image, forKey: key as NSString, cost: Self.cost(of: image))
+        memory.setObject(image, forKey: key as NSString, cost: imageCost(image))
         return image
     }
 
@@ -275,7 +275,7 @@ final class MFinishedPreviewCache {
             else { continue }
             writeDisk(image, key: key, store: store)
             // NSCache 本身线程安全；顺手预热 L1，让刚启动点开也直接命中内存。
-            shared.memory.setObject(image, forKey: key as NSString, cost: Self.cost(of: image))
+            shared.memory.setObject(image, forKey: key as NSString, cost: imageCost(image))
             // 每张后让出线程：启动期间不长时间霸占 .utility 线程，相机首帧/主页不被拖慢。
             await Task.yield()
         }
@@ -327,17 +327,6 @@ final class MFinishedPreviewCache {
                 photoID: photo.id, dateLabel: stamp.date, timeLabel: stamp.time) ?? cg
         }
         return MImage.make(cgImage: cg)
-    }
-
-    private static func cost(of image: MPlatformImage) -> Int {
-        #if os(macOS)
-        let width = Int(image.size.width.rounded())
-        let height = Int(image.size.height.rounded())
-        #else
-        let width = image.cgImage?.width ?? Int(image.size.width * image.scale)
-        let height = image.cgImage?.height ?? Int(image.size.height * image.scale)
-        #endif
-        return max(1, width * height * 4)
     }
 }
 
