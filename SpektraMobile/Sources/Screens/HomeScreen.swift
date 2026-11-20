@@ -3,6 +3,21 @@ import Photos
 import PhotosUI
 import UniformTypeIdentifiers
 
+/// 卡片在窗口里的真实矩形，供成品预览从原位放大；不用 matchedGeometryEffect，
+/// 避免 LazyVGrid 重建时把形变锚点丢到 (0,0)。
+private struct MCardFrameKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// 卡片与成品预览必须读同一个坐标系；混用 `.global` 和局部坐标会让形变的
+/// 起点整体偏移，缩回时也回不到原卡片。
+private enum MPreviewSpace {
+    static let name = "homeFinishedPreview"
+}
+
 struct HomeScreen: View {
     @ObservedObject var engine: MobileEngine
     let onOpenDevelop: (MPhoto) -> Void
@@ -23,6 +38,7 @@ struct HomeScreen: View {
     @State private var actionPhoto: MPhoto?
     @State private var folderPickerOpen = false
     @State private var didDebugOpen = false
+    @State private var didDebugPreview = false
     /// 启动提示：标题右侧的「点这里切到视频库」，出现 3 秒后淡出。
     @State private var showSwitchHint = false
     /// 已经消费过的访达访问序号，避免同一次进入重复弹提示。
@@ -34,10 +50,23 @@ struct HomeScreen: View {
     @State private var selectedIDs: Set<String> = []
     /// 重置调色的二次确认目标。
     @State private var resetTarget: MPhoto?
+    /// 已调色卡片的成品预览：主页上的一层形变与暗场，不是独立页面。
+    @State private var previewAsset: MLibraryAsset?
+    @State private var previewImage: MPlatformImage?
+    @State private var previewControls = false
+    @State private var savingPreview = false
+    /// 卡片矩形与 0→1 形变进度。进度是唯一动画源，随时可以反向播放打断。
+    @State private var cardFrames: [String: CGRect] = [:]
+    @State private var previewOrigin: CGRect = .zero
+    @State private var morphProgress: CGFloat = 0
+    /// 相纸/成片只在形变完成后由 completion 淡入，不受形变曲线的快出尾段影响。
+    @State private var matteProgress: CGFloat = 0
+    @State private var previewDismissToken = 0
     @FocusState private var searchFocused: Bool
     @AppStorage(MobileSettings.allowNonRawKey) private var allowNonRaw = false
     @Environment(\.mSafeInsets) private var insets
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// 只在「进入访达」时弹一次切换提示。
     /// 打开 App 默认落在相机页，首页虽然已挂载，但那次不能算数，
@@ -57,53 +86,66 @@ struct HomeScreen: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            VStack(spacing: 0) {
-                header
+            Group {
+                VStack(spacing: 0) {
+                    header
 
-                // 筛选栏固定在顶部，不跟随下面的照片网格一起滚走。
-                // 视频访达不做筛选，整行隐藏。
-                if !showsVideos {
-                    filterRow
-                        .padding(.bottom, 12)
-                }
+                    // 筛选栏固定在顶部，不跟随下面的照片网格一起滚走。
+                    // 视频访达不做筛选，整行隐藏。
+                    if !showsVideos {
+                        filterRow
+                            .padding(.bottom, 12)
+                    }
 
-                ScrollView(.vertical) {
-                    VStack(alignment: .leading, spacing: 0) {
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            if showsVideos {
+                                videoSectionHead
+                                videoGrid
+                                videoEmptyHint
+                            } else {
+                                sectionHead
+                                limitedAccessBanner
+                                photoGrid
+                                emptyHint
+                            }
+                        }
+                        .padding(.bottom, 106)
+                    }
+                    .scrollIndicators(.never)
+                    // 下拉刷新＝强制重新扫描相册（视频页只重扫视频）。
+                    .refreshable {
                         if showsVideos {
-                            videoSectionHead
-                            videoGrid
-                            videoEmptyHint
+                            await engine.refreshVideos(force: true)
                         } else {
-                            sectionHead
-                            limitedAccessBanner
-                            photoGrid
-                            emptyHint
+                            await engine.refreshAssets(force: true)
                         }
                     }
-                    .padding(.bottom, 106)
                 }
-                .scrollIndicators(.never)
-                // 下拉刷新＝强制重新扫描相册（视频页只重扫视频）。
-                .refreshable {
-                    if showsVideos {
-                        await engine.refreshVideos(force: true)
-                    } else {
-                        await engine.refreshAssets(force: true)
-                    }
+
+                if selecting {
+                    selectionBar
+                } else {
+                    bottomBar
+                }
+
+                if let photo = actionPhoto {
+                    photoActions(for: photo)
                 }
             }
+            .blur(radius: 18 * morphProgress)
+            // 不再对卡片网格做 scaleEffect：该变换会污染 geo.frame(in:) 上报，
+            // 让收回终点取到缩小态坐标，落回卡片时错位。背景退后交给 blur 表达即可。
+            .accessibilityHidden(previewAsset != nil)
 
-            if selecting {
-                selectionBar
-            } else {
-                bottomBar
-            }
-
-            if let photo = actionPhoto {
-                photoActions(for: photo)
+            if let asset = previewAsset {
+                finishedPreview(asset)
+                    .zIndex(10)
             }
         }
         .background(MColor.app)
+        // 卡片上报的 frame 与成品预览的局部坐标都以这层为基准，避免全局/局部混用。
+        .coordinateSpace(name: MPreviewSpace.name)
         .alert(
             "重置这张照片的调色？",
             isPresented: Binding(
@@ -151,6 +193,22 @@ struct HomeScreen: View {
         }
         .onAppear { armSwitchHint(hintToken) }
         .onChange(of: hintToken) { _, token in armSwitchHint(token) }
+        .onPreferenceChange(MCardFrameKey.self) { frames in
+            cardFrames = frames
+            // 验收触发必须等目标卡片的真实 frame 上报，否则 origin 回退成 target，
+            // 形变看起来就是「一出现就居中」，验不到原位放大与回程对准。
+            guard DebugLaunch.gradedPreview, !didDebugPreview,
+                  let asset = engine.assets.first(where: { frames[$0.id] != nil }) else { return }
+            didDebugPreview = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                guard let live = engine.assets.first(where: { $0.id == asset.id }) else { return }
+                if live.photo != nil {
+                    presentFinishedPreview(live)
+                } else {
+                    presentDebugPreview(live)
+                }
+            }
+        }
         .task {
             guard !didDebugOpen else { return }
             didDebugOpen = true
@@ -509,6 +567,432 @@ struct HomeScreen: View {
             }
         }
         .padding(.horizontal, MMetric.pageMargin)
+    }
+
+    // MARK: - 已调色成品预览
+
+    /// 从卡片原位长成居中相框：同一坐标系 + 0→1 进度插值，起止点都能回到真实卡片。
+    private func finishedPreview(_ asset: MLibraryAsset) -> some View {
+        GeometryReader { geo in
+            let target = previewTarget(in: geo.size, asset: asset)
+            // 卡片 frame 记在命名坐标系里；这里换算回当前 GeometryReader 的局部坐标。
+            let container = geo.frame(in: .named(MPreviewSpace.name))
+            let storedOrigin = previewOrigin
+            let origin: CGRect = storedOrigin == .zero ? target : CGRect(
+                x: storedOrigin.minX - container.minX,
+                y: storedOrigin.minY - container.minY,
+                width: storedOrigin.width,
+                height: storedOrigin.height
+            )
+            let progress = min(max(morphProgress, 0), 1)
+            let frame = lerpRect(origin, target, progress)
+            // 白边在放大途中从边框往外长出来：进度 0.28 起手，到 0.86 长满，
+            // 与形变同源，不是放大完成后才整体淡入。缩回时按同一曲线收回卡片。
+            let matte = min(max(matteProgress, 0), 1)
+            let grow = smoothstep(0.28, 0.86, progress)
+            // completion 后仍用 matte 兜底，确保最终帧白边完全到位且不受曲线尾段影响。
+            let paper = max(grow, matte)
+            let inset: CGFloat = 11 * paper
+            let innerWidth = max(1, frame.width - inset * 2)
+            let innerHeight = max(1, frame.height - inset * 2)
+            let transition = paper
+            // 卡片自身的圆角随放大退到 0；白边是直角相纸，不带圆角。
+            let radius = lerp(MRadius.card, 0, progress)
+            // 网格卡片上的标签：放大时迅速消隐，缩回接近原位时渐显。
+            let badgeOpacity = 1 - smoothstep(0.06, 0.5, progress)
+
+            ZStack {
+                // hold 验收模式下注入固定暗场，即便停在 0 进度也能看清预览层落在哪张卡片上。
+                Color.black.opacity(DebugLaunch.holdProgress != nil ? 0.55 : 0.68 * progress)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .accessibilityElement()
+                    .accessibilityLabel("关闭预览")
+                    .accessibilityAction { closeFinishedPreview() }
+                    .onTapGesture { closeFinishedPreview() }
+
+                ZStack {
+                    // 直角暖白相纸：白边在放大途中由 paper 从画面边缘往外生长出来。
+                    Rectangle()
+                        .fill(Color(hex: 0xF6F2E9))
+                        .frame(width: frame.width, height: frame.height)
+                        .shadow(color: .black.opacity(0.5 * paper),
+                                radius: 26 * paper, y: 12 * paper)
+                        .opacity(paper)
+
+                    ZStack {
+                        // 起始/缩回帧：和网格一致的缩略图 + 卡片标签，标签随缩回渐显。
+                        ZStack {
+                            cardArtwork(asset, size: CGSize(width: frame.width, height: frame.height))
+                            previewBadges(asset)
+                                .frame(width: frame.width, height: frame.height)
+                                .opacity(badgeOpacity)
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+                        .opacity(1 - transition)
+
+                        ZStack {
+                            if let previewImage {
+                                MImage.swiftUI(previewImage)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                            } else {
+                                cardArtwork(asset, size: CGSize(width: innerWidth, height: innerHeight))
+                            }
+                        }
+                        .frame(width: innerWidth, height: innerHeight)
+                        .clipped()
+                        .clipShape(Rectangle())
+                        .opacity(transition)
+                    }
+                    .frame(width: frame.width, height: frame.height)
+                }
+                .frame(width: frame.width, height: frame.height)
+                .position(x: frame.midX, y: frame.midY)
+
+                // 条件渲染：打断时 previewControls 一置 false，按钮立刻从视图树移除，
+                // 不会像隐式 opacity 动画那样卡在可见状态残留到主页。
+                if previewControls {
+                HStack(spacing: 10) {
+                    Button {
+                        enterDevelop(from: asset)
+                    } label: {
+                        Text("进入显影台")
+                            .font(.mSans(13, .semibold))
+                            .foregroundStyle(MColor.brassHigh)
+                            .frame(width: 152, height: 44)
+                            .mGlassSurface(
+                                Capsule(),
+                                tint: MColor.brass.opacity(0.22),
+                                fallbackFill: MColor.brassWash,
+                                interactive: true
+                            )
+                            .overlay(
+                                Capsule().strokeBorder(MColor.brass.opacity(0.38), lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        saveFinished(asset)
+                    } label: {
+                        HStack(spacing: 7) {
+                            if savingPreview {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .tint(MColor.text2)
+                            } else {
+                                Image(systemName: "square.and.arrow.down")
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            Text("保存")
+                                .font(.mSans(13, .medium))
+                        }
+                        .foregroundStyle(MColor.text1)
+                        .frame(width: 104, height: 44)
+                        .mGlassSurface(
+                            Capsule(),
+                            tint: MColor.surface3.opacity(0.72),
+                            fallbackFill: MColor.surface2,
+                            interactive: true
+                        )
+                        .overlay(
+                            Capsule().strokeBorder(MColor.hairlineStrong, lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(savingPreview)
+                }
+                .frame(width: 266, height: 44)
+                .position(x: geo.size.width / 2, y: frame.maxY + 48)
+                // 原地 Q 弹：只缩放 + 透明度，不做位移；spring 在 preparePreview 里驱动。
+                .transition(.scale(scale: 0.62).combined(with: .opacity))
+                }
+            }
+        }
+    }
+
+    /// 起始帧用与网格完全相同的缩略图，避免放大第一帧就换成成品构图而错位。
+    @ViewBuilder
+    private func cardArtwork(_ asset: MLibraryAsset, size: CGSize) -> some View {
+        ZStack {
+            if let photo = asset.photo, let url = photo.thumbnailURL {
+                MPhotoThumbnail(url: url)
+                    .frame(width: size.width, height: size.height)
+                    .clipped()
+            } else if let phAsset = asset.phAsset {
+                MAssetThumb(asset: phAsset)
+                    .frame(width: size.width, height: size.height)
+                    .clipped()
+            } else {
+                Rectangle().fill(MColor.surface2)
+            }
+        }
+    }
+
+    /// 缩回时渐显的卡片标签，与网格卡片保持同一套 RAW / 胶片 / 已调色样式。
+    @ViewBuilder
+    private func previewBadges(_ asset: MLibraryAsset) -> some View {
+        VStack {
+            HStack(alignment: .top) {
+                Text(asset.formatLabel)
+                    .font(.mSans(7.5, .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(MColor.text1.opacity(0.9))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                        .fill(Color.black.opacity(0.52)))
+                Spacer(minLength: 0)
+            }
+            .padding(8)
+
+            Spacer(minLength: 0)
+
+            HStack(spacing: 4) {
+                if asset.isImported {
+                    Text(asset.photo?.film ?? "")
+                        .font(.mSans(7.5, .medium))
+                        .foregroundStyle(MColor.text2)
+                        .lineLimit(1)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                            .fill(Color.black.opacity(0.55)))
+                }
+                if asset.isGraded {
+                    HStack(spacing: 3) {
+                        Circle().fill(MColor.brass).frame(width: 3, height: 3)
+                        Text("已调色")
+                            .font(.mSans(7.5, .medium))
+                            .foregroundStyle(MColor.brass)
+                    }
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                        .fill(Color.black.opacity(0.55)))
+                    .overlay(RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                        .strokeBorder(MColor.brass.opacity(0.35), lineWidth: 1))
+                }
+                Spacer()
+            }
+            .padding(8)
+        }
+    }
+
+    /// 相纸外框 = 成片尺寸 + 四边各 11pt，与渲染后成品预览是同一套均匀相框。
+    private func previewTarget(in size: CGSize, asset: MLibraryAsset) -> CGRect {
+        let ratio = previewRatio(asset)
+        let matteInset: CGFloat = 11
+        let matteWidth = matteInset * 2
+        let matteHeight = matteInset * 2
+        let maxInnerWidth = max(120, min(size.width - 56 - matteWidth, 460 - matteWidth))
+        let maxInnerHeight = max(100, size.height - 232 - matteHeight)
+        var innerWidth = min(maxInnerWidth, maxInnerHeight * ratio)
+        var innerHeight = innerWidth / max(ratio, 0.01)
+        if innerHeight > maxInnerHeight {
+            innerHeight = maxInnerHeight
+            innerWidth = innerHeight * ratio
+        }
+        let width = innerWidth + matteWidth
+        let height = innerHeight + matteHeight
+        return CGRect(
+            x: (size.width - width) / 2,
+            y: (size.height - (height + 70)) / 2,
+            width: width, height: height
+        )
+    }
+
+    private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
+        a + (b - a) * t
+    }
+
+    /// 平滑阶跃：在 [edge0, edge1] 之间用三次曲线从 0 过渡到 1，端点导数为 0。
+    private func smoothstep(_ edge0: CGFloat, _ edge1: CGFloat, _ x: CGFloat) -> CGFloat {
+        let t = min(max((x - edge0) / (edge1 - edge0), 0), 1)
+        return t * t * (3 - 2 * t)
+    }
+
+    private func lerpRect(_ from: CGRect, _ to: CGRect, _ t: CGFloat) -> CGRect {
+        CGRect(
+            x: lerp(from.minX, to.minX, t),
+            y: lerp(from.minY, to.minY, t),
+            width: max(1, lerp(from.width, to.width, t)),
+            height: max(1, lerp(from.height, to.height, t))
+        )
+    }
+
+    private var morphAnimation: Animation? {
+        guard !reduceMotion else { return nil }
+        return DebugLaunch.slowMorph
+            ? Animation.timingCurve(0.16, 1, 0.3, 1, duration: 1.4)
+            : MMotion.morph
+    }
+
+    private func previewRatio(_ asset: MLibraryAsset) -> CGFloat {
+        if let image = previewImage, image.size.height > 0 {
+            return image.size.width / image.size.height
+        }
+        // 成品图还没到时按裁切后的构图算比例，避免图片到达后相框再跳一次尺寸。
+        if let id = asset.photo?.id,
+           let record = engine.store.photos.first(where: { $0.id == id }),
+           let data = record.cropData,
+           let geometry = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
+            let cropW = Double(record.width) * geometry.crop.width
+            let cropH = Double(record.height) * geometry.crop.height
+            if cropW > 0, cropH > 0 {
+                let ratio = geometry.quarterTurns % 2 == 0 ? cropW / cropH : cropH / cropW
+                return max(0.2, CGFloat(ratio))
+            }
+        }
+        return max(0.2, asset.photo?.aspectRatio ?? 0.75)
+    }
+
+    private func presentFinishedPreview(_ asset: MLibraryAsset) {
+        guard let photo = asset.photo,
+              let record = engine.store.photos.first(where: { $0.id == photo.id }) else { return }
+        MHaptic.light()
+        let cached = MFinishedPreviewCache.shared.cached(for: record, store: engine.store)
+        preparePreview(asset, image: cached)
+        let token = previewDismissToken
+        Task { @MainActor in
+            let image = await MFinishedPreviewCache.shared.image(for: record, store: engine.store)
+            guard token == self.previewDismissToken,
+                  previewAsset?.id == asset.id else { return }
+            withAnimation(reduceMotion ? nil : MMotion.state) { previewImage = image }
+        }
+    }
+
+    /// 仅 `--graded-preview` 使用：未入库资产没有成品缓存，用系统缩略图验收形变。
+    private func presentDebugPreview(_ asset: MLibraryAsset) {
+        preparePreview(asset, image: nil)
+    }
+
+    private func preparePreview(_ asset: MLibraryAsset, image: MPlatformImage?) {
+        previewDismissToken &+= 1
+        let token = previewDismissToken
+        previewOrigin = cardFrames[asset.id] ?? .zero
+        morphProgress = 0
+        matteProgress = 0
+        previewAsset = asset
+        previewImage = image
+        previewControls = false
+
+        // 先让起点（真实卡片矩形 + 网格缩略图）落一帧，再启动形变。
+        DispatchQueue.main.async {
+            guard token == self.previewDismissToken else { return }
+            // 形变验收：钉在指定进度截帧，核对起/中/止是否沿真实卡片对位。
+            if let held = DebugLaunch.holdProgress {
+                self.morphProgress = held
+                return
+            }
+            withAnimation(self.morphAnimation) {
+                self.morphProgress = 1
+            } completion: {
+                // 动画被反向打断后旧 completion 仍可能触发，token 是唯一防线。
+                guard token == self.previewDismissToken,
+                      self.previewAsset?.id == asset.id,
+                      self.morphProgress > 0.999 else { return }
+                // 白边兜底到位；按钮晚一拍、用 spring 原地弹出，避免和形变尾段抢视觉。
+                withAnimation(self.reduceMotion ? nil : MMotion.state) {
+                    self.matteProgress = 1
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    guard token == self.previewDismissToken,
+                          self.previewAsset?.id == asset.id,
+                          self.morphProgress > 0.999 else { return }
+                    withAnimation(self.reduceMotion ? nil : MMotion.pop) {
+                        self.previewControls = true
+                    }
+                }
+            }
+        }
+        if let delay = DebugLaunch.cancelPreviewAfter {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard token == self.previewDismissToken else { return }
+                self.closeFinishedPreview()
+            }
+        }
+    }
+
+    private func closeFinishedPreview() {
+        guard previewAsset != nil else { return }
+        // 回程终点复用放大起点锁定的 previewOrigin：它与卡片未受任何变换污染时的
+        // 真实位置严格一致。不要再读 cardFrames 覆盖——预览期间该值会随背景
+        // scale/blur 的上报时序变化，导致落点偏移、预览层消失瞬间卡一下。
+        previewDismissToken &+= 1
+        let token = previewDismissToken
+        previewControls = false
+        withAnimation(reduceMotion ? nil : MMotion.state) {
+            matteProgress = 0
+        }
+        withAnimation(morphAnimation) {
+            morphProgress = 0
+        } completion: {
+            guard token == self.previewDismissToken else { return }
+            self.clearFinishedPreview()
+        }
+    }
+
+    private func clearFinishedPreview() {
+        previewAsset = nil
+        previewImage = nil
+        previewControls = false
+        previewOrigin = .zero
+        morphProgress = 0
+        matteProgress = 0
+    }
+
+    private func enterDevelop(from asset: MLibraryAsset) {
+        guard let photo = asset.photo else { return }
+        closeFinishedPreview()
+        let token = previewDismissToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            // 回程中再点空白会把 token 改掉，此时取消跳转。
+            guard token == self.previewDismissToken else { return }
+            self.clearFinishedPreview()
+            onOpenDevelop(photo)
+        }
+    }
+
+    private func saveFinished(_ asset: MLibraryAsset) {
+        guard let photo = asset.photo,
+              let record = engine.store.photos.first(where: { $0.id == photo.id }),
+              !savingPreview else { return }
+        MHaptic.light()
+        savingPreview = true
+        Task { @MainActor in
+            var resolved = previewImage
+            if resolved == nil {
+                resolved = await MFinishedPreviewCache.shared.image(for: record, store: engine.store)
+            }
+            if resolved == nil, let url = photo.thumbnailURL {
+                resolved = MThumbnailCache.shared.image(for: url)
+            }
+            guard let image = resolved, let data = MImage.jpegData(image) else {
+                savingPreview = false
+                onToast("成品还在生成，请稍后再试")
+                return
+            }
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("oltra-finished-\(UUID().uuidString).jpg")
+            guard (try? data.write(to: url)) != nil else {
+                savingPreview = false
+                onToast("保存失败，请重试")
+                return
+            }
+            PhotoLibraryExport.save(url, album: PhotoLibraryExport.albumTitle) { outcome in
+                try? FileManager.default.removeItem(at: url)
+                DispatchQueue.main.async {
+                    savingPreview = false
+                    switch outcome {
+                    case .saved: onToast("已保存到相册")
+                    case .denied: onToast("需要相册写入权限才能保存")
+                    case .failed: onToast("保存失败，请重试")
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - 视频访达（直接映射系统相册视频，不做筛选）
@@ -1269,8 +1753,12 @@ struct HomeScreen: View {
             : engine.assets.filter(\.isGraded).count
     }
 
-    /// 点开一张照片：已入库直接进显影台，未入库先取回原片再进。
+    /// 点开一张照片：已调色先看成品，其它照片仍直接进显影台；未入库先取回原片再进。
     private func open(_ asset: MLibraryAsset) {
+        if asset.isGraded, asset.photo != nil {
+            presentFinishedPreview(asset)
+            return
+        }
         if let photo = asset.photo {
             onOpenDevelop(photo)
             return
@@ -1503,6 +1991,16 @@ private struct MPhotoCard: View {
             RoundedRectangle(cornerRadius: MRadius.card, style: .continuous)
                 .strokeBorder(MColor.hairline, lineWidth: 1)
         )
+        // 必须在 aspectRatio / clipShape 之后量，才是屏幕上真实卡片矩形。
+        .overlay {
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: MCardFrameKey.self,
+                    value: [asset.id: geo.frame(in: .named(MPreviewSpace.name))]
+                )
+            }
+            .allowsHitTesting(false)
+        }
     }
 }
 

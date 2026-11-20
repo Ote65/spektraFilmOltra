@@ -84,6 +84,8 @@ struct LibraryPhoto: Codable, Identifiable, Hashable {
     var filename: String
     var originalPath: String
     var thumbnailPath: String?
+    /// 直出成片的持久化路径；普通显影照片没有这一份，改用显影交接图。
+    var renderedPath: String? = nil
     var width: Int
     var height: Int
     var isRaw: Bool
@@ -193,6 +195,23 @@ final class LibraryStore: @unchecked Sendable {
 
     func thumbnailURL(for photo: LibraryPhoto) -> URL? {
         photo.thumbnailPath.map { Self.resolve($0, root: root, folder: "Thumbnails") }
+    }
+
+    /// 直出成片：相机产出的临时文件会在保存后删掉，这里取持久化的成品副本。
+    func renderedURL(for photo: LibraryPhoto) -> URL? {
+        photo.renderedPath.map { Self.resolve($0, root: root, folder: "Thumbnails") }
+    }
+
+    /// 把成片复制到软件自己的目录，返回索引用的相对路径。
+    func writeFinishedFile(id: String, from url: URL) throws -> String {
+        let ext = url.pathExtension.lowercased()
+        let name = "\(id)-finished\(ext.isEmpty ? "" : ".\(ext)")"
+        let target = thumbnailsURL.appendingPathComponent(name)
+        if FileManager.default.fileExists(atPath: target.path) {
+            try? FileManager.default.removeItem(at: target)
+        }
+        try FileManager.default.copyItem(at: url, to: target)
+        return "Thumbnails/\(name)"
     }
 
     /// 索引里存相对路径（Originals/…）；老索引是绝对路径，容器目录一变就失效，

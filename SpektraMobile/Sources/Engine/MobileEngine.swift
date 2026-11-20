@@ -195,6 +195,13 @@ final class MobileEngine: ObservableObject {
         refreshPhotos()
         warmThumbnails()
         importDebugFileIfNeeded()
+        // 主页点开已调色卡片要同步拿到真实成品比例；老卡片没有直出副本，
+        // 冷启动时先把它们各渲染一遍写进成品缓存，避免首帧按比例猜测再跳一次。
+        let library = store
+        let gradedSnapshot = library.photos
+        Task.detached(priority: .utility) {
+            await MFinishedPreviewCache.backfill(photos: gradedSnapshot, store: library)
+        }
     }
 
     /// 验收脚本用：`--import <绝对路径>` 在启动时把指定 RAW 入库，省掉手工点「导入」。
@@ -994,13 +1001,21 @@ final class MobileEngine: ObservableObject {
         // 与直出渲染的裁切保持同一构图。
         let rawURL = store.originalURL(for: photo)
         let rawSize = LibraryStore.pixelSize(url: rawURL)
-        let landscape = capturedLandscape ?? (rawSize.width > rawSize.height)
-        // RAW 的 TIFF 尺寸是传感器 buffer 朝向（横拍时可能是竖的），而 crop 会被
-        // 应用到 EXIF 转正后的交接图上。必须先把尺寸换到转正坐标系，否则横拍
-        // 9:16 会按竖幅 buffer 算出细长条 crop，与直出 16:9 成片不一致。
-        let oriented = landscape && rawSize.width < rawSize.height
-            ? (width: rawSize.height, height: rawSize.width)
-            : (width: rawSize.width, height: rawSize.height)
+        // RAW 探测失败时退回库记录尺寸；至少不能拿 0×0 去算裁切。
+        let probeWidth = rawSize.width > 0 ? rawSize.width : photo.width
+        let probeHeight = rawSize.height > 0 ? rawSize.height : photo.height
+        let landscape = capturedLandscape ?? (probeWidth > probeHeight)
+        // RAW 的 TIFF 尺寸是传感器 buffer 朝向，可能和快门朝向一致，也可能差 90°；
+        // crop 会被应用到 EXIF 转正后的显示图上，所以必须先把 buffer 尺寸换到
+        // 转正坐标系。旧逻辑只在「横拍 + 竖 buffer」时交换，漏了「竖拍 + 横 buffer」，
+        // 于是 1:1 竖拍算出 0.75×1 的裁切框，套到转正图上正好变成 9:16。
+        let bufferLandscape = probeWidth > probeHeight
+        let oriented: (width: Int, height: Int)
+        if bufferLandscape == landscape {
+            oriented = (max(1, probeWidth), max(1, probeHeight))
+        } else {
+            oriented = (max(1, probeHeight), max(1, probeWidth))
+        }
         var geometry = MPhotoGeometry()
         if let data = photo.cropData,
            let decoded = try? JSONDecoder().decode(MPhotoGeometry.self, from: data) {
@@ -1014,6 +1029,8 @@ final class MobileEngine: ObservableObject {
         // 画幅与翻转方向都与成片一致，但线性源与导出仍保持全幅。
         if mirrorFront { geometry.flippedH = true }
         photo.cropData = try? JSONEncoder().encode(geometry.normalized())
+        // 直出成片是临时文件，保存完会被相机页删掉；复制一份作为预览缓存源。
+        photo.renderedPath = try? store.writeFinishedFile(id: photoID, from: renderedURL)
         try? store.update(photo)
 
         var wroteThumbnail = false
@@ -1123,10 +1140,14 @@ final class MobileEngine: ObservableObject {
     func remove(photoIDs: [String]) {
         guard !photoIDs.isEmpty else { return }
         for photoID in photoIDs {
-            if let photo = store.photos.first(where: { $0.id == photoID }),
-               let thumbnail = store.thumbnailURL(for: photo) {
-                // 缓存键是缩略图的绝对路径，不能传索引里的相对路径。
-                MThumbnailCache.shared.remove(path: thumbnail.path)
+            if let photo = store.photos.first(where: { $0.id == photoID }) {
+                if let thumbnail = store.thumbnailURL(for: photo) {
+                    // 缓存键是缩略图的绝对路径，不能传索引里的相对路径。
+                    MThumbnailCache.shared.remove(path: thumbnail.path)
+                }
+                if let rendered = store.renderedURL(for: photo) {
+                    try? FileManager.default.removeItem(at: rendered)
+                }
             }
             MDevelopHandoffCache.remove(root: store.root, photoID: photoID)
         }
@@ -1180,6 +1201,10 @@ final class MobileEngine: ObservableObject {
             try? FileManager.default.removeItem(at: url)
         }
         photo.thumbnailPath = nil
+        if let rendered = store.renderedURL(for: photo) {
+            try? FileManager.default.removeItem(at: rendered)
+        }
+        photo.renderedPath = nil
         try? store.update(photo)
         refreshPhotos()
         if let refreshed = store.photos.first(where: { $0.id == photoID }) {
@@ -1435,7 +1460,18 @@ final class MobileEngine: ObservableObject {
         transientDevelopSession = nil
         developSession?.cancel()
         let session = MobileDevelopSession(photo: photo, store: store)
-        session.onPersist = { [weak self] _ in self?.refreshPhotos() }
+        session.onPersist = { [weak self] photo in
+            guard let self else { return }
+            // 显影参数变了，直出成片副本就过期；预览改走新的显影交接图。
+            if let rendered = self.store.renderedURL(for: photo) {
+                try? FileManager.default.removeItem(at: rendered)
+            }
+            if var record = self.store.photos.first(where: { $0.id == photo.id }) {
+                record.renderedPath = nil
+                try? self.store.update(record)
+            }
+            self.refreshPhotos()
+        }
         developSession = session
         session.start()
         return session

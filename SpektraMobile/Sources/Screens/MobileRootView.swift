@@ -43,6 +43,7 @@ struct MobileRootView: View {
         if let index = args.firstIndex(of: "--screen"), args.indices.contains(index + 1) {
             switch args[index + 1] {
             case "camera": start = MLayout.isPad ? .home : .camera
+            case "home": start = .home
             case "develop": start = .develop
             case "grade": start = .grade
             case "settings": start = .settings

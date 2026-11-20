@@ -256,6 +256,11 @@ struct CameraScreen: View {
                     withAnimation(Self.directPickerFade) { directPickerOpen = true }
                 }
             }
+            if DebugLaunch.sessionList {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    sessionListOpen = true
+                }
+            }
         }
         .onDisappear {
             cancelCountdown()
@@ -316,18 +321,12 @@ struct CameraScreen: View {
         NavigationStack {
             Group {
                 if sessionShots.isEmpty {
-                    VStack(spacing: 14) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                            .font(.system(size: 34, weight: .light))
-                            .foregroundStyle(MColor.text4)
-                        Text("还没有拍摄的照片")
-                            .font(.rowLabel)
-                            .foregroundStyle(MColor.text3)
-                        Text("关闭「拍摄立即进入显影台」后，\n拍下的照片会保存在这里和相册")
-                            .font(.caption)
-                            .foregroundStyle(MColor.text4)
-                            .multilineTextAlignment(.center)
-                    }
+                    // 空状态不解释：一个自解释的胶片线稿居中，文字与张数都交给结构本身。
+                    MFilmEmptyGlyph(size: 84)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        // 视觉上不写说明，但 VoiceOver 要能说清空状态与下一步。
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("本次拍摄为空。关闭「拍摄立即进入显影台」后，拍下的照片会出现在这里。")
                 } else {
                     ScrollView {
                         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())],
@@ -365,7 +364,7 @@ struct CameraScreen: View {
                 }
             }
             .background(MColor.canvas)
-            .navigationTitle("本次拍摄 · \(sessionShots.count) 张")
+            .navigationTitle("本次拍摄")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -454,7 +453,7 @@ struct CameraScreen: View {
         .task(id: shot.photoID) {
             // 缩略图先顶上；主线程查原片 URL，后台解码 DNG 内嵌大图，回来再替换（失败保留缩略图）。
             guard let url = onOriginalURL(shot.photoID) else { return }
-            let task = Task.detached(priority: .userInitiated) { MImage.load(url: url) }
+            let task = Task.detached(priority: .userInitiated) { MImage.loadOriented(url: url) }
             guard let full = await task.value else { return }
             await MainActor.run {
                 // 快速切换照片时旧解码任务可能晚到：只回填当前仍在预览的那张，避免显示错图。
