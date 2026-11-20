@@ -1010,7 +1010,8 @@ final class MobileEngine: ObservableObject {
             ratio: aspect.ratio(landscape: landscape),
             width: oriented.width, height: oriented.height)
         // 前置镜像拍摄：直出成片已翻成预览所见，调色台（显影交接图 + 导出）
-        // 走 geometry.apply 同一翻转，两个成片方向一致。显影台仍显示 RAW 原始画面。
+        // 走 geometry.apply 同一翻转，两个成片方向一致；显影台也按这份几何裁显示图，
+        // 画幅与翻转方向都与成片一致，但线性源与导出仍保持全幅。
         if mirrorFront { geometry.flippedH = true }
         photo.cropData = try? JSONEncoder().encode(geometry.normalized())
         try? store.update(photo)

@@ -552,8 +552,9 @@ final class MobileDevelopSession: ObservableObject {
         if let originalImage, let rotated = originalImage.quarterTurnedClockwise {
             self.originalImage = rotated
         }
-        // 裁切框跟着画面转，保证旋转后重渲染的裁切方向与显示一致。
-        displayGeometry = displayGeometry.rotatedClockwise()
+        // 线性源 image 已按 edit.rotationTurns 物理旋转，这里只转裁切框与镜像，
+        // 不能再用 rotatedClockwise() 叠加 quarterTurns，否则重渲染会把画面转成 180°。
+        displayGeometry = displayGeometry.rotatingCropClockwise()
         persistSoon()
     }
 

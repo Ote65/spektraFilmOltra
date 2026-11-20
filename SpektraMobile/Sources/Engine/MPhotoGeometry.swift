@@ -93,6 +93,19 @@ struct MPhotoGeometry: Codable, Equatable {
         return value
     }
 
+    /// 画面已被外部物理旋转 90°（如显影台按 `edit.rotationTurns` 旋转线性源）时，
+    /// 只把裁切框与镜像跟着转到新画面坐标系，**不再叠加 `quarterTurns`**。
+    /// 否则 `apply` 会在已旋转的图上再转一次，预览变成 180° 且与导出方向不一致。
+    func rotatingCropClockwise() -> MPhotoGeometry {
+        var value = self
+        let old = crop
+        // 物理旋转后，屏幕水平镜像等价于原画面的垂直镜像。
+        swap(&value.flippedH, &value.flippedV)
+        value.crop = Crop(x: 1 - old.y - old.height, y: old.x,
+                          width: old.height, height: old.width).clamped
+        return value
+    }
+
     /// 方向变换后的画面尺寸（未裁切）。
     func orientedSize(sourceWidth: Int, sourceHeight: Int) -> (width: Int, height: Int) {
         quarterTurns % 2 == 0
