@@ -303,6 +303,11 @@ enum MMotion {
     static let canvas = Animation.spring(response: 0.4, dampingFraction: 0.86)
     /// 参数面板整块下沉 / 回升：三次贝塞尔，起手快、收尾长，不是计时线性。
     static let panelSlide = Animation.timingCurve(0.2, 0.92, 0.24, 1, duration: 0.46)
+    /// 卡片放大成相框：起始陡、末端几乎无声停住，接近 iOS 开 App 的图标形变。
+    /// 0.34s：比急促版稍慢、比拖沓版利落；放大与缩回共用同一条曲线。
+    static let morph = Animation.timingCurve(0.16, 1, 0.3, 1, duration: 0.34)
+    /// 按钮原地 Q 弹：欠阻尼弹簧带轻微回弹，液态玻璃的弹出手感。
+    static let pop = Animation.spring(response: 0.34, dampingFraction: 0.58, blendDuration: 0.2)
 }
 
 // MARK: - 预览调试参数
@@ -347,11 +352,6 @@ enum DebugLaunch {
     static var videoExport: Bool { args.contains("--video-export") }
     /// 截图验收用：`--video-export-run` 展开渲染面板后自动开跑，好截到进度与完成态。
     static var videoExportRun: Bool { args.contains("--video-export-run") }
-    /// 截图验收用：`--video-quick camera_exposure=2.5` 打开视频后直接推一个参数，
-    /// 用来比对「画面到底有没有走显影」。
-    static var videoQuick: (String, Double)? {
-        videoQuicks.first
-    }
     /// 验收用：`--video-codec prores` 让渲染面板默认选中母版，配合 export-run 自动验证成片。
     static var videoCodec: VideoCodec? {
         guard let index = args.firstIndex(of: "--video-codec"),
@@ -483,6 +483,29 @@ enum DebugLaunch {
 
     /// 验收用：相机页启动时展开直出预设面板。
     static var directPicker: Bool { args.contains("--direct-picker") }
+
+    /// 截图验收用：相机页启动后直接打开「本次拍摄」列表，检查空状态。
+    static var sessionList: Bool { args.contains("--session-list") }
+
+    /// 截图验收用：访达启动后直接放大第一张已入库照片，检查成品预览。
+    static var gradedPreview: Bool { args.contains("--graded-preview") }
+    /// 截图验收用：把成品预览形变拉长，便于逐帧检查起点与相框。
+    static var slowMorph: Bool { args.contains("--slow-morph") }
+    /// 形变验收用：把形变钉在指定进度（0~1），截一帧核对起/中/止的对位。
+    /// 0 = 卡片原位，0.5 = 生长途中，1 = 到位但未上相框。
+    static var holdProgress: CGFloat? {
+        guard let index = args.firstIndex(of: "--hold-progress"),
+              args.indices.contains(index + 1),
+              let value = Double(args[index + 1]) else { return nil }
+        return CGFloat(min(max(value, 0), 1))
+    }
+    /// 打断验收用：形变开始 N 秒后自动点空白收起，检查主页不会残留预览按钮。
+    static var cancelPreviewAfter: TimeInterval? {
+        guard let index = args.firstIndex(of: "--cancel-preview-after"),
+              args.indices.contains(index + 1),
+              let seconds = TimeInterval(args[index + 1]) else { return nil }
+        return seconds
+    }
 
     /// 截图验收用：设置页默认滚到底部，检查缓存分区。
     static var settingsBottom: Bool { args.contains("--settings-bottom") }

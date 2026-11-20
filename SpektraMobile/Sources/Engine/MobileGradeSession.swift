@@ -504,6 +504,11 @@ final class MobileGradeSession: ObservableObject {
         let recipe = displayRecipe.gradeRecipe(lutPath: lutPath)
         guard recipe != GradeRecipe() || photo.gradeData != nil else { return }
         photo.gradeData = try? JSONEncoder().encode(recipe)
+        // 调色配方已变，直出成片副本不再代表当前成品。
+        if let rendered = store.renderedURL(for: photo) {
+            try? FileManager.default.removeItem(at: rendered)
+        }
+        photo.renderedPath = nil
         try? store.update(photo)
     }
 

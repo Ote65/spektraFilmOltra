@@ -1169,6 +1169,61 @@ struct MFilmStockIcon: View {
     }
 }
 
+/// 空状态胶片线稿。几何取自 `Resources/Icons/film.svg`（Bootstrap Icons "film"，MIT），
+/// 只留一个自解释的图形，不配说明文字；呼吸幅度压到 2.5%，避免喧哗。
+struct MFilmEmptyGlyph: View {
+    var size: CGFloat = 72
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var breathing = false
+
+    var body: some View {
+        Canvas { context, canvas in
+            // SVG 源路径是 16×16 坐标系，必须按画布等比放大，否则图标只有 16pt。
+            let scale = min(canvas.width, canvas.height) / 16
+            context.scaleBy(x: scale, y: scale)
+            var path = Path()
+            path.addPath(
+                Path(
+                    roundedRect: CGRect(x: 0, y: 0, width: 16, height: 16),
+                    cornerRadius: 1.2
+                )
+            )
+            let holes: [CGRect] = [
+                CGRect(x: 1, y: 1, width: 2, height: 2),
+                CGRect(x: 1, y: 4, width: 2, height: 2),
+                CGRect(x: 1, y: 7, width: 2, height: 2),
+                CGRect(x: 1, y: 10, width: 2, height: 2),
+                CGRect(x: 1, y: 13, width: 2, height: 2),
+                CGRect(x: 13, y: 1, width: 2, height: 2),
+                CGRect(x: 13, y: 4, width: 2, height: 2),
+                CGRect(x: 13, y: 7, width: 2, height: 2),
+                CGRect(x: 13, y: 10, width: 2, height: 2),
+                CGRect(x: 13, y: 13, width: 2, height: 2),
+            ]
+            for rect in holes { path.addRect(rect) }
+            path.addRect(CGRect(x: 4, y: 1, width: 8, height: 6))
+            path.addRect(CGRect(x: 4, y: 9, width: 8, height: 6))
+            context.fill(
+                path,
+                with: .color(MColor.brass),
+                style: FillStyle(eoFill: true)
+            )
+        }
+        .frame(width: size, height: size)
+        .shadow(color: MColor.brass.opacity(0.14), radius: 20)
+        .scaleEffect(breathing ? 1.025 : 0.975)
+        .opacity(breathing ? 0.78 : 0.52)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 2.6).repeatForever(autoreverses: true)) {
+                breathing = true
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
 struct MPaperStockIcon: View {
     let paper: MPaper
     var size: CGFloat = 26
