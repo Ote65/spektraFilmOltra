@@ -263,7 +263,7 @@ final class MobileDevelopSession: ObservableObject {
     private var edit: PhotoEdit
     private var baseline: PhotoEdit
     /// 导入时状态：显影台重置回到这里（不碰调色台的裁切 / 边框）。
-    private let initialEdit: PhotoEdit
+    private var initialEdit: PhotoEdit
     private var quickIntents: [String: Double]
     private var image: ImageRGB?
     private var inputColorSpace = "ProPhoto RGB"
@@ -452,6 +452,7 @@ final class MobileDevelopSession: ObservableObject {
                     if self.originalLongEdge <= 0 { self.originalLongEdge = self.loadedEdge }
                     self.inputColorSpace = loaded.colorSpace
                     self.inputCCTF = loaded.cctfDecoding
+                    self.applyWideDynamicDefaultsIfNeeded(cctfDecoding: loaded.cctfDecoding)
                     self.isLoaded = true
                     // 画幅按裁切后的显示图派生，与直出成片一致；源图仍全幅，显影/导出不受影响。
                     if let croppedOriginal {
@@ -492,6 +493,35 @@ final class MobileDevelopSession: ObservableObject {
     func retryFullResolution() {
         loadNote = nil
         loadOriginal(maxSize: max(1600, previewEdge))
+    }
+
+    /// 宽动态输入（带 HDR 增益图的原片 / RAW / ACES 线性档案）把黑白场校正默认打开。
+    ///
+    /// 显影链路的软肩会把白场压到 ~0.83，宽动态输入不校正就整体发灰。
+    /// 新入库照片已在导入时带上该默认；这里只做**一次性迁移**：
+    /// 标记 = 导入时状态（initialEdit）里两个校正仍都是关（老版本入库的照片）。
+    /// 迁移后用户的手动开关照常保留，不会再被覆盖。
+    /// 判据与导入侧 `LibraryStore.isWideDynamicRangeInput` 同一口径。
+    private func applyWideDynamicDefaultsIfNeeded(cctfDecoding: Bool) {
+        guard LibraryStore.isWideDynamicRangeInput(path: originalURL.path,
+                                                   cctfDecoding: cctfDecoding) else { return }
+        guard !initialEdit.scanner.whiteCorrection,
+              !initialEdit.scanner.blackCorrection else { return }
+        edit.scanner.whiteCorrection = true
+        edit.scanner.blackCorrection = true
+        initialEdit.scanner.whiteCorrection = true
+        initialEdit.scanner.blackCorrection = true
+        baseline.scanner.whiteCorrection = true
+        baseline.scanner.blackCorrection = true
+        publishFromEdit()
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        photo.edit = edit
+        photo.initialEditData = try? JSONEncoder().encode(initialEdit)
+        if photo.quickBaselineData != nil {
+            photo.quickBaselineData = try? JSONEncoder().encode(baseline)
+        }
+        try? store.update(photo)
+        onPersist?(photo)
     }
 
     /// 启动解码看门狗。CIRAWFilter 对个别 RAW 可能长时间不返回，
@@ -2252,9 +2282,13 @@ enum MDirectRenderer {
 
     /// 直出工程的快速控制基线：拍摄曝光是基线，其它字段保持中性。
     /// 保存原图后再次进入显影台时，快速滑条回到 0 应该回到「拍摄时的曝光」，而不是归零。
+    /// App 相机拍摄即 RAW（线性宽动态输入）：黑白场校正默认打开，
+    /// 把显影软肩（白场 ~0.83）拉满到显示域，直出不再发灰；预设仍可显式覆盖。
     static func makeBaseline(meta: MCameraCaptureMeta) -> PhotoEdit {
         var baseline = PhotoEdit()
         baseline.camera.exposureCompensationEV = min(max(meta.exposureBias, -3), 3)
+        baseline.scanner.whiteCorrection = true
+        baseline.scanner.blackCorrection = true
         return baseline
     }
 

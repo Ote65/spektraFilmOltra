@@ -70,6 +70,10 @@ final class ColorReferenceService {
     }
 
     private func correctionFunction() -> (m: Double, q: Double, midgray: Double) {
+        // 引用（yBlack/yWhite）只在特定胶片/相纸组合下由 updateCMYBlackWhiteReferences
+        // 设置。当前档案库组合必然设到，但黑白场校正是宽动态输入的默认行为，
+        // 未来任何档案组合漏设引用都不该把全图乘成死白：缺失时显式退回恒等映射。
+        guard yBlack != nil || yWhite != nil else { return (1, 0, 0.184) }
         var white = whiteLevel
         var black = blackLevel
         if blackCorrection && !whiteCorrection, let yWhite { white = yWhite }
@@ -165,13 +169,14 @@ final class ColorReferenceService {
         return result
     }
 
+    /// 逐曝光点求三通道均值，对齐 Python `np.nanmean(density_curves, axis=1)`。
+    /// 返回长度 = 曝光点数（与 logExposure 对齐）；旧实现按通道求均值只返回 3 个值，
+    /// 会让下游 interp(xp:) 与 fp 长度错配而返回 nan，最终把印相曝光乘成 nan。
     private func channelMean(_ curves: [[Double]]) -> [Double] {
-        var result = [Double](repeating: 0, count: 3)
-        for row in curves {
-            for c in 0..<3 { result[c] += row[c] }
+        curves.map { row in
+            let valid = row.filter(\.isFinite)
+            return valid.isEmpty ? 0 : valid.reduce(0, +) / Double(valid.count)
         }
-        let count = Double(curves.count)
-        return result.map { $0 / count }
     }
 
     private func mean(_ values: [Double]) -> Double {

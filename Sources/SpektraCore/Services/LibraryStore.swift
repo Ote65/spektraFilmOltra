@@ -185,7 +185,13 @@ final class LibraryStore: @unchecked Sendable {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             guard let data = try? encoder.encode(snapshot) else { return }
-            try? data.write(to: url, options: .atomic)
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                // 静默失败会让库索引停留在旧状态（下次启动读到旧参数），
+                // 至少留一条日志便于排查「参数回跳」类问题。
+                NSLog("MLibrary index persist failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -256,6 +262,24 @@ final class LibraryStore: @unchecked Sendable {
         return allowingEncoded && ImageLoader.encodedSuffixes.contains(ext)
     }
 
+    /// 宽动态输入 = RAW（线性传感器数据）或带 HDR 增益图的原片。
+    /// 后者由 `decodingSemantics` 判定：增益图路径给出的解码语义是线性（cctfDecoding = false），
+    /// 编码图里只有 ACES 线性档案（png/tif 带 ACES ICC）同属线性宽动态。
+    static func isWideDynamicRangeInput(path: String, cctfDecoding: Bool) -> Bool {
+        let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
+        if ImageLoader.rawSuffixes.contains(ext) { return true }
+        return !cctfDecoding
+    }
+
+    /// 宽动态输入默认打开黑白场校正：显影链路的软肩会把白场压到 ~0.83，
+    /// 不校正整体发灰；校正把动态范围拉满到显示域。普通 SDR 编码图保持默认关。
+    private static func applyWideDynamicDefaults(to edit: inout PhotoEdit,
+                                                  path: String, cctfDecoding: Bool) {
+        guard isWideDynamicRangeInput(path: path, cctfDecoding: cctfDecoding) else { return }
+        edit.scanner.whiteCorrection = true
+        edit.scanner.blackCorrection = true
+    }
+
     /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。
     func stageImport(from source: URL, allowingEncoded: Bool = false,
                      captureExposureEV: Double? = nil,
@@ -266,7 +290,7 @@ final class LibraryStore: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey:
                             "显影台只支持 RAW，拒绝导入 \(source.lastPathComponent)"])
         }
-        let detected = ImageLoader.detectColorSpace(url: source)
+        let detected = ImageLoader.decodingSemantics(url: source)
         let dimensions = Self.pixelSize(url: source)
         let bias = ImageLoader.capturedExposureBias(url: source)
         let id = UUID().uuidString
@@ -300,6 +324,8 @@ final class LibraryStore: @unchecked Sendable {
         var edit = PhotoEdit()
         edit.io.inputColorSpace = staged.colorSpace
         edit.io.inputCCTFDecoding = staged.cctfDecoding
+        Self.applyWideDynamicDefaults(to: &edit, path: staged.originalPath,
+                                      cctfDecoding: staged.cctfDecoding)
         // 相机内调过的曝光已写进 RAW 的感光数据；显影管线的自动曝光会把它归一化掉，
         // 这里把拍摄时的补偿读回来重新施加，让显影台与导出和相册观感一致。
         // 相机页传入的快门参数优先：RAW 的 EXIF 曝光补偿并不可靠，
@@ -341,7 +367,7 @@ final class LibraryStore: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey:
                             "显影台只支持 RAW，拒绝导入 \(source.lastPathComponent)"])
         }
-        let detected = ImageLoader.detectColorSpace(url: source)
+        let detected = ImageLoader.decodingSemantics(url: source)
         let dimensions = Self.pixelSize(url: source)
         // 同名 + 同尺寸视为同一张：重复导入不再产生副本（相册选取与验收脚本都会重复触发）。
         if let existing = photos.first(where: {
@@ -356,6 +382,8 @@ final class LibraryStore: @unchecked Sendable {
         var edit = PhotoEdit()
         edit.io.inputColorSpace = detected.space
         edit.io.inputCCTFDecoding = detected.cctfDecoding
+        Self.applyWideDynamicDefaults(to: &edit, path: "Originals/\(id).\(ext)",
+                                      cctfDecoding: detected.cctfDecoding)
         // 相机内调过的曝光已写进 RAW 的感光数据；显影管线的自动曝光会把它归一化掉，
         // 这里把拍摄时的补偿读回来重新施加，让显影台与导出和相册观感一致。
         let bias = ImageLoader.capturedExposureBias(url: source)
