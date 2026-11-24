@@ -76,13 +76,13 @@ final class ColorReferenceService {
         // 引用（yBlack/yWhite）只在特定胶片/相纸组合下由 updateCMYBlackWhiteReferences
         // 设置。当前档案库组合必然设到，但黑白场校正是宽动态输入的默认行为，
         // 未来任何档案组合漏设引用都不该把全图乘成死白：缺失时显式退回恒等映射。
-        guard yBlack != nil || yWhite != nil else { return (1, 0, 0.184) }
+        guard let yWhite, let yBlack else { return (1, 0, 0.184) }
         var white = whiteLevel
         var black = blackLevel
-        if blackCorrection && !whiteCorrection, let yWhite { white = yWhite }
-        if whiteCorrection && !blackCorrection, let yBlack { black = yBlack }
-        let m = (white - black) / ((yWhite ?? 0) - (yBlack ?? 0) + 1e-10)
-        let q = black - m * (yBlack ?? 0)
+        if blackCorrection && !whiteCorrection { white = yWhite }
+        if whiteCorrection && !blackCorrection { black = yBlack }
+        let m = (white - black) / (yWhite - yBlack + 1e-10)
+        let q = black - m * yBlack
         let midgray = (0.184 - q) / m
         return (m, q, midgray)
     }

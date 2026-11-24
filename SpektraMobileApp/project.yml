@@ -40,7 +40,7 @@ targets:
       properties:
         CFBundleDisplayName: Spektrafilm
         CFBundleShortVersionString: 0.7.11
-        CFBundleVersion: 39
+        CFBundleVersion: 40
         LSRequiresIPhoneOS: true
         UILaunchScreen:
           UIColorName: LaunchBackground

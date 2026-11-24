@@ -262,9 +262,10 @@ final class MCameraSession: NSObject, ObservableObject {
     #if os(iOS)
     private func startSession() {
         let userEV = exposureBias
-        let generation = resetAutomaticProtection()
+        // 启动是生命周期操作：只重置保护状态，不能被之后到达的曝光意图取消。
+        resetAutomaticProtection()
         sessionQueue.async { [weak self] in
-            guard let self, self.exposureWriteIsCurrent(generation) else { return }
+            guard let self else { return }
             var format: OSType?
             var firstConfigure = false
             if !self.isConfigured {
@@ -666,7 +667,8 @@ final class MCameraSession: NSObject, ObservableObject {
         isSwitchingLens = true
         let userEV = exposureBias
         let restoreManualExposure = !allowsAutomaticProtection || abs(userEV) > 0.001
-        let generation = resetAutomaticProtection()
+        // 切镜头不是曝光写入：代际变化只该作废旧曝光任务，不能取消切换本身。
+        resetAutomaticProtection()
         lensSwitchToken += 1
         let token = lensSwitchToken
 
@@ -677,7 +679,7 @@ final class MCameraSession: NSObject, ObservableObject {
         }
 
         sessionQueue.async { [weak self] in
-            guard let self, self.exposureWriteIsCurrent(generation) else { return }
+            guard let self else { return }
             guard let previous = self.session.inputs.compactMap({ $0 as? AVCaptureDeviceInput }).first,
                   let next = try? AVCaptureDeviceInput(device: target) else {
                 DispatchQueue.main.async { self.failSwitch(to: lens) }
@@ -842,16 +844,18 @@ final class MCameraSession: NSObject, ObservableObject {
     func flip() {
         #if os(iOS)
         guard isRunning, !isCapturing, !isSwitchingLens, let current = device else { return }
-        isSwitchingLens = true
-        exposureBias = 0
-        resetAutomaticProtection(allowAutomatic: true)
         let target: AVCaptureDevice.Position = current.position == .front ? .back : .front
         guard let next = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: target),
               let input = try? AVCaptureDeviceInput(device: next) else {
-            isSwitchingLens = false
             message = "找不到可用的摄像头"
             return
         }
+        // 找到目标摄像头后才重置状态：失败时曝光标签与设备实际偏差保持一致。
+        isSwitchingLens = true
+        let previousEV = exposureBias
+        let previousAllowsAutomatic = allowsAutomaticProtection
+        exposureBias = 0
+        resetAutomaticProtection(allowAutomatic: true)
 
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -881,6 +885,9 @@ final class MCameraSession: NSObject, ObservableObject {
                 self.session.commitConfiguration()
                 DispatchQueue.main.async {
                     self.isSwitchingLens = false
+                    // 切换失败退回原输入，恢复用户原来的曝光意图与自动保护开关。
+                    self.exposureBias = previousEV
+                    self.resetAutomaticProtection(allowAutomatic: previousAllowsAutomatic)
                     self.message = target == .front
                         ? "这台 iPhone 的前置镜头不提供 RAW，已切回后置"
                         : "切换摄像头失败"

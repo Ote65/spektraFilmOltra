@@ -186,17 +186,20 @@ enum HDRGainMap {
             guard tiff + 8 < bytes.count else { continue }
 
             guard let (m33, m48) = parseAppleMakerNote(
-                bytes: bytes, tiff: tiff, bigEndian: bigEndian,
-                u16: { u16($0, bigEndian) }, u32: { u32($0, bigEndian) },
-                i32: { i32($0, bigEndian) }) else { continue }
+                bytes: bytes, tiff: tiff,
+                u16: { u16($0, bigEndian) }, u32: { u32($0, bigEndian) }) else { continue }
             return headroomFromMakerNote(maker33: m33, maker48: m48)
         }
     }
 
     private static func parseAppleMakerNote(
-        bytes: [UInt8], tiff: Int, bigEndian: Bool,
-        u16: (Int) -> Int, u32: (Int) -> Int, i32: (Int) -> Int
+        bytes: [UInt8], tiff: Int,
+        u16: (Int) -> Int, u32: (Int) -> Int
     ) -> (Double, Double)? {
+        // MakerNote 自己的 IFD 固定大端（头 12…13 字节写出 "MM"），与 TIFF 容器端序无关。
+        func be16(_ o: Int) -> Int { Int(bytes[o]) << 8 | Int(bytes[o + 1]) }
+        func be32(_ o: Int) -> Int { be16(o) << 16 | be16(o + 2) }
+        func bei32(_ o: Int) -> Int { Int(Int32(truncatingIfNeeded: be32(o))) }
         func entryCount(_ ifd: Int) -> Int {
             guard ifd + 2 <= bytes.count else { return 0 }
             let c = u16(ifd)
@@ -233,18 +236,18 @@ enum HDRGainMap {
         // 多张样片键 33 均读出相同校准值 0.7844，跨条目基准则读出碎片垃圾）。
         let entriesStart = makerNote + 16
         guard bytes[makerNote + 12] == 0x4D, bytes[makerNote + 13] == 0x4D else { return nil }
-        let count = u16(makerNote + 14)
+        let count = be16(makerNote + 14)
         guard count > 0, count <= 256 else { return nil }
         var maker33: Double?; var maker48: Double?
         for i in 0..<count {
             let e = entriesStart + i * 12
             guard e + 12 <= bytes.count else { break }
-            let key = u16(e); let type = u16(e + 2)
+            let key = be16(e); let type = be16(e + 2)
             guard key == 33 || key == 48, type == 10 else { continue }  // SRATIONAL
-            let offset = u32(e + 8)
+            let offset = be32(e + 8)
             let dataPos = makerNote + offset
             guard dataPos + 8 <= bytes.count else { continue }
-            let n = i32(dataPos); let d = i32(dataPos + 4)
+            let n = bei32(dataPos); let d = bei32(dataPos + 4)
             guard d != 0 else { continue }
             let v = Double(n) / Double(d)
             if key == 33 { maker33 = v } else { maker48 = v }
