@@ -278,6 +278,7 @@ final class LibraryStore: @unchecked Sendable {
         guard isWideDynamicRangeInput(path: path, cctfDecoding: cctfDecoding) else { return }
         edit.scanner.whiteCorrection = true
         edit.scanner.blackCorrection = true
+        edit.camera.autoExposureMethod = "adaptive"
     }
 
     /// 只做耗时准备（RAW 头解析 + 文件复制），不读写 `photos`，可在任意线程调用。

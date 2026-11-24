@@ -12,6 +12,8 @@ struct LoadedImage {
     var usedFallback: Bool = false
     /// 已应用 Apple HDR 增益图：image 为真实场景线性 HDR（含 >1.0 高光），cctfDecoding 恒为 false。
     var appliedGainMap: Bool = false
+    /// 是否可进入全质量场景线性路径。RAW 内嵌预览即使转成 Float 也仍只是 SDR 降级。
+    var isSceneLinearHDR: Bool { !usedFallback && !cctfDecoding }
 }
 
 // MARK: - Apple HDR 增益图（Adaptive HDR 原片）
@@ -23,7 +25,7 @@ struct LoadedImage {
 /// 三通道等比，不改变色相，色彩平衡保持）。
 ///
 /// 谨慎性设计：任何一步探测/解析失败都返回 nil / 跳过应用，退回现状的 SDR 基底解码，
-/// 绝不引入错误增强。EXIF 方向 2/4/5/7（含镜像）同样跳过（实拍照片只出现 1/3/6/8）。
+/// 绝不引入错误增强。EXIF 1…8 的方向与镜像均在应用阶段显式处理。
 enum HDRGainMap {
     struct Info {
         let data: Data
@@ -35,48 +37,82 @@ enum HDRGainMap {
 
         /// 线性域应用增益图。`image` 必须是 extendedLinear 空间的线性数据（已按 EXIF 方向摆正）。
         func apply(inPlace image: inout ImageRGB) {
-            // display(x,y) ↔ 原图 (r,c) 的映射来自 CIImage.oriented(forExifOrientation:)
-            // 的实测基准（不靠文档猜测；EXIF 1/3/6/8）。
-            let orientedWidth: Int, orientedHeight: Int
+            // renderToImage 已按 EXIF 摆正主图；增益图仍对应未转正原图。
+            // 逆映射必须使用显示宽高，增益图网格缩放则使用原图宽高。
+            let sourceWidth: Double, sourceHeight: Double
             switch orientation {
-            case .right, .left: (orientedWidth, orientedHeight) = (image.height, image.width)
-            default: (orientedWidth, orientedHeight) = (image.width, image.height)
+            case .right, .left, .rightMirrored, .leftMirrored:
+                (sourceWidth, sourceHeight) = (Double(image.height), Double(image.width))
+            default:
+                (sourceWidth, sourceHeight) = (Double(image.width), Double(image.height))
             }
-        let gmW = Double(width), gmH = Double(height)
-        let w0 = Double(orientedWidth), h0 = Double(orientedHeight)
-        let dataBytes = [UInt8](data)
-        let s = stride
-        // Rec.709 解码查表：12 MP 逐像素 pow 要数百毫秒，256 项表等价且近乎零成本。
-        var decodeLUT = [Float](repeating: 0, count: 256)
-        for i in 1...255 {
-            let encoded = Double(i) / 255.0
-            decodeLUT[i] = Float(encoded <= 0.081
-                ? encoded / 4.5
-                : pow((encoded + 0.099) / 1.099, 1.0 / 0.45))
-        }
-        for y in 0..<image.height {
-            for x in 0..<image.width {
-                let r: Int; let c: Int
-                switch orientation {
-                case .up: (r, c) = (y, x)
-                case .down: (r, c) = (orientedHeight - 1 - y, orientedWidth - 1 - x)
-                case .right: (r, c) = (orientedHeight - 1 - x, y)   // EXIF 6
-                case .left: (r, c) = (x, orientedWidth - 1 - y)     // EXIF 8
-                default: return
-                }
-                // 原图坐标 → 增益图网格（1/4 分辨率，最近邻）
-                let gr = min(height - 1, Int(Double(r) * gmH / h0))
-                let gc = min(width - 1, Int(Double(c) * gmW / w0))
-                let g = decodeLUT[Int(dataBytes[gr * s + gc])]
-                guard g > 0 else { continue }
-                let gain = Float(1.0 + (headroom - 1.0) * Double(g))
-                guard gain != 1 else { continue }
+            let dataBytes = [UInt8](data)
+            // Rec.709 解码查表：12 MP 逐像素 pow 要数百毫秒，256 项表等价且近乎零成本。
+            var decodeLUT = [Float](repeating: 0, count: 256)
+            for i in 1...255 {
+                let encoded = Double(i) / 255.0
+                decodeLUT[i] = Float(encoded <= 0.081
+                    ? encoded / 4.5
+                    : pow((encoded + 0.099) / 1.099, 1.0 / 0.45))
+            }
+            for y in 0..<image.height {
+                for x in 0..<image.width {
+                    guard let (r, c) = Self.sourceCoordinates(
+                        orientation: orientation, x: x, y: y,
+                        orientedWidth: image.width, orientedHeight: image.height)
+                    else { return }
+                    let g = Self.sampleBilinear(
+                        data: dataBytes, lut: decodeLUT, width: width, height: height,
+                        stride: stride, row: Double(r), column: Double(c),
+                        sourceWidth: sourceWidth, sourceHeight: sourceHeight)
+                    guard g > 0 else { continue }
+                    let gain = Float(1.0 + (headroom - 1.0) * Double(g))
+                    guard gain != 1 else { continue }
                     let p = (y * image.width + x) * 3
                     image.data[p] *= gain
                     image.data[p + 1] *= gain
                     image.data[p + 2] *= gain
                 }
             }
+        }
+
+        /// display(x,y) → 未转正原图(r,c)，覆盖 EXIF 1…8（含镜像）。
+        static func sourceCoordinates(orientation: CGImagePropertyOrientation,
+                                      x: Int, y: Int, orientedWidth: Int,
+                                      orientedHeight: Int) -> (r: Int, c: Int)? {
+            switch orientation {
+            case .up: return (y, x)
+            case .upMirrored: return (y, orientedWidth - 1 - x)
+            case .down: return (orientedHeight - 1 - y, orientedWidth - 1 - x)
+            case .downMirrored: return (orientedHeight - 1 - y, x)
+            case .leftMirrored: return (x, y)
+            case .right: return (orientedWidth - 1 - x, y)
+            case .rightMirrored:
+                return (orientedWidth - 1 - x, orientedHeight - 1 - y)
+            case .left: return (x, orientedHeight - 1 - y)
+            @unknown default: return nil
+            }
+        }
+
+        /// 主图像素中心映射到增益图网格，边界复制 + 双线性插值，消除最近邻方块。
+        static func sampleBilinear(data: [UInt8], lut: [Float], width: Int, height: Int,
+                                   stride: Int, row: Double, column: Double,
+                                   sourceWidth: Double, sourceHeight: Double) -> Float {
+            guard width > 0, height > 0, stride >= width, lut.count == 256,
+                  sourceWidth > 0, sourceHeight > 0 else { return 0 }
+            let gy = min(max((row + 0.5) * Double(height) / sourceHeight - 0.5, 0),
+                         Double(height - 1))
+            let gx = min(max((column + 0.5) * Double(width) / sourceWidth - 0.5, 0),
+                         Double(width - 1))
+            let y0 = Int(floor(gy)), x0 = Int(floor(gx))
+            let y1 = min(y0 + 1, height - 1), x1 = min(x0 + 1, width - 1)
+            let fy = Float(gy - Double(y0)), fx = Float(gx - Double(x0))
+            func value(_ y: Int, _ x: Int) -> Float {
+                lut[Int(data[y * stride + x])]
+            }
+            let top = value(y0, x0) * (1 - fx) + value(y0, x1) * fx
+            let bottom = value(y1, x0) * (1 - fx) + value(y1, x1) * fx
+            return top * (1 - fy) + bottom * fy
         }
     }
 
@@ -96,8 +132,6 @@ enum HDRGainMap {
         guard let fileData = try? Data(contentsOf: url),
               let headroom = Self.appleHeadroom(fileData: fileData) else { return nil }
         let orientation = ImageLoader.exifOrientation(url: url)
-        // 仅支持无镜像的方向；其余（2/4/5/7）跳过，退回 SDR 基底。
-        guard [CGImagePropertyOrientation.up, .down, .right, .left].contains(orientation) else { return nil }
         return Info(data: data, width: width, height: height, stride: stride,
                     headroom: headroom, orientation: orientation)
     }
@@ -359,7 +393,7 @@ enum ImageLoader {
             // 该路径无法应用白平衡/镜头校正参数，真机才走 CIRAWFilter。
             let image = try RawDecoder.decodeThumbnail(url: url, maxSize: maxSize ?? 4096)
             return LoadedImage(image: image, colorSpace: "sRGB",
-                               cctfDecoding: false, isRaw: true)
+                               cctfDecoding: false, isRaw: true, usedFallback: true)
             #else
             do {
                 var options = rawOptions

@@ -10,11 +10,13 @@ final class ScanningStage {
     private let settings: SettingsParams
     private let lutService: SpectralLUTService
     private let colorReference: ColorReferenceService
+    private let preserveExtendedRange: Bool
     private let cmyToLogXYZ: (ImageRGB) -> ImageRGB
 
     init(film: Profile, filmRender: FilmRenderParams, printProfile: Profile, printRender: PrintRenderParams,
          scanner: ScannerParams, io: IOParams, settings: SettingsParams,
-         lutService: SpectralLUTService, colorReference: ColorReferenceService) {
+         lutService: SpectralLUTService, colorReference: ColorReferenceService,
+         preserveExtendedRange: Bool = false) {
         self.film = film
         self.filmRender = filmRender
         self.printProfile = printProfile
@@ -24,6 +26,7 @@ final class ScanningStage {
         self.settings = settings
         self.lutService = lutService
         self.colorReference = colorReference
+        self.preserveExtendedRange = preserveExtendedRange
         self.cmyToLogXYZ = ScanningStage.makeCmyToLogXYZ(film: film, printProfile: printProfile, io: io)
         colorReference.cmyToLogXYZ = self.cmyToLogXYZ
     }
@@ -237,7 +240,9 @@ final class ScanningStage {
     }
 
     private func compressRGB(_ rgb: ImageRGB) -> ImageRGB {
-        OutputGamutCompression.apply(
+        // 显影后的浮点线性出口保留广色域 / 超白场分量；显示色域压缩只属于 SDR 分支。
+        guard !preserveExtendedRange else { return rgb }
+        return OutputGamutCompression.apply(
             rgb,
             algorithm: io.outputGamutCompressAlgorithm,
             knee: io.outputGamutCompressKnee,

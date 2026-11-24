@@ -7,6 +7,7 @@ final class ColorReferenceService {
     private let scanFilm: Bool
     private let outputColorSpace: String
     private let outputCCTFEncoding: Bool
+    private let preserveExtendedRange: Bool
 
     private let blackCorrection: Bool
     private let whiteCorrection: Bool
@@ -23,7 +24,8 @@ final class ColorReferenceService {
     init(film: Profile, printProfile: Profile, densityMin: [Double],
          blackCorrection: Bool, whiteCorrection: Bool,
          blackLevel: Double, whiteLevel: Double,
-         scanFilm: Bool, outputColorSpace: String, outputCCTFEncoding: Bool) {
+         scanFilm: Bool, outputColorSpace: String, outputCCTFEncoding: Bool,
+         preserveExtendedRange: Bool = false) {
         self.film = film
         self.printProfile = printProfile
         self.densityMin = densityMin
@@ -34,6 +36,7 @@ final class ColorReferenceService {
         self.scanFilm = scanFilm
         self.outputColorSpace = outputColorSpace
         self.outputCCTFEncoding = outputCCTFEncoding
+        self.preserveExtendedRange = preserveExtendedRange
     }
 
     private func updateCMYBlackWhiteReferences(inPrint: Bool = false) {
@@ -150,13 +153,21 @@ final class ColorReferenceService {
             guard let base = buffer.baseAddress else { return }
             for p in 0..<count {
                 let y = Double(base[p * 3 + 1])
-                let corrected = min(max(m * y + q, 0), 1)
+                let corrected = Self.correctedLuminance(
+                    y, m: m, q: q, preserveExtendedRange: preserveExtendedRange)
                 let scale = corrected / (y + 1e-10)
                 base[p * 3] = Float(Double(base[p * 3]) * scale)
                 base[p * 3 + 1] = Float(corrected)
                 base[p * 3 + 2] = Float(Double(base[p * 3 + 2]) * scale)
             }
         }
+    }
+
+    /// 黑场仍不允许产生负亮度；只有显示分支把白场裁到 SDR 1.0。
+    static func correctedLuminance(_ y: Double, m: Double, q: Double,
+                                   preserveExtendedRange: Bool) -> Double {
+        let mapped = max(m * y + q, 0)
+        return preserveExtendedRange ? mapped : min(mapped, 1)
     }
 
     private func densityCurvesMax(_ curves: [[Double]]) -> [Double] {
