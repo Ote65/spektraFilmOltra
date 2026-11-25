@@ -207,9 +207,9 @@ final class MCameraSession: NSObject, ObservableObject {
     private let videoQueue = DispatchQueue(label: "spektra.camera.meter", qos: .utility)
     private let sessionQueue = DispatchQueue(label: "spektra.camera.session", qos: .userInitiated)
     private var device: AVCaptureDevice?
+    /// 当前设备的 RAW 像素格式。主线程专用：sessionQueue 要用时由主线程带进去，
+    /// 不要在队列上直接读（会和主线程的发布互相踩）。
     private var rawFormat: OSType?
-    /// HDR 处理图请求的尺寸；0 表示用会话默认（12 MP）。sessionQueue 写入。
-    private var hdrDimensions = CMVideoDimensions(width: 0, height: 0)
     /// 处理图编码：HEVC → HEIC；没有 HEVC 时退回 JPEG。nil 表示不支持处理图。
     private var hdrCodec: AVVideoCodecType?
     /// 会话首次 configure 时输出自带的默认尺寸档（一般是 12 MP）。sessionQueue 写入。
@@ -355,9 +355,7 @@ final class MCameraSession: NSObject, ObservableObject {
         }
         session.commitConfiguration()
         device = nil
-        rawFormat = nil
         hdrCodec = nil
-        hdrDimensions = CMVideoDimensions(width: 0, height: 0)
         pendingWideDevice = nil
         isConfigured = false
     }
@@ -378,6 +376,8 @@ final class MCameraSession: NSObject, ObservableObject {
         // configure 依赖它们决定 ProRAW 开关与优先级，切格式不会把前置跳回后置。
         let mode = captureMode
         let position: AVCaptureDevice.Position = isFront ? .front : .back
+        // rawFormat 主线程专用：重配时要用上一轮的格式，就在主线程取好带进去。
+        let cachedRawFormat = self.rawFormat
         // 启动是生命周期操作：只重置保护状态，不能被之后到达的曝光意图取消。
         resetAutomaticProtection()
         sessionQueue.async { [weak self] in
@@ -399,7 +399,7 @@ final class MCameraSession: NSObject, ObservableObject {
                     return
                 }
             } else {
-                format = self.rawFormat
+                format = cachedRawFormat
             }
 
             let hdrReady = self.hdrCodec != nil
@@ -422,13 +422,11 @@ final class MCameraSession: NSObject, ObservableObject {
             let currentLens = self.pendingLens(for: self.device)
             let wide = self.pendingWideDevice
             let maxEdge = self.device.map { Self.maxPhotoLongEdge(of: $0, mode: mode) } ?? 0
-            let hdrDims = self.hdrDimensions
 
             DispatchQueue.main.async {
                 self.rawFormat = format
                 self.rawAvailable = format != nil
                 self.hdrAvailable = hdrReady
-                self.hdrDimensions = hdrDims
                 self.hasFlash = flash
                 self.maxZoom = zoomLimit
                 self.maxPhotoEdge = maxEdge
@@ -520,7 +518,7 @@ final class MCameraSession: NSObject, ObservableObject {
         if baselinePhotoDimensions == nil {
             baselinePhotoDimensions = photoOutput.maxPhotoDimensions
         }
-        hdrDimensions = applyMaxPhotoDimensions(for: device, mode: mode)
+        applyMaxPhotoDimensions(for: device, mode: mode)
 
         self.device = device
         self.pendingWideDevice = device
@@ -610,39 +608,52 @@ final class MCameraSession: NSObject, ObservableObject {
         return edge
     }
 
-    /// 按拍摄格式设置输出的最大照片尺寸，返回 HDR 档。
+    /// 按拍摄格式设置输出的最大照片尺寸。
     /// `photoOutput.maxPhotoDimensions` 是输出级、跨模式共用的：
-    /// HDR 会把它抬到 24 MP，切回 RAW 必须显式还原会话默认档，
+    /// HDR 会把它抬到 24 MP 档，切回 RAW 必须显式还原会话默认档，
     /// 否则要么 ProRAW 被降档，要么默认 12 MP 被悄悄抬到 48 MP（解码成本翻几倍）。
-    @discardableResult
+    ///
+    /// 值没变时不重复写：改这个属性会触发捕获渲染管线重配
+    /// （SDK 头文件原文：Changing this property may trigger a lengthy reconfiguration of the
+    /// capture render pipeline）。换镜头时每写一次就重配一次，白白掉帧。
     private func applyMaxPhotoDimensions(for device: AVCaptureDevice,
-                                         mode: CaptureMode) -> CMVideoDimensions {
+                                         mode: CaptureMode) {
         let supported = device.activeFormat.supportedMaxPhotoDimensions
+        var target = CMVideoDimensions(width: 0, height: 0)
         if mode == .hdr {
-            let dims = Self.hdrPhotoDimensions(of: device)
-            if dims.width > 0 { photoOutput.maxPhotoDimensions = dims }
-            return dims
+            target = Self.hdrPhotoDimensions(of: device)
+        } else {
+            let baseline = baselinePhotoDimensions ?? CMVideoDimensions(width: 0, height: 0)
+            if baseline.width > 0,
+               supported.contains(where: {
+                   $0.width == baseline.width && $0.height == baseline.height
+               }) {
+                target = baseline
+            } else if let fallback = supported.filter({
+                Int($0.width) * Int($0.height) <= Int(baseline.width) * Int(baseline.height)
+            }).max(by: {
+                Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height)
+            }), fallback.width > 0 {
+                // 换了摄像头，原档位不在它的支持列表里：退到不超过原档的最大可选档。
+                target = fallback
+            }
         }
-        let baseline = baselinePhotoDimensions ?? CMVideoDimensions(width: 0, height: 0)
-        if baseline.width > 0,
-           supported.contains(where: {
-               $0.width == baseline.width && $0.height == baseline.height
-           }) {
-            photoOutput.maxPhotoDimensions = baseline
-        } else if let fallback = supported.filter({
-            Int($0.width) * Int($0.height) <= Int(baseline.width) * Int(baseline.height)
-        }).max(by: {
-            Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height)
-        }), fallback.width > 0 {
-            // 换了摄像头，原档位不在它的支持列表里：退到不超过原档的最大可选档。
-            photoOutput.maxPhotoDimensions = fallback
-        }
-        return CMVideoDimensions(width: 0, height: 0)
+        guard target.width > 0 else { return }
+        let current = photoOutput.maxPhotoDimensions
+        guard current.width != target.width || current.height != target.height else { return }
+        photoOutput.maxPhotoDimensions = target
     }
 
     /// 处理图（非 RAW）能请求的最大尺寸档：48 MP 只对 ProRAW 开放，
     /// 处理图最高是 24 MP（5712×4284 ≈ 24.47 M）。没有可选档位时返回 0，
     /// 表示交回会话默认尺寸，不强行设置 maxPhotoDimensions。
+    ///
+    /// 24 MP 的实际交付要当心（AVCapturePhotoOutput.h）：
+    /// 「The maxPhotoDimensions setting for 24MP (5712, 4284), when supported,
+    /// is only serviced as 24MP via deferred photo delivery」——
+    /// 不开启 autoDeferredPhotoDeliveryEnabled 时，请求 24 MP 不报错，但拿到的可能更小；
+    /// 而开启延迟交付必须在 delegate 实现 didFinishCapturingDeferredPhotoProxy，
+    /// 没实现会抛异常。这里不开延迟交付，所以 HDR 的真实像素数要真机核对。
     static func hdrPhotoDimensions(of device: AVCaptureDevice) -> CMVideoDimensions {
         // 允许到 25 M，把 24 MP 的 24.47 M 放进阈值内，同时挡掉 48 MP 的 48.7 M。
         let pixelBudget = 25_000_000
@@ -960,7 +971,7 @@ final class MCameraSession: NSObject, ObservableObject {
             let limit = max(1, target.activeFormat.videoMaxZoomFactor)
             let factor = min(max(1, lens.crop), limit)
             // 新镜头的支持档位可能不同：按格式重设最大尺寸，HDR 档位要带回去写进 settings。
-            let hdrDims = self.applyMaxPhotoDimensions(for: target, mode: mode)
+            self.applyMaxPhotoDimensions(for: target, mode: mode)
             do {
                 try target.lockForConfiguration()
                 target.videoZoomFactor = factor
@@ -980,7 +991,6 @@ final class MCameraSession: NSObject, ObservableObject {
                 self.rawFormat = raw
                 // raw 在 HDR 模式下是 nil：这里按实际拿到的格式发布，不能硬写成 true。
                 self.rawAvailable = raw != nil
-                self.hdrDimensions = hdrDims
                 self.hasFlash = target.hasFlash
                 self.maxZoom = limit
                 self.maxPhotoEdge = Self.maxPhotoLongEdge(of: target, mode: self.captureMode)
@@ -1044,7 +1054,7 @@ final class MCameraSession: NSObject, ObservableObject {
             if self.photoOutput.isAppleProRAWSupported {
                 self.photoOutput.isAppleProRAWEnabled = (mode == .raw)
             }
-            let hdrDims = self.applyMaxPhotoDimensions(for: wide, mode: mode)
+            self.applyMaxPhotoDimensions(for: wide, mode: mode)
 
             if let connection = self.photoOutput.connection(with: .video) {
                 if #available(iOS 17.0, *) {
@@ -1057,7 +1067,10 @@ final class MCameraSession: NSObject, ObservableObject {
             }
 
             let formats = self.photoOutput.availableRawPhotoPixelFormatTypes
-            let raw = formats.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) ?? formats.first
+            // 拍摄格式决定要不要 RAW：HDR 走处理图，不该把 Bayer 格式写进 rawFormat。
+            let raw = mode == .raw
+                ? (formats.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) } ?? formats.first)
+                : nil
             let limit = max(1, wide.activeFormat.videoMaxZoomFactor)
             do {
                 try wide.lockForConfiguration()
@@ -1072,7 +1085,6 @@ final class MCameraSession: NSObject, ObservableObject {
                     self.rawFormat = raw
                     self.rawAvailable = true
                 }
-                self.hdrDimensions = hdrDims
                 self.hasFlash = wide.hasFlash
                 self.maxZoom = limit
                 self.maxPhotoEdge = Self.maxPhotoLongEdge(of: wide, mode: self.captureMode)
@@ -1163,15 +1175,14 @@ final class MCameraSession: NSObject, ObservableObject {
 
             let built = Self.makeLenses(position: target, wide: next,
                                         excluding: self.failedLensIDs)
-            // 新摄像头的支持档位可能不同：RAW 提回最大档，HDR 设成它自己的 24 MP 档。
-            let hdrDims = self.applyMaxPhotoDimensions(for: next, mode: mode)
+            // 新摄像头的支持档位可能不同：RAW 提回默认档，HDR 设成它自己的 24 MP 档。
+            self.applyMaxPhotoDimensions(for: next, mode: mode)
 
             DispatchQueue.main.async {
                 self.isSwitchingLens = false
                 self.device = next
                 self.wideDevice = next
                 self.isFront = target == .front
-                self.hdrDimensions = hdrDims
                 self.rawFormat = picked
                 // 前置摄像头通常没有 RAW：HDR 模式 picked 也可能是 nil。
                 self.rawAvailable = picked != nil
@@ -1592,7 +1603,7 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
         }
         completion(.success(MCameraShot(
             url: url,
-            thumbnail: Self.thumbnail(url: url, mirrored: actualMeta.mirrorFront, isHDR: isHDR),
+            thumbnail: Self.thumbnail(url: url, mirrored: actualMeta.mirrorFront),
             meta: actualMeta)))
     }
 
@@ -1619,13 +1630,13 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
         return formatter.string(from: Date())
     }
 
-    /// 只读内嵌预览，避免为了取景器缩略图去解码整张 RAW。
+    /// 只读内嵌预览，避免为了取景器缩略图去解码整张原片。
     /// 前置镜像拍摄时把缩略图翻成预览所见，成片渲染同样会镜像，两边一致。
-    /// `isHDR` 只影响注释里"解整张 RAW"的说法：HEIC 走系统缩略图，路径一致。
-    private static func thumbnail(url: URL, mirrored: Bool, isHDR: Bool) -> MPlatformImage? {
+    /// RAW（DNG）与 HDR（HEIC）走同一条 ImageIO 缩略图路径，不用分模式。
+    private static func thumbnail(url: URL, mirrored: Bool) -> MPlatformImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
-            // 先用 DNG 内嵌的小预览；只有缺失时才解整张 RAW，避免快门后立刻吃一大块内存。
+            // 优先用文件内嵌的小预览；只有缺失时才解整张原片，避免快门后立刻吃一大块内存。
             kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: 240

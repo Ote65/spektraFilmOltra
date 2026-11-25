@@ -30,7 +30,7 @@ cd "/Users/megmeet/Documents/开发 APP/SpektrafilmSwift-ios"
 
 /usr/libexec/PlistBuddy \
   -c "Set :CFBundleShortVersionString 0.7.12" \
-  -c "Set :CFBundleVersion 40" \
+  -c "Set :CFBundleVersion 41" \
   SpektraMobileApp/Info.plist
 ```
 
