@@ -119,8 +119,6 @@ struct CameraScreen: View {
     @State private var aspectPanelOpen = false
     /// 徽标实测宽度：展开时用它给左侧徽标精确让位。
     @State private var aspectBadgeWidth: CGFloat = 90
-    /// 格式徽标实测宽度：直出模式下它要停在画幅按钮左侧，位置靠这个值算。
-    @State private var modeBadgeWidth: CGFloat = 58
     /// 选中块在两条选项胶囊之间滑动的几何匹配命名空间。
     @Namespace private var aspectSlideSpace
 
@@ -241,7 +239,6 @@ struct CameraScreen: View {
         .coordinateSpace(name: "cameraRoot")
         .onPreferenceChange(MDirectButtonFrameKey.self) { directButtonFrame = $0 }
         .onPreferenceChange(MTopBadgeWidthKey.self) { aspectBadgeWidth = $0 }
-        .onPreferenceChange(MTopModeBadgeWidthKey.self) { modeBadgeWidth = $0 }
         .background(MColor.canvas)
         .preferredColorScheme(.dark)
         .onAppear {
@@ -515,12 +512,13 @@ struct CameraScreen: View {
                                 ? 0
                                 : max(0, geo.size.width - aspectBadgeWidth))
                         .zIndex(1)
-                    // 格式徽标钉在画幅按钮左侧：收起时一起停在右端，展开时随选项行一起让位。
-                    // 间距给 2：画幅按钮的命中区比胶囊左右各宽 6pt，视觉间距正好 8。
+                    // 格式徽标改钉在顶栏左侧（关闭按钮之后），不跟画幅徽标挤在右端：
+                    // 右边只放得下一个徽标——画幅徽标本身 ~106pt，
+                    // 再加一个 ~58pt 的格式徽标会盖住居中的工具组，直出按钮直接点不到。
+                    // 左侧从关闭按钮（38pt）之后到工具组之前空着，正好放它。
                     if !aspectPanelOpen {
                         modeBadgeButton
-                            .offset(x: max(0, geo.size.width - aspectBadgeWidth
-                                          - modeBadgeWidth - 2))
+                            .offset(x: 40)
                             .zIndex(2)
                             .transition(.opacity)
                     }
@@ -650,29 +648,25 @@ struct CameraScreen: View {
             camera.toggleCaptureMode()
         } label: {
             HStack(spacing: 6) {
-                Circle()
-                    .fill(camera.isReadyForCurrentMode ? MColor.filmRed : MColor.text4)
-                    .frame(width: 6, height: 6)
-                Text(camera.captureMode.title)
-                    .font(.mSans(10, .semibold))
-                    .foregroundStyle(MColor.text1)
+                // 重配中的转圈占圆点同一个位置：胶囊宽度不随转圈胀大，
+                // 否则顶栏左侧那段会被它挤到工具组身上。
                 if camera.isReconfiguring {
                     ProgressView()
                         .controlSize(.mini)
                         .tint(MColor.text3)
+                        .frame(width: 8, height: 8)
+                } else {
+                    Circle()
+                        .fill(camera.isReadyForCurrentMode ? MColor.filmRed : MColor.text4)
+                        .frame(width: 6, height: 6)
                 }
+                Text(camera.captureMode.title)
+                    .font(.mSans(10, .semibold))
+                    .foregroundStyle(MColor.text1)
             }
             .padding(.horizontal, 10)
             .frame(height: 28)
             .background(Capsule().fill(Color.white.opacity(0.07)))
-            // 量的是胶囊本身，不是被拉满的按钮容器：非直出模式下按钮会填满整行，
-            // 量容器宽度会把画幅徽标的定位算错。
-            .background(
-                GeometryReader { proxy in
-                    Color.clear.preference(key: MTopModeBadgeWidthKey.self,
-                                           value: proxy.size.width)
-                }
-            )
             // 命中区 44pt 高，不对齐文字轮廓：点胶囊上下留白也要响应。
             .frame(height: 44)
             .contentShape(Rectangle())
@@ -2882,14 +2876,6 @@ private struct MDirectButtonFrameKey: PreferenceKey {
 /// 顶栏画幅徽标宽度：展开菜单时按它把选项行推到徽标右侧。
 private struct MTopBadgeWidthKey: PreferenceKey {
     static var defaultValue: CGFloat = 90
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-/// 顶栏格式徽标（RAW / HDR）宽度：直出模式下它停在画幅按钮左侧，位置按它算。
-private struct MTopModeBadgeWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 58
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }

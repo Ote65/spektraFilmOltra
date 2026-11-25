@@ -402,6 +402,13 @@ final class MCameraSession: NSObject, ObservableObject {
                 format = cachedRawFormat
             }
 
+            // 尺寸档在 configure 的 commit 之后再算：sessionPreset 生效后，
+            // device.activeFormat 才是会话真正在用的格式，
+            // 这时读 supportedMaxPhotoDimensions 才作数（写错档位会抛异常）。
+            if let device = self.device {
+                self.applyMaxPhotoDimensions(for: device, mode: mode)
+            }
+
             let hdrReady = self.hdrCodec != nil
 
             if !self.session.isRunning {
@@ -506,6 +513,11 @@ final class MCameraSession: NSObject, ObservableObject {
             // 系统默认是 .balanced，多帧融合在这种优先级下会退化成单帧 + 轻度处理。
             photoOutput.maxPhotoQualityPrioritization = .quality
         }
+        // 别顺手开 autoDeferredPhotoDeliveryEnabled：开了就必须同时在 MCaptureDelegate 实现
+        // photoOutput(_:didFinishCapturingDeferredPhotoProxy:error:)，
+        // 否则 capturePhoto 会直接抛 NSInvalidArgumentException（SDK 头文件明写）。
+        // 现状是刻意不开：24 MP 档因此会被静默降档到 12 MP 档，
+        // 界面也已按 12 MP 上限上报（maxPhotoLongEdge 的 HDR 分支）。
 
         // 优先 Apple ProRAW：它已经是去过马赛克的线性 DNG，显影时不用现场去马赛克，读取快好几倍；
         // Bayer RAW 虽然更"原始"，但 12MP 去马赛克在 CIRAWFilter 里要几秒，用户会以为卡死。
@@ -513,12 +525,14 @@ final class MCameraSession: NSObject, ObservableObject {
         let proRAW = formats.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
         let picked: OSType? = mode == .raw ? (proRAW ?? formats.first) : nil
 
-        // HDR 用 24 MP 档（5712×4284）：处理图最高只到这一档，48 MP 是 ProRAW 专属。
-        // 没有支持的档位就留 0，交回会话默认（12 MP）。
+        // 会话默认尺寸档（一般是 12 MP）先记下来：切回 RAW 时要还原它，
+        // 否则默认 12 MP 会被悄悄抬到 48 MP（解码成本翻几倍）。
         if baselinePhotoDimensions == nil {
             baselinePhotoDimensions = photoOutput.maxPhotoDimensions
         }
-        applyMaxPhotoDimensions(for: device, mode: mode)
+        // 尺寸档不在这里设：configure 的事务还没 commit，device.activeFormat 未必是
+        // sessionPreset 选定的那个格式，读它的 supportedMaxPhotoDimensions 可能拿到旧格式的列表。
+        // 真正的写入放在 startSession 里、configure 返回之后（已 commit）。
 
         self.device = device
         self.pendingWideDevice = device
@@ -595,10 +609,11 @@ final class MCameraSession: NSObject, ObservableObject {
 
     /// 摄像头可输出的最大照片长边：当前格式支持的尺寸档位取最大
     /// （48 MP 机型这里会包含 8064×6048，普通机型是 4032×3024）。
-    /// HDR 处理图拿不到 48 MP 档，按 24 MP 上限算。
+    /// HDR 处理图拿不到 48 MP 档；而且 24 MP 档不开延迟交付就静默降档，
+    /// 所以上报给界面的上限按"实际能落地的档位"算，不让界面承诺 24 MP。
     static func maxPhotoLongEdge(of device: AVCaptureDevice, mode: CaptureMode) -> Int {
         if mode == .hdr {
-            let dims = hdrPhotoDimensions(of: device)
+            let dims = Self.hdrServiceableDimensions(of: device)
             if dims.width > 0 { return max(Int(dims.width), Int(dims.height)) }
         }
         var edge = 0
@@ -607,6 +622,13 @@ final class MCameraSession: NSObject, ObservableObject {
         }
         return edge
     }
+
+    /// HDR 处理图在**不开启延迟交付**时实际能落地的最大档位。
+    /// SDK 规则（AVCapturePhotoOutput.h）：24 MP（5712×4284）"is only serviced as 24MP
+    /// via deferred photo delivery" —— 不开 `autoDeferredPhotoDeliveryEnabled` 时请求 24 MP
+    /// 不报错，但交付会降档。所以这里按 12 MP 档（4032×3024 ≈ 12.19 M）算上限，
+    /// 宁可少报一档，也不要让界面给出兑现不了的 24 MP 选项。
+    /// （定义在下面 hdrServiceableDimensions(of:)。）
 
     /// 按拍摄格式设置输出的最大照片尺寸。
     /// `photoOutput.maxPhotoDimensions` 是输出级、跨模式共用的：
@@ -621,7 +643,7 @@ final class MCameraSession: NSObject, ObservableObject {
         let supported = device.activeFormat.supportedMaxPhotoDimensions
         var target = CMVideoDimensions(width: 0, height: 0)
         if mode == .hdr {
-            target = Self.hdrPhotoDimensions(of: device)
+            target = Self.hdrServiceableDimensions(of: device)
         } else {
             let baseline = baselinePhotoDimensions ?? CMVideoDimensions(width: 0, height: 0)
             if baseline.width > 0,
@@ -644,19 +666,15 @@ final class MCameraSession: NSObject, ObservableObject {
         photoOutput.maxPhotoDimensions = target
     }
 
-    /// 处理图（非 RAW）能请求的最大尺寸档：48 MP 只对 ProRAW 开放，
-    /// 处理图最高是 24 MP（5712×4284 ≈ 24.47 M）。没有可选档位时返回 0，
-    /// 表示交回会话默认尺寸，不强行设置 maxPhotoDimensions。
-    ///
-    /// 24 MP 的实际交付要当心（AVCapturePhotoOutput.h）：
-    /// 「The maxPhotoDimensions setting for 24MP (5712, 4284), when supported,
-    /// is only serviced as 24MP via deferred photo delivery」——
-    /// 不开启 autoDeferredPhotoDeliveryEnabled 时，请求 24 MP 不报错，但拿到的可能更小；
-    /// 而开启延迟交付必须在 delegate 实现 didFinishCapturingDeferredPhotoProxy，
-    /// 没实现会抛异常。这里不开延迟交付，所以 HDR 的真实像素数要真机核对。
-    static func hdrPhotoDimensions(of device: AVCaptureDevice) -> CMVideoDimensions {
-        // 允许到 25 M，把 24 MP 的 24.47 M 放进阈值内，同时挡掉 48 MP 的 48.7 M。
-        let pixelBudget = 25_000_000
+    /// 处理图（非 RAW）在**不开启延迟交付**时能落地的尺寸档。
+    /// 48 MP 只对 ProRAW 开放；24 MP（5712×4284）按 SDK 规则
+    /// 「is only serviced as 24MP via deferred photo delivery」——
+    /// 不开 autoDeferredPhotoDeliveryEnabled 时请求 24 MP 不报错，但拿到的更小。
+    /// 所以上限按 12 MP 档（4032×3024 ≈ 12.19 M）算：上报给界面和实际请求用同一个口径。
+    /// 没有可选档位时返回 0，表示交回会话默认尺寸，不强行设置 maxPhotoDimensions。
+    static func hdrServiceableDimensions(of device: AVCaptureDevice) -> CMVideoDimensions {
+        // 允许到 13 M：12 MP 的 12.19 M 放得进，24 MP 的 24.47 M 与 48 MP 的 48.7 M 都挡掉。
+        let pixelBudget = 13_000_000
         var best = CMVideoDimensions(width: 0, height: 0)
         for dims in device.activeFormat.supportedMaxPhotoDimensions {
             let pixels = Int(dims.width) * Int(dims.height)
@@ -1617,10 +1635,31 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     }
 
     /// 处理图真实容器：HEVC 编出的是 HEIC，退回 JPEG 时是 JPEG。
+    /// 扩展名决定 ImageLoader 的解码路径（HEIC 才读得到 HDR 增益图），
+    /// 所以 ImageIO 认不出类型时不能一律写 jpg——按容器盒式嗅探兜底。
     private static func processedExtension(for data: Data) -> String {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let uti = CGImageSourceGetType(source) as String? else { return "jpg" }
+              let uti = CGImageSourceGetType(source) as String? else {
+            return Self.sniffContainerExtension(data)
+        }
         return uti.contains("heic") || uti.contains("heif") ? "heic" : "jpg"
+    }
+
+    /// 容器嗅探：ISO-BMFF（HEIF/HEIC）第 4–8 字节是 "ftyp"，紧接着是品牌名；
+    /// 其余（JPEG 的 FF D8 也落这里）按 JPEG 记。
+    private static func sniffContainerExtension(_ data: Data) -> String {
+        let bytes = [UInt8](data.prefix(12))
+        guard bytes.count >= 12,
+              bytes[4] == 0x66, bytes[5] == 0x74, bytes[6] == 0x79, bytes[7] == 0x70 else {
+            return "jpg"
+        }
+        let brand = String(bytes: bytes[8..<12], encoding: .ascii) ?? ""
+        switch brand {
+        case "heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs", "mif1", "msf1":
+            return "heic"
+        default:
+            return "jpg"
+        }
     }
 
     private static func stamp() -> String {
