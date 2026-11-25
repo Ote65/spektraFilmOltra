@@ -263,7 +263,7 @@ final class MobileDevelopSession: ObservableObject {
     private var edit: PhotoEdit
     private var baseline: PhotoEdit
     /// 导入时状态：显影台重置回到这里（不碰调色台的裁切 / 边框）。
-    private let initialEdit: PhotoEdit
+    private var initialEdit: PhotoEdit
     private var quickIntents: [String: Double]
     private var image: ImageRGB?
     private var inputColorSpace = "ProPhoto RGB"
@@ -446,12 +446,13 @@ final class MobileDevelopSession: ObservableObject {
                     self.image = loaded.image
                     self.loadedEdge = max(loaded.image.width, loaded.image.height)
                     self.loadNote = loaded.usedFallback
-                        ? "RAW 解码较慢 · 已显示预览"
+                        ? "SDR 预览降级 · 导出将重读 RAW"
                         : nil
                     // 库里的宽高缺失时才退回解码缓冲的长边（此时至少能保证导出不被预览尺寸误缩）。
                     if self.originalLongEdge <= 0 { self.originalLongEdge = self.loadedEdge }
                     self.inputColorSpace = loaded.colorSpace
                     self.inputCCTF = loaded.cctfDecoding
+                    self.applyWideDynamicDefaultsIfNeeded(cctfDecoding: loaded.cctfDecoding)
                     self.isLoaded = true
                     // 画幅按裁切后的显示图派生，与直出成片一致；源图仍全幅，显影/导出不受影响。
                     if let croppedOriginal {
@@ -492,6 +493,46 @@ final class MobileDevelopSession: ObservableObject {
     func retryFullResolution() {
         loadNote = nil
         loadOriginal(maxSize: max(1600, previewEdge))
+    }
+
+    /// 宽动态输入（带 HDR 增益图的原片 / RAW / ACES 线性档案）把黑白场校正默认打开。
+    ///
+    /// 显影链路的软肩会把白场压到 ~0.83，宽动态输入不校正就整体发灰。
+    /// 新入库照片已在导入时带上该默认；这里只做**一次性迁移**：
+    /// 标记 = 导入时状态（initialEdit）里两个校正仍都是关（老版本入库的照片）。
+    /// 迁移后用户的手动开关照常保留，不会再被覆盖。
+    /// 判据与导入侧 `LibraryStore.isWideDynamicRangeInput` 同一口径。
+    private func applyWideDynamicDefaultsIfNeeded(cctfDecoding: Bool) {
+        guard LibraryStore.isWideDynamicRangeInput(path: originalURL.path,
+                                                   cctfDecoding: cctfDecoding) else { return }
+        guard !initialEdit.scanner.whiteCorrection,
+              !initialEdit.scanner.blackCorrection else { return }
+        edit.scanner.whiteCorrection = true
+        edit.scanner.blackCorrection = true
+        // 黑白场迁移不代表用户没选过测光。只有三份状态都仍是旧默认值，
+        // 才把旧 RAW 迁到 adaptive；用户显式选择的 legacy 测光保持原样。
+        let legacyMethod = PhotoEdit().camera.autoExposureMethod
+        let migrateMetering = edit.camera.autoExposureMethod == legacyMethod
+            && initialEdit.camera.autoExposureMethod == legacyMethod
+            && baseline.camera.autoExposureMethod == legacyMethod
+        if migrateMetering {
+            edit.camera.autoExposureMethod = "adaptive"
+            initialEdit.camera.autoExposureMethod = "adaptive"
+            baseline.camera.autoExposureMethod = "adaptive"
+        }
+        initialEdit.scanner.whiteCorrection = true
+        initialEdit.scanner.blackCorrection = true
+        baseline.scanner.whiteCorrection = true
+        baseline.scanner.blackCorrection = true
+        publishFromEdit()
+        guard var photo = store.photos.first(where: { $0.id == photoID }) else { return }
+        photo.edit = edit
+        photo.initialEditData = try? JSONEncoder().encode(initialEdit)
+        if photo.quickBaselineData != nil {
+            photo.quickBaselineData = try? JSONEncoder().encode(baseline)
+        }
+        try? store.update(photo)
+        onPersist?(photo)
     }
 
     /// 启动解码看门狗。CIRAWFilter 对个别 RAW 可能长时间不返回，
@@ -1049,6 +1090,7 @@ final class MobileDevelopSession: ObservableObject {
         }
         let colorSpace = params.io.outputColorSpace
         let cctf = params.io.outputCCTFEncoding
+        let outputMode: PipelineOutputMode = format == 2 ? .extendedLinear : .display
         let destination = Self.exportURL(filename: filename, ext: ext)
         let sourceURL = originalURL
         let options = rawOptions()
@@ -1075,7 +1117,8 @@ final class MobileDevelopSession: ObservableObject {
             var exportParams = params
             exportParams.io.inputColorSpace = loaded.colorSpace
             exportParams.io.inputCCTFDecoding = loaded.cctfDecoding
-            let pipeline = SimulationPipeline(params: exportParams, keepTaps: false)
+            let pipeline = SimulationPipeline(
+                params: exportParams, keepTaps: false, outputMode: outputMode)
             var prepared = PreviewRenderer.prepared(loaded.image, maxSize: requested)
             // 解码结果与 prepared 共享同一块存储；把 loaded 的引用清掉，
             // 后续 COW / 分带分配才能拿到唯一所有权。
@@ -2235,6 +2278,7 @@ enum MDirectRenderer {
         case decodeFailed
         case emptyImage
         case cancelled
+        case fullQualityUnavailable
         case lut(String)
 
         var errorDescription: String? {
@@ -2242,6 +2286,7 @@ enum MDirectRenderer {
             case .decodeFailed: return "原片解码失败"
             case .emptyImage: return "渲染结果为空"
             case .cancelled: return "显影已取消"
+            case .fullQualityUnavailable: return "RAW 全质量解码不可用，未生成 ACES EXR"
             case .lut(let message): return message
             }
         }
@@ -2252,9 +2297,14 @@ enum MDirectRenderer {
 
     /// 直出工程的快速控制基线：拍摄曝光是基线，其它字段保持中性。
     /// 保存原图后再次进入显影台时，快速滑条回到 0 应该回到「拍摄时的曝光」，而不是归零。
+    /// App 相机拍摄即 RAW（线性宽动态输入）：黑白场校正默认打开，
+    /// 把显影软肩（白场 ~0.83）拉满到显示域，直出不再发灰；预设仍可显式覆盖。
     static func makeBaseline(meta: MCameraCaptureMeta) -> PhotoEdit {
         var baseline = PhotoEdit()
         baseline.camera.exposureCompensationEV = min(max(meta.exposureBias, -3), 3)
+        baseline.camera.autoExposureMethod = "adaptive"
+        baseline.scanner.whiteCorrection = true
+        baseline.scanner.blackCorrection = true
         return baseline
     }
 
@@ -2441,6 +2491,9 @@ enum MDirectRenderer {
             throw RenderError.decodeFailed
         }
         let usedFallback = loaded.usedFallback
+        if usedFallback && settings.format == 2 {
+            throw RenderError.fullQualityUnavailable
+        }
         // 前置镜像拍摄：在进入显影管线前水平翻转，成片与镜像取景一致（所见即所得）。
         // RAW 原片本身保持原始数据；片边 / 水印画在镜像后的画面上，文字不会被翻反。
         if settings.mirrorOutput {
@@ -2449,7 +2502,9 @@ enum MDirectRenderer {
         try checkCancellation()
         params.io.inputColorSpace = loaded.colorSpace
         params.io.inputCCTFDecoding = loaded.cctfDecoding
-        let pipeline = SimulationPipeline(params: params, keepTaps: false)
+        // 直出随后进入既有 SDR GradeEngine，因此不能标为 extendedLinear。
+        // 保留 >1 高光的 ACES EXR 走上方 MobileDevelopSession.export 的直接显影出口。
+        let pipeline = SimulationPipeline(params: params, keepTaps: false, outputMode: .display)
         pipeline.shouldCancel = isCancelled
         var prepared = PreviewRenderer.prepared(loaded.image, maxSize: requested)
         loaded.image = ImageRGB(width: 0, height: 0)

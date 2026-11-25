@@ -902,15 +902,18 @@ final class MobileEngine: ObservableObject {
 
     /// 导入照片：文件复制与头部探测在后台串行完成，主线程只提交库状态与刷新列表。
     /// 新入库的原片随后异步写进系统相册（`publishToAlbum`），主页按相册映射才能看到它们。
+    /// - Parameter fromCamera: 相机自己产出的文件。HDR 模式仿下来的就是 HEIC，
+    ///   必须绕过「允许导入 JPEG/HEIC」这道用户开关，否则拍完直接入库失败。
     @discardableResult
     func importPhotos(_ urls: [URL], publishToAlbum: Bool = true,
                       generateThumbnails: Bool = true,
+                      fromCamera: Bool = false,
                       captureMeta: MCameraCaptureMeta? = nil) async -> ImportReport {
         var report = ImportReport()
         guard !urls.isEmpty else { return report }
 
         // 移动端只导入 RAW / JPEG / HEIC(HEIF)；PNG、GIF、WebP、TIFF 直接拒绝。
-        let allowingEncoded = MobileSettings.allowNonRaw
+        let allowingEncoded = MobileSettings.allowNonRaw || fromCamera
         var accepted: [URL] = []
         for url in urls {
             let ext = url.pathExtension.lowercased()

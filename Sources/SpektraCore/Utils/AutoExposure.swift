@@ -1,8 +1,146 @@
 import Foundation
 
+/// 场景线性代理图的高光—主体—阴影联合分析。
+///
+/// 这里只决定曝光落位，不重写胶片曲线，也不把每张图的显示中值拉到同一个位置。
+/// 取景流与 RAW 精算共用同一组决策规则；取景流只能提供预览高光估计，
+/// 不能据此宣称 RAW 通道已经饱和。
+struct SceneExposureAnalysis {
+    var subjectLuminance: Double
+    var medianLuminance: Double
+    var highlightLuminance: Double
+    var shadowLuminance: Double
+    var channelClippingFraction: Double
+
+    static let empty = SceneExposureAnalysis(
+        subjectLuminance: 0.184, medianLuminance: 0.184,
+        highlightLuminance: 0.184, shadowLuminance: 0.184,
+        channelClippingFraction: 0)
+
+    private static let epsilon = 1e-6
+    /// 场景白场之上再保留约 2 EV 的高光落点；实际软肩仍由原胶片 / 相纸曲线决定。
+    private static let highlightTarget = 4.0
+    /// 自动模式最多额外下压 1.5 EV，避免点光源把整张夜景拉得过暗。
+    private static let maximumHighlightProtection = 1.5
+    /// 保守的 p05 阴影落位下限；它只限制继续减光，不会把低调照片自动提亮。
+    private static let shadowTarget = 0.002
+
+    var adaptiveEV: Double {
+        let baseEV = log2(0.184 / max(subjectLuminance, Self.epsilon))
+        let range = highlightLuminance / max(medianLuminance, Self.epsilon)
+        // 低光与低调照片不机械套高光保护；中灰仍按主体意图落位。
+        guard medianLuminance >= 0.004, highlightLuminance > Self.highlightTarget,
+              range >= 8 else { return baseEV }
+        let highlightEV = log2(Self.highlightTarget / max(highlightLuminance, Self.epsilon))
+        let protected = max(highlightEV, baseEV - Self.maximumHighlightProtection)
+        let shadowEV = log2(Self.shadowTarget / max(shadowLuminance, Self.epsilon))
+        // 高光保护与阴影约束都只允许减光，不能越过主体曝光向上提亮。
+        return min(baseEV, max(protected, min(baseEV, shadowEV)))
+    }
+
+    /// 取景 SDR 代理图的自动高光保护建议。只在明显高反差且接近显示白的区域
+    /// 占有一定比例时介入；返回 0…−0.7 EV，由 AVFoundation 自行分配快门与 ISO。
+    static func captureProtectionEV(_ analysis: SceneExposureAnalysis) -> Double {
+        let range = analysis.highlightLuminance / max(analysis.medianLuminance, epsilon)
+        guard analysis.medianLuminance >= 0.015,
+              analysis.highlightLuminance >= 0.70,
+              analysis.channelClippingFraction >= 0.002,
+              range >= 6 else { return 0 }
+        let correction = log2(0.72 / max(analysis.highlightLuminance, epsilon))
+        return min(0, max(-0.7, correction))
+    }
+
+    static func analyze(image: ImageRGB, colorSpace: String,
+                        applyCCTFDecoding: Bool) -> SceneExposureAnalysis {
+        let count = image.width * image.height
+        guard count > 0 else { return .empty }
+        var luminance = [Double](repeating: 0, count: count)
+        var clipped = 0
+        for p in 0..<count {
+            let r = Double(image.data[p * 3])
+            let g = Double(image.data[p * 3 + 1])
+            let b = Double(image.data[p * 3 + 2])
+            if max(r, max(g, b)) >= 0.995 { clipped += 1 }
+            let rgb = Vec3(r, g, b)
+            let xyz = ColorMath.rgbToXYZ(
+                rgb, spaceName: colorSpace, applyCCTFDecoding: applyCCTFDecoding)
+            luminance[p] = max(xyz.y, epsilon)
+        }
+        let sorted = luminance.sorted()
+        func quantile(_ fraction: Double) -> Double {
+            guard !sorted.isEmpty else { return 0.184 }
+            let position = min(max(fraction, 0), 1) * Double(sorted.count - 1)
+            let low = Int(floor(position))
+            let high = min(low + 1, sorted.count - 1)
+            let mix = position - Double(low)
+            return sorted[low] * (1 - mix) + sorted[high] * mix
+        }
+        let lowTrim = quantile(0.01)
+        let highTrim = quantile(0.98)
+        let normH = Double(image.height) / Double(max(image.width, image.height))
+        let normW = Double(image.width) / Double(max(image.width, image.height))
+        let sigma = 0.35
+        var weightedLog = 0.0
+        var totalWeight = 0.0
+        for row in 0..<image.height {
+            let y = (Double(row) / Double(max(image.height - 1, 1)) - 0.5) * normH
+            for col in 0..<image.width {
+                let value = luminance[row * image.width + col]
+                guard value >= lowTrim, value <= highTrim else { continue }
+                let x = (Double(col) / Double(max(image.width - 1, 1)) - 0.5) * normW
+                let weight = exp(-(x * x + y * y) / (2 * sigma * sigma))
+                weightedLog += log(max(value, epsilon)) * weight
+                totalWeight += weight
+            }
+        }
+        let subject = totalWeight > 1e-12
+            ? exp(weightedLog / totalWeight)
+            : quantile(0.5)
+        let clippingFraction = Double(clipped) / Double(count)
+        // p99 会漏掉面积不足 1% 的灯源、窗框。小面积亮部取区域内部的中位
+        // 分位，避免恰好落在明暗交界；达到 1% 后继续使用原 p99 高光口径。
+        let highlightFraction = clippingFraction > 0
+            ? min(0.01, clippingFraction * 0.5)
+            : 0.01
+        return SceneExposureAnalysis(
+            subjectLuminance: subject,
+            medianLuminance: quantile(0.5),
+            highlightLuminance: quantile(1 - highlightFraction),
+            shadowLuminance: quantile(0.05),
+            channelClippingFraction: clippingFraction)
+    }
+}
+
+/// 取景曝光保护的连续平滑值与已应用量化值分开保存。
+/// 否则从 −0.1 EV 回到 0 时，量化会反复得到 −0.1，保护永远无法退出。
+struct CaptureExposureProtectionState {
+    private(set) var smoothedEV = 0.0
+    private(set) var appliedEV = 0.0
+
+    mutating func reset() {
+        smoothedEV = 0
+        appliedEV = 0
+    }
+
+    mutating func proposedEV(target: Double) -> Double {
+        let bounded = min(max(target, -0.7), 0)
+        smoothedEV = smoothedEV * 0.65 + bounded * 0.35
+        return (smoothedEV * 10).rounded() / 10
+    }
+
+    mutating func markApplied(_ value: Double) {
+        appliedEV = value
+    }
+}
+
 enum AutoExposure {
     static func measureEV(image: ImageRGB, colorSpace: String, applyCCTFDecoding: Bool,
                           method: String) -> Double {
+        if method == "adaptive" {
+            return SceneExposureAnalysis.analyze(
+                image: image, colorSpace: colorSpace,
+                applyCCTFDecoding: applyCCTFDecoding).adaptiveEV
+        }
         var luminance = [Double](repeating: 0, count: image.width * image.height)
         for p in 0..<(image.width * image.height) {
             let rgb = Vec3(Double(image.data[p * 3]), Double(image.data[p * 3 + 1]),

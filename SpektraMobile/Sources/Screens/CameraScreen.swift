@@ -119,6 +119,8 @@ struct CameraScreen: View {
     @State private var aspectPanelOpen = false
     /// 徽标实测宽度：展开时用它给左侧徽标精确让位。
     @State private var aspectBadgeWidth: CGFloat = 90
+    /// 格式徽标实测宽度：直出模式下它要停在画幅按钮左侧，位置靠这个值算。
+    @State private var modeBadgeWidth: CGFloat = 58
     /// 选中块在两条选项胶囊之间滑动的几何匹配命名空间。
     @Namespace private var aspectSlideSpace
 
@@ -239,6 +241,7 @@ struct CameraScreen: View {
         .coordinateSpace(name: "cameraRoot")
         .onPreferenceChange(MDirectButtonFrameKey.self) { directButtonFrame = $0 }
         .onPreferenceChange(MTopBadgeWidthKey.self) { aspectBadgeWidth = $0 }
+        .onPreferenceChange(MTopModeBadgeWidthKey.self) { modeBadgeWidth = $0 }
         .background(MColor.canvas)
         .preferredColorScheme(.dark)
         .onAppear {
@@ -512,8 +515,17 @@ struct CameraScreen: View {
                                 ? 0
                                 : max(0, geo.size.width - aspectBadgeWidth))
                         .zIndex(1)
+                    // 格式徽标钉在画幅按钮左侧：收起时一起停在右端，展开时随选项行一起让位。
+                    // 间距给 2：画幅按钮的命中区比胶囊左右各宽 6pt，视觉间距正好 8。
+                    if !aspectPanelOpen {
+                        modeBadgeButton
+                            .offset(x: max(0, geo.size.width - aspectBadgeWidth
+                                          - modeBadgeWidth - 2))
+                            .zIndex(2)
+                            .transition(.opacity)
+                    }
                 } else {
-                    rawBadge
+                    modeBadgeButton
                         .frame(maxWidth: .infinity, alignment: .trailing)
                 }
 
@@ -629,23 +641,48 @@ struct CameraScreen: View {
         .overlay(Capsule().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
     }
 
-    /// Spektra 只拍 RAW：这里只做状态显示，不提供开关。
-    private var rawBadge: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(camera.isRawReady ? MColor.filmRed : MColor.text4)
-                .frame(width: 6, height: 6)
-            Text("RAW")
-                .font(.mSans(10, .semibold))
-                .foregroundStyle(MColor.text1)
-            Text("4:3")
-                .font(.mSans(10, .medium))
-                .foregroundStyle(MColor.text4)
+    /// 拍摄格式徽标：点一下在 RAW / HDR 之间切换。
+    /// RAW = 单帧 ProRAW DNG，留给后期；HDR = 多帧融合 HEIC，即拍即出。
+    /// 不是装饰性标签：模式切换要重建 photoOutput，重配期间这里转圈并锁快门。
+    private var modeBadgeButton: some View {
+        Button {
+            MHaptic.tick()
+            camera.toggleCaptureMode()
+        } label: {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(camera.isReadyForCurrentMode ? MColor.filmRed : MColor.text4)
+                    .frame(width: 6, height: 6)
+                Text(camera.captureMode.title)
+                    .font(.mSans(10, .semibold))
+                    .foregroundStyle(MColor.text1)
+                if camera.isReconfiguring {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(MColor.text3)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 28)
+            .background(Capsule().fill(Color.white.opacity(0.07)))
+            // 量的是胶囊本身，不是被拉满的按钮容器：非直出模式下按钮会填满整行，
+            // 量容器宽度会把画幅徽标的定位算错。
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(key: MTopModeBadgeWidthKey.self,
+                                           value: proxy.size.width)
+                }
+            )
+            // 命中区 44pt 高，不对齐文字轮廓：点胶囊上下留白也要响应。
+            .frame(height: 44)
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 10)
-        .frame(height: 28)
-        .background(Capsule().fill(Color.white.opacity(0.07)))
-        .accessibilityLabel("正在拍 RAW")
+        .buttonStyle(MPressStyle(scale: 0.94))
+        // 不在「当前模式不可拍」时禁用：那样会把人困在一个模式里出不来。
+        // 可拍与否由圆点颜色表达，真要按快门时另有 blockedHint。
+        .disabled(camera.isCapturing || camera.isReconfiguring)
+        .accessibilityLabel("拍摄格式 \(camera.captureMode.title)")
+        .accessibilityHint(camera.captureMode == .raw ? "点按切到 HDR 多帧融合" : "点按切回 RAW 单帧")
     }
 
     /// 直出模式的画幅按钮：与 RAW 标签同位同尺寸，显示当前比例。
@@ -936,7 +973,7 @@ struct CameraScreen: View {
             VStack(spacing: 6) {
                 Image(systemName: "camera.aperture")
                     .font(.system(size: 20, weight: .light))
-                Text("4:3 · RAW")
+                Text("4:3 · \(camera.captureMode.title)")
                     .font(.mSans(9, .medium))
             }
             .foregroundStyle(MColor.text4)
@@ -1022,7 +1059,7 @@ struct CameraScreen: View {
                     icon: camera.flash.symbol,
                     label: camera.flash.title,
                     active: camera.flash != .off,
-                    enabled: camera.isRawReady && camera.hasFlash,
+                    enabled: camera.isReadyForCurrentMode && camera.hasFlash,
                     showsLabel: false
                 ) {
                     MHaptic.tick()
@@ -1036,7 +1073,7 @@ struct CameraScreen: View {
     private func axisButton(_ axis: MCaptureAxis, icon: String,
                             label: String, active: Bool) -> some View {
         MCaptureControl(icon: icon, label: label, active: active,
-                        enabled: camera.isRawReady, showsLabel: false) {
+                        enabled: camera.isReadyForCurrentMode, showsLabel: false) {
             MHaptic.tick()
             scaleValue = axis.seedValue(temperature: camera.temperature,
                                         exposure: camera.exposureBias)
@@ -2123,7 +2160,9 @@ struct CameraScreen: View {
             if let clamped = result.clampedEdge {
                 showHint("已按内存上限 \(clamped) px 渲染")
             } else if result.usedFallback {
-                showHint("RAW 解码较慢 · 已使用内嵌预览")
+                showHint(camera.captureMode == .raw
+                         ? "RAW 解码较慢 · 已使用内嵌预览"
+                         : "HDR 解码失败 · 已使用内嵌预览")
             }
         }
     }
@@ -2843,6 +2882,14 @@ private struct MDirectButtonFrameKey: PreferenceKey {
 /// 顶栏画幅徽标宽度：展开菜单时按它把选项行推到徽标右侧。
 private struct MTopBadgeWidthKey: PreferenceKey {
     static var defaultValue: CGFloat = 90
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// 顶栏格式徽标（RAW / HDR）宽度：直出模式下它停在画幅按钮左侧，位置按它算。
+private struct MTopModeBadgeWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 58
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }
