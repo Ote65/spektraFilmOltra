@@ -23,6 +23,17 @@ enum RawDecoder {
         var bandRows: Int? = nil
         /// 草稿模式：跳过高质量去马赛克，模拟器上避免等待 MobileAsset 相机描述。
         var draftMode: Bool = false
+        /// 输出场景线性（显影管线的输入契约）。
+        ///
+        /// CIRAWFilter 默认走 Apple 的 as-shot 渲染：`baselineExposure` 会按机型叠 +3 EV 左右、
+        /// `boostAmount`（全局影调曲线）默认 1、`localToneMapAmount`（局部影调曲线）默认按机型给到 1.0、
+        /// `extendedDynamicRangeAmount` 默认 0。这套组合会把 10 EV 以上的场景压进 0…1，
+        /// 并把暗部抬起来——那已经是"显示参考的 SDR"，不是场景光。
+        /// 直接喂给胶片/相纸曲线等于叠了两次影调，直出必然发灰。
+        /// 打开后关闭全部影调曲线、不叠 baseline exposure，只保留去马赛克 / 镜头校正 / 白平衡。
+        var sceneLinear: Bool = true
+        /// 高光余量（CIRAWFilter 0…2）。0 = 输出硬夹在 1.0；1.5 约保住 0.6 EV 以上的高光。
+        var extendedDynamicRange: Float = 1.5
     }
 
     enum DecodeError: Error, CustomStringConvertible {
@@ -106,6 +117,24 @@ enum RawDecoder {
         filter.orientation = ImageLoader.exifOrientation(url: url)
         filter.boostAmount = 0
         filter.boostShadowAmount = 0
+        if options.sceneLinear {
+            // 只关 boostAmount 是不够的：它只对应"全局影调曲线"，
+            // Apple 还有一条独立的"局部影调曲线"（localToneMapAmount），默认在 ProRAW 上就是满值。
+            // 局部曲线一边压全局反差、一边抬暗部，是直出"很灰"的直接来源。
+            // 两个量都有 supported 开关，不支持的 RAW 上直接赋值会抛异常，必须查过再设。
+            if filter.isLocalToneMapSupported {
+                filter.localToneMapAmount = 0
+            }
+            if filter.isContrastSupported {
+                filter.contrastAmount = 0
+            }
+            filter.shadowBias = 0
+            // baselineExposure 是绝对值：设 0 表示不叠 Apple 的 as-shot 曝光，
+            // 场景亮度留给显影端的自动曝光去落位。
+            filter.baselineExposure = 0
+            // 允许 >1.0：高光要能进胶片曲线，否则像纸白之前先被裁在 1.0。
+            filter.extendedDynamicRangeAmount = options.extendedDynamicRange
+        }
         if let maxSize = options.maxSize {
             let native = filter.nativeSize
             let longEdge = max(native.width, native.height)

@@ -20,6 +20,8 @@ enum MobileSettings {
     // 相机
     static let cameraLevelKey = "mobile.camera.level"
     static let cameraMirrorFrontKey = "mobile.camera.mirrorFront"
+    /// 相机拍摄格式：true = HDR（多帧融合 HEIC），false = RAW（单帧 DNG）。
+    static let cameraHDRKey = "mobile.camera.hdr"
     static let cameraEnterDevelopKey = "mobile.camera.enterDevelop"
     static let cameraVolumeShutterKey = "mobile.camera.volumeShutter"
     static let cameraDirectSaveOriginalKey = "mobile.camera.directSaveOriginal"
@@ -125,6 +127,13 @@ enum MobileSettings {
 
     static var cameraMirrorFront: Bool {
         UserDefaults.standard.object(forKey: cameraMirrorFrontKey) as? Bool ?? false
+    }
+
+    /// 相机拍摄格式。默认 HDR：直出要拿到和 iPhone 原相机同一条多帧融合管线，
+    /// RAW 是给后期留的单帧 DNG，不能当默认。
+    static var cameraHDR: Bool {
+        get { UserDefaults.standard.object(forKey: cameraHDRKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: cameraHDRKey) }
     }
 
     static var cameraShutterSound: Bool {

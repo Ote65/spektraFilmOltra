@@ -1,5 +1,13 @@
 import Foundation
 
+/// 显影结果的用途。显示分支保留既有 SDR 色调 / 色域映射；
+/// extendedLinear 是显影后的浮点线性出口，不提前套用显示白场。
+/// 它不是胶片曝光前的原始场景 Master，也不包含后续 SDR 调色。
+enum PipelineOutputMode {
+    case display
+    case extendedLinear
+}
+
 /// 管线内可进入/退出的 tap，用于 LUT 预览的四段烘焙。
 enum PipelineTap {
     case rgbIn
@@ -32,8 +40,11 @@ final class SimulationPipeline {
     var shouldCancel: () -> Bool = { false }
 
     init(params: RuntimePhotoParams, lutService sharedLUT: SpectralLUTService? = nil,
-         keepTaps: Bool = true) {
+         keepTaps: Bool = true, outputMode: PipelineOutputMode = .display) {
         var resolved = params
+        if outputMode == .extendedLinear {
+            resolved.io.outputCCTFEncoding = false
+        }
         if resolved.settings.previewMode {
             resolved.enlarger.lensBlur = 0
             resolved.filmRender.dirCouplers.diffusionSizeUM = 0
@@ -102,7 +113,8 @@ final class SimulationPipeline {
             whiteLevel: resolved.scanner.whiteLevel,
             scanFilm: resolved.io.scanFilm,
             outputColorSpace: resolved.io.outputColorSpace,
-            outputCCTFEncoding: resolved.io.outputCCTFEncoding
+            outputCCTFEncoding: resolved.io.outputCCTFEncoding,
+            preserveExtendedRange: outputMode == .extendedLinear
         )
         self.filming = FilmingStage(
             film: resolved.film, filmRender: resolved.filmRender, camera: resolved.camera,
@@ -117,7 +129,8 @@ final class SimulationPipeline {
         self.scanning = ScanningStage(
             film: resolved.film, filmRender: resolved.filmRender, printProfile: resolved.print,
             printRender: resolved.printRender, scanner: resolved.scanner, io: resolved.io,
-            settings: resolved.settings, lutService: lutService, colorReference: colorReference
+            settings: resolved.settings, lutService: lutService, colorReference: colorReference,
+            preserveExtendedRange: outputMode == .extendedLinear
         )
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 
 func log(_ text: String) {
     FileHandle.standardError.write((text + "\n").data(using: .utf8)!)
@@ -51,6 +52,201 @@ struct CoreSmoke {
         log("raw timeout \(rawTimeout)")
         let quickExposure = try runQuickExposureSmoke()
         log("quick exposure \(quickExposure)")
+        let sceneExposure = try runSceneExposureSmoke()
+        log("scene exposure \(sceneExposure)")
+        let captureState = try runCaptureExposureStateSmoke()
+        log("capture exposure state \(captureState)")
+        let rangeChannel = try runDynamicRangeChannelSmoke()
+        log("dynamic range channel \(rangeChannel)")
+        let gainMap = try runHDRGainMapSmoke()
+        log("HDR gain map \(gainMap)")
+    }
+
+    /// 用 2×3 非方形原图核对 EXIF 1…8；镜像与旋转后的宽高不能混用。
+    private static func runHDRGainMapSmoke() throws -> String {
+        let expected: [[Int]] = [
+            [0, 1, 2, 3, 4, 5],
+            [1, 0, 3, 2, 5, 4],
+            [5, 4, 3, 2, 1, 0],
+            [4, 5, 2, 3, 0, 1],
+            [0, 2, 4, 1, 3, 5],
+            [4, 2, 0, 5, 3, 1],
+            [5, 3, 1, 4, 2, 0],
+            [1, 3, 5, 0, 2, 4],
+        ]
+        for rawOrientation in 1...8 {
+            let orientation = CGImagePropertyOrientation(rawValue: UInt32(rawOrientation))!
+            let swaps = [4, 5, 6, 7].contains(rawOrientation - 1)
+            let width = swaps ? 3 : 2
+            let height = swaps ? 2 : 3
+            for y in 0..<height {
+                for x in 0..<width {
+                    guard let source = HDRGainMap.Info.sourceCoordinates(
+                        orientation: orientation, x: x, y: y,
+                        orientedWidth: width, orientedHeight: height) else {
+                        throw smokeError(27, "missing EXIF orientation \(rawOrientation)")
+                    }
+                    let actual = source.r * 2 + source.c
+                    let wanted = expected[rawOrientation - 1][y * width + x]
+                    guard actual == wanted else {
+                        throw smokeError(28, "EXIF \(rawOrientation) at \(x),\(y): \(actual) != \(wanted)")
+                    }
+                }
+            }
+        }
+        // 端到端调用 Info.apply：主图与真实 renderToImage 一样已经转正，
+        // 增益图仍是 2×3 未转正坐标；增益只有 0 / 1，可精确验证每个方向。
+        let gains: [UInt8] = [0, 255, 0, 255, 0, 255]
+        for rawOrientation in 1...8 {
+            let orientation = CGImagePropertyOrientation(rawValue: UInt32(rawOrientation))!
+            let swaps = [4, 5, 6, 7].contains(rawOrientation - 1)
+            let width = swaps ? 3 : 2
+            let height = swaps ? 2 : 3
+            var image = ImageRGB(width: width, height: height,
+                                 data: [Float](repeating: 1, count: width * height * 3))
+            let info = HDRGainMap.Info(data: Data(gains), width: 2, height: 3, stride: 2,
+                                       headroom: 2, orientation: orientation)
+            info.apply(inPlace: &image)
+            for y in 0..<height {
+                for x in 0..<width {
+                    let sourceIndex = expected[rawOrientation - 1][y * width + x]
+                    let wanted: Float = gains[sourceIndex] == 255 ? 2 : 1
+                    let offset = (y * width + x) * 3
+                    for channel in 0..<3 {
+                        guard abs(image.data[offset + channel] - wanted) < 1e-5 else {
+                            throw smokeError(30, "gain apply EXIF \(rawOrientation) at \(x),\(y)")
+                        }
+                    }
+                }
+            }
+        }
+        let data: [UInt8] = [0, 64, 128, 255]
+        let lut = (0..<256).map { Float($0) }
+        let sampled = HDRGainMap.Info.sampleBilinear(
+            data: data, lut: lut, width: 2, height: 2, stride: 2,
+            row: 0.5, column: 0.5, sourceWidth: 2, sourceHeight: 2)
+        let average = Float(0 + 64 + 128 + 255) / 4
+        guard abs(sampled - average) < 1e-6 else {
+            throw smokeError(29, "bilinear gain map \(sampled) != \(average)")
+        }
+        return "8 orientations + bilinear ok"
+    }
+
+    /// 显示与显影后浮点线性是两条出口：>1 高光只在显示分支限幅。
+    private static func runDynamicRangeChannelSmoke() throws -> String {
+        let sdr = ColorReferenceService.correctedLuminance(
+            1.2, m: 1, q: 0, preserveExtendedRange: false)
+        let master = ColorReferenceService.correctedLuminance(
+            1.2, m: 1, q: 0, preserveExtendedRange: true)
+        guard abs(sdr - 1) < 1e-12, abs(master - 1.2) < 1e-12 else {
+            throw smokeError(25, "white clip split failed sdr=\(sdr), master=\(master)")
+        }
+        let toe = ColorReferenceService.correctedLuminance(
+            -0.02, m: 1, q: 0, preserveExtendedRange: true)
+        guard toe == 0 else {
+            throw smokeError(26, "negative luminance escaped master \(toe)")
+        }
+        return "SDR \(sdr), master \(master)"
+    }
+
+    /// 宽动态自动曝光只约束真正越界的重要高光；普通 / 低光场景不触发拍摄端欠曝。
+    private static func runSceneExposureSmoke() throws -> String {
+        func image(value: Double, brightFraction: Double = 0, brightValue: Double = 1) -> ImageRGB {
+            let width = 100
+            let height = 100
+            var output = ImageRGB(width: width, height: height)
+            let brightCount = Int(Double(width * height) * brightFraction)
+            for p in 0..<(width * height) {
+                let level = p >= width * height - brightCount ? brightValue : value
+                output.data[p * 3] = Float(level)
+                output.data[p * 3 + 1] = Float(level)
+                output.data[p * 3 + 2] = Float(level)
+            }
+            return output
+        }
+        let normal = SceneExposureAnalysis.analyze(
+            image: image(value: 0.184), colorSpace: "sRGB", applyCCTFDecoding: false)
+        guard abs(normal.adaptiveEV) < 1e-5,
+              SceneExposureAnalysis.captureProtectionEV(normal) == 0 else {
+            throw smokeError(20, "normal scene was unnecessarily protected \(normal.adaptiveEV)")
+        }
+        let contrast = SceneExposureAnalysis.analyze(
+            image: image(value: 0.184, brightFraction: 0.04, brightValue: 16),
+            colorSpace: "sRGB", applyCCTFDecoding: false)
+        guard contrast.adaptiveEV <= normal.adaptiveEV - 1.0 else {
+            throw smokeError(21, "HDR highlight was not protected \(contrast.adaptiveEV)")
+        }
+        let preview = SceneExposureAnalysis.analyze(
+            image: image(value: 0.05, brightFraction: 0.04, brightValue: 1),
+            colorSpace: "sRGB", applyCCTFDecoding: false)
+        let protection = SceneExposureAnalysis.captureProtectionEV(preview)
+        guard protection < -0.2, protection >= -0.7 else {
+            throw smokeError(22, "preview highlight protection \(protection)")
+        }
+        let lowLight = SceneExposureAnalysis.analyze(
+            image: image(value: 0.005, brightFraction: 0.04, brightValue: 1),
+            colorSpace: "sRGB", applyCCTFDecoding: false)
+        guard SceneExposureAnalysis.captureProtectionEV(lowLight) == 0 else {
+            throw smokeError(23, "low light triggered negative exposure")
+        }
+        // 0.5% 的小窗框 / 灯源也应进入高光统计，不能被固定 p99 漏掉。
+        let smallHighlight = SceneExposureAnalysis.analyze(
+            image: image(value: 0.05, brightFraction: 0.005, brightValue: 1),
+            colorSpace: "sRGB", applyCCTFDecoding: false)
+        guard SceneExposureAnalysis.captureProtectionEV(smallHighlight) < -0.2 else {
+            throw smokeError(31, "small clipped highlight was ignored")
+        }
+        // 8% 极暗阴影 + 4% HDR 高光：保护高光不能把 p05 压到保守下限以下。
+        var shadowImage = image(value: 0.184, brightFraction: 0.04, brightValue: 16)
+        for p in 0..<800 {
+            shadowImage.data[p * 3] = 0.005
+            shadowImage.data[p * 3 + 1] = 0.005
+            shadowImage.data[p * 3 + 2] = 0.005
+        }
+        let shadows = SceneExposureAnalysis.analyze(
+            image: shadowImage, colorSpace: "sRGB", applyCCTFDecoding: false)
+        let mappedShadow = shadows.shadowLuminance * pow(2.0, shadows.adaptiveEV)
+        let baseEV = log2(0.184 / shadows.subjectLuminance)
+        guard mappedShadow >= 0.002 - 1e-6, shadows.adaptiveEV <= baseEV + 1e-6 else {
+            throw smokeError(32, "shadow constraint failed \(mappedShadow)")
+        }
+        let measured = AutoExposure.measureEV(
+            image: image(value: 0.184, brightFraction: 0.04, brightValue: 16),
+            colorSpace: "sRGB", applyCCTFDecoding: false, method: "adaptive")
+        guard abs(measured - contrast.adaptiveEV) < 1e-9 else {
+            throw smokeError(24, "adaptive method diverged from shared analysis")
+        }
+        return String(format: "normal %.3f, contrast %.3f, capture %.3f",
+                      normal.adaptiveEV, contrast.adaptiveEV, protection)
+    }
+
+    /// 连续平滑必须持续推进，即使量化结果暂时没有变化；高光消失后应能回到 0。
+    private static func runCaptureExposureStateSmoke() throws -> String {
+        var state = CaptureExposureProtectionState()
+        for _ in 0..<3 {
+            let proposed = state.proposedEV(target: -0.7)
+            state.markApplied(proposed)
+        }
+        guard state.appliedEV < -0.2 else {
+            throw smokeError(33, "protection did not engage")
+        }
+        var returnedToZero = false
+        for _ in 0..<16 {
+            let proposed = state.proposedEV(target: 0)
+            state.markApplied(proposed)
+            if state.appliedEV == 0 {
+                returnedToZero = true
+                break
+            }
+        }
+        guard returnedToZero else {
+            throw smokeError(34, "stuck at \(state.appliedEV)")
+        }
+        state.reset()
+        guard state.smoothedEV == 0, state.appliedEV == 0 else {
+            throw smokeError(35, "reset failed")
+        }
+        return "engage / release / reset ok"
     }
 
     /// 回归：拍摄曝光非 0 时，快速轴第一次离开 0 不能因为关闭印相补偿而按基线 EV 跳变。

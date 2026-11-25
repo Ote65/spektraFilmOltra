@@ -80,6 +80,7 @@ enum MobileCatalog {
                 slider("exposure_compensation_ev", "曝光补偿", 0, -5...5, 0.1, 1, " EV"),
                 toggle("auto_exposure", "自动曝光", true),
                 choice("auto_exposure_method", "测光方式", [
+                    MProOption(value: "adaptive", label: "宽动态"),
                     MProOption(value: "center_weighted", label: "中央重点"),
                     MProOption(value: "average", label: "平均值"),
                     MProOption(value: "median", label: "中位数"),

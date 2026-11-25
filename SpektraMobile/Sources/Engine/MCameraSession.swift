@@ -8,10 +8,14 @@ import CoreMotion
 import AudioToolbox
 #endif
 
-/// 按下快门那一刻的拍摄参数。RAW 的 EXIF 不一定记录曝光补偿，
-/// 显影管线的自动曝光又会把感光差异归一化掉，所以必须显式带着这一份进入入库/显影。
+/// 按下快门那一刻的拍摄参数。RAW 的 EXIF 不一定记录曝光补偿。
+/// `exposureBias` 只保存用户的创作意图；系统自动高光保护单独记录，
+/// 因为它已经改变传感器实进光量，不能在显影端再当作一次曝光补偿施加。
 struct MCameraCaptureMeta: Equatable {
     var exposureBias: Double = 0
+    var automaticExposureProtectionEV: Double = 0
+    var captureISO: Double? = nil
+    var captureExposureDuration: Double? = nil
     /// nil 表示自动白平衡。
     var temperature: Int?
     /// 快门瞬间的握持方向：横拍为 true。成片画幅据此决定，
@@ -32,7 +36,7 @@ struct MCameraShot: Identifiable {
 
 /// 相机页的拍摄会话：AVCaptureSession + AVCapturePhotoOutput 的薄封装。
 ///
-/// 只拍 RAW（DNG）：显影台只接受 RAW，拍完由根视图入库。
+/// 两种拍摄格式：RAW（单帧 ProRAW DNG，留给后期）与 HDR（多帧融合处理图，直出成品）。
 /// 所有 `@Published` 都在主线程写入；AVFoundation 的配置与启停在 `sessionQueue` 上跑。
 final class MCameraSession: NSObject, ObservableObject {
     enum Permission: Equatable {
@@ -94,14 +98,36 @@ final class MCameraSession: NSObject, ObservableObject {
         }
     }
 
+    /// 拍摄格式。两个模式走的是两条系统管线，不能混：
+    /// - `raw`：Apple ProRAW 单帧 DNG。只能 `.speed`，拿不到多帧融合，也没有增益图。
+    /// - `hdr`：Apple 处理图（HEVC/HEIC），`.quality` 优先级，系统会做多帧融合（Smart HDR / Deep Fusion），
+    ///   文件里带 HDR 增益图时由显影端按宽动态重建。直出走这条和 iPhone 原相机的口径一致。
+    enum CaptureMode: String, CaseIterable, Identifiable {
+        case raw, hdr
+
+        var id: String { rawValue }
+
+        var title: String { self == .raw ? "RAW" : "HDR" }
+
+        var hint: String {
+            switch self {
+            case .raw: return "RAW：单帧 DNG，留给后期"
+            case .hdr: return "HDR：多帧融合 HEIC，直出即成品"
+            }
+        }
+    }
+
     enum SessionError: LocalizedError {
         case noDevice
         case noRawData
+        case noProcessedData
+
 
         var errorDescription: String? {
             switch self {
             case .noDevice: return "找不到可用的后置摄像头"
             case .noRawData: return "这张照片没有 RAW 数据，请重试"
+            case .noProcessedData: return "这张照片没有生成处理图，请重试"
             }
         }
     }
@@ -110,6 +136,12 @@ final class MCameraSession: NSObject, ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var isCapturing = false
     @Published private(set) var rawAvailable = false
+    /// 设备能否输出处理图（HEVC/HEIC）。绝大多数 iPhone 都可以，模拟器不行。
+    @Published private(set) var hdrAvailable = false
+    /// 当前拍摄格式（RAW / HDR）。切换会重配 photoOutput，期间快门互锁。
+    @Published private(set) var captureMode: CaptureMode = .raw
+    /// 正在重配会话（切换 RAW / HDR、换镜头）。不允许按快门。
+    @Published private(set) var isReconfiguring = false
     @Published private(set) var hasFlash = false
     /// 光学焦段（DiscoverySession 枚举）+ 主摄裁切焦段（2×/4×）合并后的按钮列表。
     @Published private(set) var availableLenses: [Lens] = [.placeholder]
@@ -136,13 +168,18 @@ final class MCameraSession: NSObject, ObservableObject {
     /// 当前 ISO：未锁定时是设备的自动读数，锁定时是手动值。
     @Published private(set) var isoValue: Float = 0
 
-    /// 只有就绪且支持 RAW 时才允许按快门。
+    /// 只有就绪时才允许按快门。RAW 模式还需要设备的 RAW 格式；HDR 走处理图，不需要。
     var canCapture: Bool {
-        isRunning && rawAvailable && !isCapturing && !isSwitchingLens && unusableReason == nil
+        isRunning && isReadyForCurrentMode && !isCapturing && !isSwitchingLens
+            && !isReconfiguring && unusableReason == nil
     }
 
-    var isRawReady: Bool {
-        isRunning && rawAvailable && unusableReason == nil
+    /// 当前模式是否具备快门条件。
+    var isReadyForCurrentMode: Bool {
+        switch captureMode {
+        case .raw: return rawAvailable
+        case .hdr: return hdrAvailable
+        }
     }
 
     /// 快门被挡住时的说明文案。
@@ -150,9 +187,12 @@ final class MCameraSession: NSObject, ObservableObject {
         if let unusableReason { return unusableReason }
         if permission == .denied { return "没有相机权限，请到系统设置里打开" }
         if isSwitchingLens { return "正在切换镜头" }
-        if isCapturing { return "正在写入 DNG…" }
+        if isReconfiguring { return "正在切换拍摄格式" }
+        if isCapturing { return captureMode == .raw ? "正在写入 DNG…" : "正在合成 HDR…" }
         if !isRunning { return "相机还在启动" }
-        if !rawAvailable { return "这台设备不提供 RAW 拍摄" }
+        if !isReadyForCurrentMode {
+            return captureMode == .raw ? "这台设备不提供 RAW 拍摄" : "这台设备不支持 HDR 处理图输出"
+        }
         return "相机还没准备好"
     }
 
@@ -163,12 +203,30 @@ final class MCameraSession: NSObject, ObservableObject {
     #if os(iOS)
     let session = AVCaptureSession()
     private let photoOutput = AVCapturePhotoOutput()
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let videoQueue = DispatchQueue(label: "spektra.camera.meter", qos: .utility)
     private let sessionQueue = DispatchQueue(label: "spektra.camera.session", qos: .userInitiated)
     private var device: AVCaptureDevice?
+    /// 当前设备的 RAW 像素格式。主线程专用：sessionQueue 要用时由主线程带进去，
+    /// 不要在队列上直接读（会和主线程的发布互相踩）。
     private var rawFormat: OSType?
+    /// 处理图编码：HEVC → HEIC；没有 HEVC 时退回 JPEG。nil 表示不支持处理图。
+    private var hdrCodec: AVVideoCodecType?
+    /// 会话首次 configure 时输出自带的默认尺寸档（一般是 12 MP）。sessionQueue 写入。
+    /// 切回 RAW 要还原它，而不是把默认档抬到 48 MP——那会把 DNG 解码成本翻好几倍。
+    private var baselinePhotoDimensions: CMVideoDimensions?
     private var isConfigured = false
     private var captureDelegate: MCaptureDelegate?
     private var maxZoom: CGFloat = 1
+    /// 主线程专用：取景高光估计与用户 EV 分开；只有设备写入成功后才标记已应用值。
+    private var protectionState = CaptureExposureProtectionState()
+    /// 主线程专用：拍摄格式只在首次 start 时从设置恢复，之后交给徽标切换。
+    private var didRestoreMode = false
+    private var allowsAutomaticProtection = true
+    /// 使已经排队的旧曝光写入失效。跨主线程 / sessionQueue 读取由锁保护。
+    private let exposureGenerationLock = NSLock()
+    private var exposureGeneration = 0
+    private var lastMeterTimestamp = 0.0
     /// 当前方向的主摄，失败时回退到它。主线程专用：configure 的结果经
     /// pendingWideDevice 在 startSession 发布，flip 在主线程回调里更新。
     private var wideDevice: AVCaptureDevice?
@@ -203,10 +261,17 @@ final class MCameraSession: NSObject, ObservableObject {
         #if os(iOS)
         if isSimulator {
             permission = .authorized
-            unusableReason = "模拟器没有相机，请在 iPhone 真机上试拍 RAW"
+            unusableReason = "模拟器没有相机，请在 iPhone 真机上试拍"
             return
         }
         guard unusableReason == nil else { return }
+
+        // 上次用的拍摄格式：HDR 是新的默认口径，用户手动切回 RAW 也会记住。
+        // 只恢复一次：之后的模式由徽标切换，不再被冷启动覆盖。
+        if !didRestoreMode {
+            didRestoreMode = true
+            captureMode = MobileSettings.cameraHDR ? .hdr : .raw
+        }
 
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -229,6 +294,7 @@ final class MCameraSession: NSObject, ObservableObject {
 
     func stop() {
         #if os(iOS)
+        resetAutomaticProtection()
         sessionQueue.async { [weak self] in
             guard let self else { return }
             if self.session.isRunning { self.session.stopRunning() }
@@ -236,6 +302,64 @@ final class MCameraSession: NSObject, ObservableObject {
         }
         #endif
     }
+
+    // MARK: - 拍摄格式
+
+    /// 切换 RAW / HDR。两种模式在 AVFoundation 里是两套配置
+    /// （ProRAW 开关、qualityPrioritization、最大尺寸都不同），
+    /// 必须整段拆掉重建，不能只改快门参数。
+    func setCaptureMode(_ mode: CaptureMode) {
+        guard mode != captureMode else { return }
+        #if os(iOS)
+        guard !isCapturing, !isReconfiguring else { return }
+        isReconfiguring = true
+        MobileSettings.cameraHDR = (mode == .hdr)
+        let wasRunning = isRunning
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.teardownConfiguration()
+            DispatchQueue.main.async {
+                self.captureMode = mode
+                self.rawFormat = nil
+                self.rawAvailable = false
+                self.hdrAvailable = false
+                if wasRunning {
+                    // isReconfiguring 留到 startSession 发布结果时再放下：
+                    // 重建期间快门必须锁住。
+                    self.startSession()
+                } else {
+                    self.isReconfiguring = false
+                }
+            }
+        }
+        #else
+        captureMode = mode
+        #endif
+    }
+
+    /// 点一下徽标就切到另一个模式。
+    func toggleCaptureMode() {
+        setCaptureMode(captureMode == .raw ? .hdr : .raw)
+    }
+
+    #if os(iOS)
+    /// sessionQueue 调用：拆掉输入输出，让下一次 startSession 按新格式重新 configure。
+    private func teardownConfiguration() {
+        if session.isRunning { session.stopRunning() }
+        session.beginConfiguration()
+        for input in session.inputs {
+            session.removeInput(input)
+        }
+        for output in session.outputs {
+            session.removeOutput(output)
+        }
+        session.commitConfiguration()
+        device = nil
+        hdrCodec = nil
+        pendingWideDevice = nil
+        isConfigured = false
+    }
+    #endif
 
     private var isSimulator: Bool {
         #if targetEnvironment(simulator)
@@ -247,27 +371,49 @@ final class MCameraSession: NSObject, ObservableObject {
 
     #if os(iOS)
     private func startSession() {
+        let userEV = exposureBias
+        // 拍摄格式与摄像头位置在主线程读一次带进 sessionQueue：
+        // configure 依赖它们决定 ProRAW 开关与优先级，切格式不会把前置跳回后置。
+        let mode = captureMode
+        let position: AVCaptureDevice.Position = isFront ? .front : .back
+        // rawFormat 主线程专用：重配时要用上一轮的格式，就在主线程取好带进去。
+        let cachedRawFormat = self.rawFormat
+        // 启动是生命周期操作：只重置保护状态，不能被之后到达的曝光意图取消。
+        resetAutomaticProtection()
         sessionQueue.async { [weak self] in
             guard let self else { return }
             var format: OSType?
             var firstConfigure = false
             if !self.isConfigured {
                 do {
-                    format = try self.configure()
+                    format = try self.configure(mode: mode, position: position)
                     self.isConfigured = true
                     firstConfigure = true
                 } catch {
                     DispatchQueue.main.async {
                         self.unusableReason = error.localizedDescription
                         self.permission = .authorized
+                        // 配置失败也必须放下重配锁：否则快门和格式徽标会永久卡在「正在切换」。
+                        self.isReconfiguring = false
                     }
                     return
                 }
             } else {
-                format = self.rawFormat
+                format = cachedRawFormat
             }
 
-            if !self.session.isRunning { self.session.startRunning() }
+            let hdrReady = self.hdrCodec != nil
+
+            if !self.session.isRunning {
+                if let device = self.device {
+                    do {
+                        try device.lockForConfiguration()
+                        self.applyUserExposureBias(userEV, on: device)
+                        device.unlockForConfiguration()
+                    } catch {}
+                }
+                self.session.startRunning()
+            }
             let running = self.session.isRunning
             let flash = self.device?.hasFlash ?? false
             let zoomLimit = self.device?.activeFormat.videoMaxZoomFactor ?? 1
@@ -275,11 +421,12 @@ final class MCameraSession: NSObject, ObservableObject {
             let lensMap = self.pendingLensDevices
             let currentLens = self.pendingLens(for: self.device)
             let wide = self.pendingWideDevice
-            let maxEdge = self.device.map(Self.maxPhotoLongEdge) ?? 0
+            let maxEdge = self.device.map { Self.maxPhotoLongEdge(of: $0, mode: mode) } ?? 0
 
             DispatchQueue.main.async {
                 self.rawFormat = format
                 self.rawAvailable = format != nil
+                self.hdrAvailable = hdrReady
                 self.hasFlash = flash
                 self.maxZoom = zoomLimit
                 self.maxPhotoEdge = maxEdge
@@ -293,6 +440,7 @@ final class MCameraSession: NSObject, ObservableObject {
                     }
                 }
                 self.isRunning = running
+                self.isReconfiguring = false
             }
         }
     }
@@ -303,8 +451,11 @@ final class MCameraSession: NSObject, ObservableObject {
     }
 
     /// 在 sessionQueue 上调用：装配输入 / 输出 / 竖屏方向，返回可用的 RAW 像素格式。
-    private func configure() throws -> OSType? {
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+    /// `mode` / `position` 由主线程带进来，决定 ProRAW 开关、优先级、最大尺寸与摄像头，
+    /// 不在 sessionQueue 上读 @Published 状态。
+    private func configure(mode: CaptureMode, position: AVCaptureDevice.Position) throws -> OSType? {
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video,
+                                                   position: position)
                 ?? AVCaptureDevice.default(for: .video) else {
             throw SessionError.noDevice
         }
@@ -319,6 +470,16 @@ final class MCameraSession: NSObject, ObservableObject {
         guard session.canAddOutput(photoOutput) else { throw SessionError.noDevice }
         session.addOutput(photoOutput)
 
+        // 低分辨率取景流只用于高光估计，不参与成片；拿不到时不影响 ProRAW 拍摄。
+        videoOutput.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        videoOutput.alwaysDiscardsLateVideoFrames = true
+        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+        if session.canAddOutput(videoOutput) {
+            session.addOutput(videoOutput)
+        }
+
         // App 只支持竖屏：把输出连接固定成竖拍，拍到的 DNG 不需要再做旋转。
         if let connection = photoOutput.connection(with: .video) {
             if #available(iOS 17.0, *) {
@@ -330,21 +491,38 @@ final class MCameraSession: NSObject, ObservableObject {
             }
         }
 
-        // 部分 Pro 机型只暴露 Apple ProRAW：不先打开这个开关，下面的格式列表会是空的，
-        // 相机就会一直停在「这台设备不提供 RAW 拍摄」。
-        if photoOutput.isAppleProRAWSupported, !photoOutput.isAppleProRAWEnabled {
-            photoOutput.isAppleProRAWEnabled = true
+        // 拍摄格式决定 ProRAW 开关：RAW 需要先打开它，格式列表才会出现；
+        // HDR 反过来必须关掉——系统规定请求 RAW 时 photoQualityPrioritization 只能是 .speed，
+        // 而多帧融合（Smart HDR / Deep Fusion）只在 .quality 下发生。
+        if photoOutput.isAppleProRAWSupported {
+            photoOutput.isAppleProRAWEnabled = (mode == .raw)
+        }
+
+        // 处理图能力：优先 HEVC（编出 HEIC，可能带 HDR 增益图），拿不到退回 JPEG。
+        // 两者都没有时 hdrCodec 为 nil，HDR 模式会被标成不可用。
+        let codecs = photoOutput.availablePhotoCodecTypes
+        hdrCodec = codecs.contains(.hevc) ? .hevc : (codecs.contains(.jpeg) ? .jpeg : nil)
+        if hdrCodec != nil {
+            // 系统默认是 .balanced，多帧融合在这种优先级下会退化成单帧 + 轻度处理。
+            photoOutput.maxPhotoQualityPrioritization = .quality
         }
 
         // 优先 Apple ProRAW：它已经是去过马赛克的线性 DNG，显影时不用现场去马赛克，读取快好几倍；
         // Bayer RAW 虽然更"原始"，但 12MP 去马赛克在 CIRAWFilter 里要几秒，用户会以为卡死。
         let formats = photoOutput.availableRawPhotoPixelFormatTypes
         let proRAW = formats.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
-        let picked = proRAW ?? formats.first
+        let picked: OSType? = mode == .raw ? (proRAW ?? formats.first) : nil
+
+        // HDR 用 24 MP 档（5712×4284）：处理图最高只到这一档，48 MP 是 ProRAW 专属。
+        // 没有支持的档位就留 0，交回会话默认（12 MP）。
+        if baselinePhotoDimensions == nil {
+            baselinePhotoDimensions = photoOutput.maxPhotoDimensions
+        }
+        applyMaxPhotoDimensions(for: device, mode: mode)
 
         self.device = device
         self.pendingWideDevice = device
-        let built = Self.makeLenses(position: .back, wide: device,
+        let built = Self.makeLenses(position: position, wide: device,
                                     excluding: failedLensIDs)
         self.pendingLenses = built.lenses
         self.pendingLensDevices = built.devices
@@ -417,12 +595,75 @@ final class MCameraSession: NSObject, ObservableObject {
 
     /// 摄像头可输出的最大照片长边：当前格式支持的尺寸档位取最大
     /// （48 MP 机型这里会包含 8064×6048，普通机型是 4032×3024）。
-    static func maxPhotoLongEdge(of device: AVCaptureDevice) -> Int {
+    /// HDR 处理图拿不到 48 MP 档，按 24 MP 上限算。
+    static func maxPhotoLongEdge(of device: AVCaptureDevice, mode: CaptureMode) -> Int {
+        if mode == .hdr {
+            let dims = hdrPhotoDimensions(of: device)
+            if dims.width > 0 { return max(Int(dims.width), Int(dims.height)) }
+        }
         var edge = 0
         for dims in device.activeFormat.supportedMaxPhotoDimensions {
             edge = max(edge, max(Int(dims.width), Int(dims.height)))
         }
         return edge
+    }
+
+    /// 按拍摄格式设置输出的最大照片尺寸。
+    /// `photoOutput.maxPhotoDimensions` 是输出级、跨模式共用的：
+    /// HDR 会把它抬到 24 MP 档，切回 RAW 必须显式还原会话默认档，
+    /// 否则要么 ProRAW 被降档，要么默认 12 MP 被悄悄抬到 48 MP（解码成本翻几倍）。
+    ///
+    /// 值没变时不重复写：改这个属性会触发捕获渲染管线重配
+    /// （SDK 头文件原文：Changing this property may trigger a lengthy reconfiguration of the
+    /// capture render pipeline）。换镜头时每写一次就重配一次，白白掉帧。
+    private func applyMaxPhotoDimensions(for device: AVCaptureDevice,
+                                         mode: CaptureMode) {
+        let supported = device.activeFormat.supportedMaxPhotoDimensions
+        var target = CMVideoDimensions(width: 0, height: 0)
+        if mode == .hdr {
+            target = Self.hdrPhotoDimensions(of: device)
+        } else {
+            let baseline = baselinePhotoDimensions ?? CMVideoDimensions(width: 0, height: 0)
+            if baseline.width > 0,
+               supported.contains(where: {
+                   $0.width == baseline.width && $0.height == baseline.height
+               }) {
+                target = baseline
+            } else if let fallback = supported.filter({
+                Int($0.width) * Int($0.height) <= Int(baseline.width) * Int(baseline.height)
+            }).max(by: {
+                Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height)
+            }), fallback.width > 0 {
+                // 换了摄像头，原档位不在它的支持列表里：退到不超过原档的最大可选档。
+                target = fallback
+            }
+        }
+        guard target.width > 0 else { return }
+        let current = photoOutput.maxPhotoDimensions
+        guard current.width != target.width || current.height != target.height else { return }
+        photoOutput.maxPhotoDimensions = target
+    }
+
+    /// 处理图（非 RAW）能请求的最大尺寸档：48 MP 只对 ProRAW 开放，
+    /// 处理图最高是 24 MP（5712×4284 ≈ 24.47 M）。没有可选档位时返回 0，
+    /// 表示交回会话默认尺寸，不强行设置 maxPhotoDimensions。
+    ///
+    /// 24 MP 的实际交付要当心（AVCapturePhotoOutput.h）：
+    /// 「The maxPhotoDimensions setting for 24MP (5712, 4284), when supported,
+    /// is only serviced as 24MP via deferred photo delivery」——
+    /// 不开启 autoDeferredPhotoDeliveryEnabled 时，请求 24 MP 不报错，但拿到的可能更小；
+    /// 而开启延迟交付必须在 delegate 实现 didFinishCapturingDeferredPhotoProxy，
+    /// 没实现会抛异常。这里不开延迟交付，所以 HDR 的真实像素数要真机核对。
+    static func hdrPhotoDimensions(of device: AVCaptureDevice) -> CMVideoDimensions {
+        // 允许到 25 M，把 24 MP 的 24.47 M 放进阈值内，同时挡掉 48 MP 的 48.7 M。
+        let pixelBudget = 25_000_000
+        var best = CMVideoDimensions(width: 0, height: 0)
+        for dims in device.activeFormat.supportedMaxPhotoDimensions {
+            let pixels = Int(dims.width) * Int(dims.height)
+            guard pixels > 0, pixels <= pixelBudget else { continue }
+            if pixels > Int(best.width) * Int(best.height) { best = dims }
+        }
+        return best
     }
 
     /// 用水平视场角折算 35mm 等效焦距：f = 18 / tan(FOV / 2)。
@@ -435,21 +676,96 @@ final class MCameraSession: NSObject, ObservableObject {
 
     // MARK: - 拍摄
 
+    #if os(iOS)
+    @discardableResult
+    private func invalidateExposureWrites() -> Int {
+        exposureGenerationLock.lock()
+        exposureGeneration &+= 1
+        let generation = exposureGeneration
+        exposureGenerationLock.unlock()
+        return generation
+    }
+
+    private func exposureWriteIsCurrent(_ generation: Int) -> Bool {
+        exposureGenerationLock.lock()
+        defer { exposureGenerationLock.unlock() }
+        return generation == exposureGeneration
+    }
+
+    private func currentExposureGeneration() -> Int {
+        exposureGenerationLock.lock()
+        defer { exposureGenerationLock.unlock() }
+        return exposureGeneration
+    }
+
+    /// 主线程调用：手动 EV、锁定、切镜头或停止时，旧异步曝光写入一律失效。
+    @discardableResult
+    private func resetAutomaticProtection(allowAutomatic: Bool? = nil) -> Int {
+        if let allowAutomatic { allowsAutomaticProtection = allowAutomatic }
+        protectionState.reset()
+        return invalidateExposureWrites()
+    }
+
+    /// sessionQueue 调用，设备已 lockForConfiguration。自动保护已在采集端生效，
+    /// 显影端只收到用户 EV，不会重复补偿。
+    private func applyUserExposureBias(_ userEV: Double, on device: AVCaptureDevice) {
+        let target = min(max(Float(userEV), device.minExposureTargetBias),
+                         device.maxExposureTargetBias)
+        device.setExposureTargetBias(target)
+    }
+    #endif
+
     /// - Parameter onWillCapture: 真实曝光时刻的反馈（音效）。由相机页注入，
     ///   在系统播放快门音、物理闪光点亮的同一刻触发，避免音效比画面早半拍。
     func capture(onWillCapture: (() -> Void)? = nil) {
         #if os(iOS)
-        guard canCapture, let rawFormat else { return }
+        guard canCapture else { return }
+        let mode = captureMode
+        // 快门这一刻的格式参数先取到本地：settings 在 sessionQueue 上使用，
+        // 不能在那边再读 @Published。
+        let rawFormat = self.rawFormat
         isCapturing = true
         message = nil
+        // 冻结取景测光：已经排队的旧写入不能越过这次快门继续改变目标偏差。
+        invalidateExposureWrites()
+        let userEV = exposureBias
+        let allowsAutomatic = allowsAutomaticProtection && !isExposureLocked
 
-        // 只拍 RAW：qualityPrioritization 只对 processed 图有意义，设了反而会被系统拒绝，所以不设。
-        let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: nil)
-        // 闪光灯必须显式写到拍摄设置上才會触发；RAW 拍摄同样靠闪光灯照亮。
+        let settings: AVCapturePhotoSettings
+        switch mode {
+        case .raw:
+            guard let rawFormat else { isCapturing = false; return }
+            // 单帧 DNG。系统规定请求 RAW 时 qualityPrioritization 只能是 .speed，
+            // 也因此 RAW 这条路永远拿不到多帧融合和增益图——这是硬件管线约束，不是取舍。
+            settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: nil)
+            settings.photoQualityPrioritization = .speed
+        case .hdr:
+            // 编码类型以快门这一刻设备实际支持的为准：换镜头后可用的编码可能变。
+            // 传了不支持的 codec，AVFoundation 会直接抛异常而不是返回错误。
+            let codecs = photoOutput.availablePhotoCodecTypes
+            let codec: AVVideoCodecType? = codecs.contains(.hevc)
+                ? .hevc
+                : (codecs.contains(.jpeg) ? .jpeg : nil)
+            guard let codec else {
+                isCapturing = false
+                message = "当前镜头不支持 HDR 处理图"
+                return
+            }
+            // 处理图走 .quality：系统才会做多帧融合（Smart HDR / Deep Fusion），
+            // 输出的 HEIC 在支持的机型上带 HDR 增益图，显影端按宽动态重建。
+            settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
+            settings.photoQualityPrioritization =
+                photoOutput.maxPhotoQualityPrioritization == .quality ? .quality : .balanced
+            // 尺寸直接用输出上那个已被校验过的值：settings 的 maxPhotoDimensions 必须落在
+            // 当前 activeFormat 的 supportedMaxPhotoDimensions 里，传一个跨镜头残留的旧值会抛异常。
+            // 不显式赋值时系统就是用它，这里显式写等同，只是把语义摆明。
+            settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+        }
+        // 闪光灯必须显式写到拍摄设置上才會触发；两种模式靠闪光灯照亮的方式一样。
         if hasFlash {
-            let mode = flash.avMode
-            if photoOutput.supportedFlashModes.contains(mode) {
-                settings.flashMode = mode
+            let flashMode = flash.avMode
+            if photoOutput.supportedFlashModes.contains(flashMode) {
+                settings.flashMode = flashMode
             } else if flash == .on {
                 message = "当前设备或模式不支持强制闪光"
             }
@@ -462,15 +778,24 @@ final class MCameraSession: NSObject, ObservableObject {
         // 9:16 横拍输出 16:9 横幅。竖向只认 90°/270°，flat 等中间态回退竖幅。
         let capturedLandscape = angle == 0 || angle == 180
         let delegate = MCaptureDelegate(
-            meta: MCameraCaptureMeta(exposureBias: exposureBias, temperature: temperature,
-                                     capturedLandscape: capturedLandscape,
-                                     mirrorFront: isFront && MobileSettings.cameraMirrorFront),
+            meta: MCameraCaptureMeta(
+                exposureBias: userEV,
+                automaticExposureProtectionEV: 0,
+                temperature: temperature,
+                capturedLandscape: capturedLandscape,
+                mirrorFront: isFront && MobileSettings.cameraMirrorFront),
+            isHDR: mode == .hdr,
             onWillCapture: onWillCapture
         ) { [weak self] result in
             DispatchQueue.main.async { self?.finish(result) }
         }
         captureDelegate = delegate
-        sessionQueue.async { [photoOutput] in
+        sessionQueue.async { [weak self, photoOutput] in
+            if let device = self?.device {
+                delegate.recordActualExposureBias(
+                    device.exposureTargetBias, userEV: userEV,
+                    automatic: allowsAutomatic && device.exposureMode == .continuousAutoExposure)
+            }
             if let connection = photoOutput.connection(with: .video) {
                 if #available(iOS 17.0, *) {
                     if connection.isVideoRotationAngleSupported(angle) {
@@ -576,8 +901,15 @@ final class MCameraSession: NSObject, ObservableObject {
     }
 
     /// 换物理镜头：重挂输入后重新确认 RAW 格式，失败就退回主摄。
+    /// HDR 模式不要求 RAW 格式（走处理图），只有 RAW 模式才把「没有 RAW 格式」当失败。
     private func switchInput(to lens: Lens, target: AVCaptureDevice) {
         isSwitchingLens = true
+        let userEV = exposureBias
+        let restoreManualExposure = !allowsAutomaticProtection || abs(userEV) > 0.001
+        // 拍摄格式在主线程读一次带进 sessionQueue：决定 ProRAW 开关与是否强求 RAW 格式。
+        let mode = captureMode
+        // 切镜头不是曝光写入：代际变化只该作废旧曝光任务，不能取消切换本身。
+        resetAutomaticProtection()
         lensSwitchToken += 1
         let token = lensSwitchToken
 
@@ -604,13 +936,18 @@ final class MCameraSession: NSObject, ObservableObject {
                 return
             }
             self.session.addInput(next)
-            if self.photoOutput.isAppleProRAWSupported, !self.photoOutput.isAppleProRAWEnabled {
-                self.photoOutput.isAppleProRAWEnabled = true
+            // 换设备后格式列表会重算：RAW 打开 ProRAW；HDR 必须关掉，否则优先级被锁成 .speed。
+            if self.photoOutput.isAppleProRAWSupported {
+                self.photoOutput.isAppleProRAWEnabled = (mode == .raw)
             }
             self.session.commitConfiguration()
 
             let formats = self.photoOutput.availableRawPhotoPixelFormatTypes
-            guard let raw = formats.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) ?? formats.first else {
+            let raw = mode == .raw
+                ? (formats.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) } ?? formats.first)
+                : nil
+            // 只有 RAW 模式才要求拿到 RAW 格式。
+            guard mode == .hdr || raw != nil else {
                 self.session.beginConfiguration()
                 self.session.removeInput(next)
                 if self.session.canAddInput(previous) {
@@ -633,9 +970,14 @@ final class MCameraSession: NSObject, ObservableObject {
 
             let limit = max(1, target.activeFormat.videoMaxZoomFactor)
             let factor = min(max(1, lens.crop), limit)
+            // 新镜头的支持档位可能不同：按格式重设最大尺寸，HDR 档位要带回去写进 settings。
+            self.applyMaxPhotoDimensions(for: target, mode: mode)
             do {
                 try target.lockForConfiguration()
                 target.videoZoomFactor = factor
+                if restoreManualExposure {
+                    self.applyUserExposureBias(userEV, on: target)
+                }
                 target.unlockForConfiguration()
             } catch {
                 // 输入已经切好，倍率保持现状也能拍。
@@ -647,10 +989,11 @@ final class MCameraSession: NSObject, ObservableObject {
                 self.isSwitchingLens = false
                 self.device = target
                 self.rawFormat = raw
-                self.rawAvailable = true
+                // raw 在 HDR 模式下是 nil：这里按实际拿到的格式发布，不能硬写成 true。
+                self.rawAvailable = raw != nil
                 self.hasFlash = target.hasFlash
                 self.maxZoom = limit
-                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: target)
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: target, mode: self.captureMode)
                 self.zoom = appliedZoom
                 self.lens = lens
             }
@@ -660,6 +1003,7 @@ final class MCameraSession: NSObject, ObservableObject {
     /// 主线程调用：撤销切换、发布失败提示；failedLensIDs 的回写走 sessionQueue。
     private func failSwitch(to lens: Lens) {
         lensSwitchToken += 1
+        resetAutomaticProtection()
         isSwitchingLens = false
         if lens.id == wideDevice?.uniqueID {
             message = "镜头切换失败"
@@ -676,13 +1020,18 @@ final class MCameraSession: NSObject, ObservableObject {
     /// 失败后回到当前方向的主摄 1×。
     private func restoreWideInput() {
         guard let wide = wideDevice else { return }
+        let userEV = exposureBias
+        let generation = currentExposureGeneration()
+        // 拍摄格式在主线程读一次带进 sessionQueue：回退后要按它重设最大尺寸档。
+        let mode = captureMode
         sessionQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.exposureWriteIsCurrent(generation) else { return }
             guard let current = self.session.inputs.compactMap({ $0 as? AVCaptureDeviceInput }).first else { return }
             if current.device === wide {
                 do {
                     try wide.lockForConfiguration()
                     wide.videoZoomFactor = 1
+                    self.applyUserExposureBias(userEV, on: wide)
                     wide.unlockForConfiguration()
                 } catch {}
                 DispatchQueue.main.async {
@@ -700,6 +1049,13 @@ final class MCameraSession: NSObject, ObservableObject {
             }
             self.session.commitConfiguration()
 
+            // 换设备后格式列表会重算，Key 的 ProRAW 开关按当前拍摄格式重设；
+            // 最大尺寸档也跟着新设备的支持列表重设。
+            if self.photoOutput.isAppleProRAWSupported {
+                self.photoOutput.isAppleProRAWEnabled = (mode == .raw)
+            }
+            self.applyMaxPhotoDimensions(for: wide, mode: mode)
+
             if let connection = self.photoOutput.connection(with: .video) {
                 if #available(iOS 17.0, *) {
                     if connection.isVideoRotationAngleSupported(90) {
@@ -711,11 +1067,15 @@ final class MCameraSession: NSObject, ObservableObject {
             }
 
             let formats = self.photoOutput.availableRawPhotoPixelFormatTypes
-            let raw = formats.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) ?? formats.first
+            // 拍摄格式决定要不要 RAW：HDR 走处理图，不该把 Bayer 格式写进 rawFormat。
+            let raw = mode == .raw
+                ? (formats.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) } ?? formats.first)
+                : nil
             let limit = max(1, wide.activeFormat.videoMaxZoomFactor)
             do {
                 try wide.lockForConfiguration()
                 wide.videoZoomFactor = 1
+                self.applyUserExposureBias(userEV, on: wide)
                 wide.unlockForConfiguration()
             } catch {}
 
@@ -727,7 +1087,7 @@ final class MCameraSession: NSObject, ObservableObject {
                 }
                 self.hasFlash = wide.hasFlash
                 self.maxZoom = limit
-                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: wide)
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: wide, mode: self.captureMode)
                 self.zoom = 1
                 self.applyWideLensState()
             }
@@ -741,16 +1101,27 @@ final class MCameraSession: NSObject, ObservableObject {
     }
     #endif
 
-    /// 前后摄像头切换。前置多数机型不提供 RAW，切不过去时退回后置并给出提示。
+    /// 前后摄像头切换。RAW 模式前置多数机型不提供 ProRAW，切不过去时退回后置并提示；
+    /// HDR 走处理图，没有 RAW 也能正常切。
     func flip() {
         #if os(iOS)
-        guard isRunning, !isCapturing, !isSwitchingLens, let current = device else { return }
+        guard isRunning, !isCapturing, !isSwitchingLens, !isReconfiguring, let current = device else {
+            return
+        }
         let target: AVCaptureDevice.Position = current.position == .front ? .back : .front
         guard let next = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: target),
               let input = try? AVCaptureDeviceInput(device: next) else {
             message = "找不到可用的摄像头"
             return
         }
+        // 拍摄格式在主线程带进 sessionQueue：决定 ProRAW 开关与是否要求 RAW 格式。
+        let mode = captureMode
+        // 找到目标摄像头后才重置状态：失败时曝光标签与设备实际偏差保持一致。
+        isSwitchingLens = true
+        let previousEV = exposureBias
+        let previousAllowsAutomatic = allowsAutomaticProtection
+        exposureBias = 0
+        resetAutomaticProtection(allowAutomatic: true)
 
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -760,18 +1131,20 @@ final class MCameraSession: NSObject, ObservableObject {
             if let previous { self.session.removeInput(previous) }
             let attached = self.session.canAddInput(input)
             if attached { self.session.addInput(input) }
-            // 换设备后格式列表会重算，ProRAW 开关也要在这个配置窗口里重新确认。
-            if self.photoOutput.isAppleProRAWSupported, !self.photoOutput.isAppleProRAWEnabled {
-                self.photoOutput.isAppleProRAWEnabled = true
+            // 换设备后格式列表会重算，ProRAW 开关按当前拍摄格式重设：
+            // RAW 要打开才有格式；HDR 必须关掉，否则 qualityPrioritization 被限制成 .speed。
+            if self.photoOutput.isAppleProRAWSupported {
+                self.photoOutput.isAppleProRAWEnabled = (mode == .raw)
             }
             self.session.commitConfiguration()
 
             let formats = attached ? self.photoOutput.availableRawPhotoPixelFormatTypes : []
             let proRAW = formats.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
-            let picked = proRAW ?? formats.first
+            let picked: OSType? = mode == .raw ? (proRAW ?? formats.first) : nil
 
-            // Spektra 只拍 RAW：前置没有 RAW 就把后置装回去。
-            guard picked != nil else {
+            // 只有 RAW 模式才要求设备给得出 RAW 格式：前置多数机型没有 ProRAW，
+            // 那种情况下把后置装回去。HDR 走处理图，前置一样能拍。
+            guard mode == .hdr || picked != nil else {
                 self.session.beginConfiguration()
                 if let failed = self.session.inputs.first { self.session.removeInput(failed) }
                 if let previous, self.session.canAddInput(previous) {
@@ -779,6 +1152,10 @@ final class MCameraSession: NSObject, ObservableObject {
                 }
                 self.session.commitConfiguration()
                 DispatchQueue.main.async {
+                    self.isSwitchingLens = false
+                    // 切换失败退回原输入，恢复用户原来的曝光意图与自动保护开关。
+                    self.exposureBias = previousEV
+                    self.resetAutomaticProtection(allowAutomatic: previousAllowsAutomatic)
                     self.message = target == .front
                         ? "这台 iPhone 的前置镜头不提供 RAW，已切回后置"
                         : "切换摄像头失败"
@@ -798,16 +1175,20 @@ final class MCameraSession: NSObject, ObservableObject {
 
             let built = Self.makeLenses(position: target, wide: next,
                                         excluding: self.failedLensIDs)
+            // 新摄像头的支持档位可能不同：RAW 提回默认档，HDR 设成它自己的 24 MP 档。
+            self.applyMaxPhotoDimensions(for: next, mode: mode)
 
             DispatchQueue.main.async {
+                self.isSwitchingLens = false
                 self.device = next
                 self.wideDevice = next
                 self.isFront = target == .front
                 self.rawFormat = picked
-                self.rawAvailable = true
+                // 前置摄像头通常没有 RAW：HDR 模式 picked 也可能是 nil。
+                self.rawAvailable = picked != nil
                 self.hasFlash = next.hasFlash
                 self.maxZoom = next.activeFormat.videoMaxZoomFactor
-                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: next)
+                self.maxPhotoEdge = Self.maxPhotoLongEdge(of: next, mode: self.captureMode)
                 self.availableLenses = built.lenses
                 self.lensDevices = built.devices
                 self.lens = built.lenses.first(where: { $0.id == next.uniqueID }) ?? .placeholder
@@ -830,22 +1211,62 @@ final class MCameraSession: NSObject, ObservableObject {
 
     func setExposureBias(_ value: Double) {
         #if os(iOS)
-        guard let device else { return }
+        guard device != nil else { return }
         let clamped = min(max(value, -3), 3)
-        do {
-            try device.lockForConfiguration()
-            if device.exposureMode == .locked,
-               device.isExposureModeSupported(.continuousAutoExposure) {
-                // AE 锁定后仍要能调曝光：恢复自动测光，对焦继续保持锁定。
-                device.exposureMode = .continuousAutoExposure
-            }
-            device.setExposureTargetBias(Float(clamped))
-            device.unlockForConfiguration()
-        } catch {
-            return
-        }
         exposureBias = clamped
+        // 非零 EV 是持续的手动意图；显式回到 0 才恢复自动高光保护。
+        let generation = resetAutomaticProtection(allowAutomatic: clamped == 0)
+        sessionQueue.async { [weak self] in
+            guard let self, self.exposureWriteIsCurrent(generation),
+                  let device = self.device else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.exposureMode != .continuousAutoExposure,
+                   device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+                self.applyUserExposureBias(clamped, on: device)
+                device.unlockForConfiguration()
+            } catch {
+                return
+            }
+            let iso = device.iso
+            DispatchQueue.main.async {
+                guard self.exposureWriteIsCurrent(generation) else { return }
+                self.isExposureLocked = false
+                self.isoValue = iso
+            }
+        }
         #endif
+    }
+
+    /// 取景分析在主线程做时间平滑，再到会话串行队列设置目标偏差。
+    /// 代际校验保证旧帧不能覆盖手动 EV、AE 锁定、手动 ISO 或快门状态。
+    private func updateAutomaticProtection(_ analysis: SceneExposureAnalysis) {
+        guard allowsAutomaticProtection, !isExposureLocked, !isCapturing,
+              !isSwitchingLens, isRunning else { return }
+        let target = SceneExposureAnalysis.captureProtectionEV(analysis)
+        let quantized = protectionState.proposedEV(target: target)
+        guard quantized != protectionState.appliedEV else { return }
+        let userEV = exposureBias
+        let generation = currentExposureGeneration()
+        sessionQueue.async { [weak self] in
+            guard let self, self.exposureWriteIsCurrent(generation),
+                  let device = self.device,
+                  device.exposureMode == .continuousAutoExposure else { return }
+            let total = min(max(Float(userEV + quantized),
+                                device.minExposureTargetBias),
+                            device.maxExposureTargetBias)
+            do {
+                try device.lockForConfiguration()
+                device.setExposureTargetBias(total)
+                device.unlockForConfiguration()
+            } catch { return }
+            DispatchQueue.main.async {
+                guard self.exposureWriteIsCurrent(generation) else { return }
+                self.protectionState.markApplied(quantized)
+            }
+        }
     }
 
     /// 色温按 自动 → 3200K → 4300K → 5600K → 7000K 循环。
@@ -885,106 +1306,216 @@ final class MCameraSession: NSObject, ObservableObject {
     /// `point` 是 AVCaptureVideoPreviewLayer 的设备坐标（左上 0,0）。
     func focus(at point: CGPoint) {
         #if os(iOS)
-        guard let device else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusPointOfInterestSupported {
-                device.focusPointOfInterest = point
-                if device.isFocusModeSupported(.autoFocus) { device.focusMode = .autoFocus }
-            }
-            if device.isExposurePointOfInterestSupported {
-                device.exposurePointOfInterest = point
-                if device.isExposureModeSupported(.continuousAutoExposure) {
-                    device.exposureMode = .continuousAutoExposure
+        guard device != nil else { return }
+        let userEV = exposureBias
+        let generation = resetAutomaticProtection(allowAutomatic: true)
+        sessionQueue.async { [weak self] in
+            guard let self, self.exposureWriteIsCurrent(generation),
+                  let device = self.device else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = point
+                    if device.isFocusModeSupported(.autoFocus) { device.focusMode = .autoFocus }
                 }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = point
+                    if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                }
+                self.applyUserExposureBias(userEV, on: device)
+                device.unlockForConfiguration()
+            } catch { return }
+            let iso = device.iso
+            DispatchQueue.main.async {
+                guard self.exposureWriteIsCurrent(generation) else { return }
+                self.isExposureLocked = false
+                self.isoValue = iso
             }
-            device.unlockForConfiguration()
-        } catch {
-            return
         }
-        isExposureLocked = false
-        isoValue = device.iso
         #endif
     }
 
     /// 长按取景框：锁定当前对焦与曝光，作为上下拖动改 ISO 的起点。
     func lockFocusAndExposure(at point: CGPoint) {
         #if os(iOS)
-        guard let device else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusPointOfInterestSupported {
-                device.focusPointOfInterest = point
-                if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
-            }
-            if device.isExposurePointOfInterestSupported {
-                device.exposurePointOfInterest = point
-                if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
-            }
-            device.unlockForConfiguration()
-        } catch {
-            return
-        }
+        guard device != nil else { return }
+        let userEV = exposureBias
+        let wasLocked = isExposureLocked
         isExposureLocked = true
-        isoValue = device.iso
+        let generation = resetAutomaticProtection()
+        sessionQueue.async { [weak self] in
+            guard let self, self.exposureWriteIsCurrent(generation),
+                  let device = self.device else { return }
+            do {
+                try device.lockForConfiguration()
+                self.applyUserExposureBias(userEV, on: device)
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = point
+                    if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = point
+                    if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
+                }
+                device.unlockForConfiguration()
+            } catch {
+                DispatchQueue.main.async {
+                    if self.exposureWriteIsCurrent(generation) {
+                        self.isExposureLocked = wasLocked
+                    }
+                }
+                return
+            }
+            let iso = device.iso
+            DispatchQueue.main.async {
+                guard self.exposureWriteIsCurrent(generation) else { return }
+                self.isExposureLocked = true
+                self.isoValue = iso
+            }
+        }
         #endif
     }
 
     /// 未锁定时直接滑动：只锁曝光以便调 ISO，对焦保持当前模式。
     func lockExposure() {
         #if os(iOS)
-        guard let device else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
-            device.unlockForConfiguration()
-        } catch {
-            return
-        }
+        guard device != nil else { return }
+        let userEV = exposureBias
+        let wasLocked = isExposureLocked
         isExposureLocked = true
-        isoValue = device.iso
+        let generation = resetAutomaticProtection()
+        sessionQueue.async { [weak self] in
+            guard let self, self.exposureWriteIsCurrent(generation),
+                  let device = self.device else { return }
+            do {
+                try device.lockForConfiguration()
+                self.applyUserExposureBias(userEV, on: device)
+                if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
+                device.unlockForConfiguration()
+            } catch {
+                DispatchQueue.main.async {
+                    if self.exposureWriteIsCurrent(generation) {
+                        self.isExposureLocked = wasLocked
+                    }
+                }
+                return
+            }
+            let iso = device.iso
+            DispatchQueue.main.async {
+                guard self.exposureWriteIsCurrent(generation) else { return }
+                self.isExposureLocked = true
+                self.isoValue = iso
+            }
+        }
         #endif
     }
 
     /// 锁定后上下拖动：保持当前快门，只改 ISO（夹在格式的感光度范围内）。
     func setISO(_ value: Float) {
         #if os(iOS)
-        guard let device, isExposureLocked, device.isExposureModeSupported(.custom) else { return }
-        let upper = min(device.activeFormat.maxISO, 6400)
-        let clamped = min(max(value, device.activeFormat.minISO), upper)
-        let duration = device.exposureDuration
-        do {
-            try device.lockForConfiguration()
-            device.setExposureModeCustom(duration: duration, iso: clamped, completionHandler: nil)
-            device.unlockForConfiguration()
-        } catch {
-            return
+        guard device != nil, isExposureLocked else { return }
+        let generation = invalidateExposureWrites()
+        sessionQueue.async { [weak self] in
+            guard let self, self.exposureWriteIsCurrent(generation),
+                  let device = self.device,
+                  device.isExposureModeSupported(.custom) else { return }
+            let upper = min(device.activeFormat.maxISO, 6400)
+            let clamped = min(max(value, device.activeFormat.minISO), upper)
+            let duration = device.exposureDuration
+            do {
+                try device.lockForConfiguration()
+                device.setExposureModeCustom(duration: duration, iso: clamped, completionHandler: nil)
+                device.unlockForConfiguration()
+            } catch { return }
+            DispatchQueue.main.async {
+                guard self.exposureWriteIsCurrent(generation) else { return }
+                self.isoValue = clamped
+            }
         }
-        isoValue = clamped
         #endif
     }
 
     /// 点按取景框时解除 AE/AF 锁定，回到连续自动。
     func releaseLock() {
         #if os(iOS)
-        guard let device else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusModeSupported(.continuousAutoFocus) {
-                device.focusMode = .continuousAutoFocus
+        guard device != nil else { return }
+        let userEV = exposureBias
+        let generation = resetAutomaticProtection(allowAutomatic: true)
+        sessionQueue.async { [weak self] in
+            guard let self, self.exposureWriteIsCurrent(generation),
+                  let device = self.device else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+                self.applyUserExposureBias(userEV, on: device)
+                device.unlockForConfiguration()
+            } catch { return }
+            let iso = device.iso
+            DispatchQueue.main.async {
+                guard self.exposureWriteIsCurrent(generation) else { return }
+                self.isExposureLocked = false
+                self.isoValue = iso
             }
-            if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
-            }
-            device.unlockForConfiguration()
-        } catch {
-            return
         }
-        isExposureLocked = false
-        isoValue = device.iso
         #endif
     }
 }
+
+#if os(iOS)
+extension MCameraSession: AVCaptureVideoDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        guard timestamp.isFinite, timestamp - lastMeterTimestamp >= 0.20 else { return }
+        lastMeterTimestamp = timestamp
+        guard let analysis = MCameraPreviewMeter.analysis(from: sampleBuffer) else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.updateAutomaticProtection(analysis)
+        }
+    }
+}
+
+/// 取景 BGRA → 约 64 px 的线性 sRGB 代理图。只抽样，不创建全尺寸 CI 中间图。
+private enum MCameraPreviewMeter {
+    static func analysis(from sampleBuffer: CMSampleBuffer) -> SceneExposureAnalysis? {
+        guard let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+        CVPixelBufferLockBaseAddress(pixels, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
+        guard CVPixelBufferGetPixelFormatType(pixels) == kCVPixelFormatType_32BGRA,
+              let base = CVPixelBufferGetBaseAddress(pixels)?
+                .assumingMemoryBound(to: UInt8.self) else { return nil }
+        let sourceWidth = CVPixelBufferGetWidth(pixels)
+        let sourceHeight = CVPixelBufferGetHeight(pixels)
+        let stride = CVPixelBufferGetBytesPerRow(pixels)
+        guard sourceWidth > 0, sourceHeight > 0, stride >= sourceWidth * 4 else { return nil }
+        let stepX = max(1, sourceWidth / 64)
+        let stepY = max(1, sourceHeight / 64)
+        let width = (sourceWidth + stepX - 1) / stepX
+        let height = (sourceHeight + stepY - 1) / stepY
+        var proxy = ImageRGB(width: width, height: height)
+        for y in 0..<height {
+            let sourceY = min(sourceHeight - 1, y * stepY + stepY / 2)
+            for x in 0..<width {
+                let sourceX = min(sourceWidth - 1, x * stepX + stepX / 2)
+                let p = sourceY * stride + sourceX * 4
+                let b = ColorMath.cctfDecode(Double(base[p]) / 255, kind: .srgb)
+                let g = ColorMath.cctfDecode(Double(base[p + 1]) / 255, kind: .srgb)
+                let r = ColorMath.cctfDecode(Double(base[p + 2]) / 255, kind: .srgb)
+                proxy.setPixel(x, y, Vec3(r, g, b))
+            }
+        }
+        return SceneExposureAnalysis.analyze(
+            image: proxy, colorSpace: "sRGB", applyCCTFDecoding: false)
+    }
+}
+#endif
 
 #if os(iOS)
 private extension MCameraSession.FlashMode {
@@ -999,18 +1530,26 @@ private extension MCameraSession.FlashMode {
 /// AVCapturePhotoOutput 的代理：把 RAW 数据落到临时 DNG，并顺手取一张缩略图。
 private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     private let completion: (Result<MCameraShot, Error>) -> Void
+    /// 这次请求的是处理图（HDR）还是 RAW。决定接受哪种数据、落什么扩展名。
+    private let isHDR: Bool
     /// 快门按下时的曝光/色温：异步回调里不能再读已经变化的相机状态。
-    private let meta: MCameraCaptureMeta
+    private var meta: MCameraCaptureMeta
     /// 真实曝光时刻的反馈回调。系统在这个回调之后立刻播系统快门音、点亮物理闪光，
     /// 所以自定义音效必须放在这里触发，才不会比真实闪光早半拍。
     private let onWillCapture: (() -> Void)?
     private var finished = false
 
-    init(meta: MCameraCaptureMeta, onWillCapture: (() -> Void)?,
+    init(meta: MCameraCaptureMeta, isHDR: Bool, onWillCapture: (() -> Void)?,
          completion: @escaping (Result<MCameraShot, Error>) -> Void) {
         self.meta = meta
+        self.isHDR = isHDR
         self.onWillCapture = onWillCapture
         self.completion = completion
+    }
+
+    /// capturePhoto 前在 sessionQueue 记录设备实际目标偏差；用户 EV 与自动保护分别入库。
+    func recordActualExposureBias(_ bias: Float, userEV: Double, automatic: Bool) {
+        meta.automaticExposureProtectionEV = automatic ? Double(bias) - userEV : 0
     }
 
     /// 系统在这个回调之后才会播放系统快门音。这里释放它的 SystemSound(1108) 资源，
@@ -1034,12 +1573,18 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
             completion(.failure(error))
             return
         }
-        guard photo.isRawPhoto, let data = photo.fileDataRepresentation() else {
-            completion(.failure(MCameraSession.SessionError.noRawData))
+        // RAW 请求应当回 DNG，HDR 请求应当回处理图；两者都不是就是没拿到数据。
+        guard photo.isRawPhoto || isHDR, let data = photo.fileDataRepresentation() else {
+            completion(.failure(isHDR
+                ? MCameraSession.SessionError.noProcessedData
+                : MCameraSession.SessionError.noRawData))
             return
         }
 
-        let name = "Spektra-\(Self.stamp())-\(Int.random(in: 100...999)).dng"
+        // RAW 落 .dng；HDR 处理图按真实容器落 .heic / .jpg。
+        // 扩展名不能靠猜：ImageLoader 用扩展名决定 inputColorSpace 与 HDR 增益图的读取路径。
+        let ext = photo.isRawPhoto ? "dng" : Self.processedExtension(for: data)
+        let name = "Spektra-\(Self.stamp())-\(Int.random(in: 100...999)).\(ext)"
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
         do {
             try data.write(to: url, options: .atomic)
@@ -1047,10 +1592,19 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
             completion(.failure(error))
             return
         }
+        var actualMeta = meta
+        if let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any] {
+            if let iso = exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber] {
+                actualMeta.captureISO = iso.first?.doubleValue
+            }
+            if let duration = exif[kCGImagePropertyExifExposureTime as String] as? NSNumber {
+                actualMeta.captureExposureDuration = duration.doubleValue
+            }
+        }
         completion(.success(MCameraShot(
             url: url,
-            thumbnail: Self.thumbnail(url: url, mirrored: meta.mirrorFront),
-            meta: meta)))
+            thumbnail: Self.thumbnail(url: url, mirrored: actualMeta.mirrorFront),
+            meta: actualMeta)))
     }
 
     /// 出片前就失败（如采集被中断）时只会回调这里；不复位的话 `isCapturing` 会永远卡住。
@@ -1062,6 +1616,13 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
         completion(.failure(error))
     }
 
+    /// 处理图真实容器：HEVC 编出的是 HEIC，退回 JPEG 时是 JPEG。
+    private static func processedExtension(for data: Data) -> String {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let uti = CGImageSourceGetType(source) as String? else { return "jpg" }
+        return uti.contains("heic") || uti.contains("heif") ? "heic" : "jpg"
+    }
+
     private static func stamp() -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -1069,12 +1630,13 @@ private final class MCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
         return formatter.string(from: Date())
     }
 
-    /// 只读 DNG 内嵌预览，避免为了取景器缩略图去解码整张 RAW。
+    /// 只读内嵌预览，避免为了取景器缩略图去解码整张原片。
     /// 前置镜像拍摄时把缩略图翻成预览所见，成片渲染同样会镜像，两边一致。
+    /// RAW（DNG）与 HDR（HEIC）走同一条 ImageIO 缩略图路径，不用分模式。
     private static func thumbnail(url: URL, mirrored: Bool) -> MPlatformImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
-            // 先用 DNG 内嵌的小预览；只有缺失时才解整张 RAW，避免快门后立刻吃一大块内存。
+            // 优先用文件内嵌的小预览；只有缺失时才解整张原片，避免快门后立刻吃一大块内存。
             kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: 240

@@ -7,6 +7,7 @@ final class ColorReferenceService {
     private let scanFilm: Bool
     private let outputColorSpace: String
     private let outputCCTFEncoding: Bool
+    private let preserveExtendedRange: Bool
 
     private let blackCorrection: Bool
     private let whiteCorrection: Bool
@@ -23,7 +24,8 @@ final class ColorReferenceService {
     init(film: Profile, printProfile: Profile, densityMin: [Double],
          blackCorrection: Bool, whiteCorrection: Bool,
          blackLevel: Double, whiteLevel: Double,
-         scanFilm: Bool, outputColorSpace: String, outputCCTFEncoding: Bool) {
+         scanFilm: Bool, outputColorSpace: String, outputCCTFEncoding: Bool,
+         preserveExtendedRange: Bool = false) {
         self.film = film
         self.printProfile = printProfile
         self.densityMin = densityMin
@@ -34,6 +36,7 @@ final class ColorReferenceService {
         self.scanFilm = scanFilm
         self.outputColorSpace = outputColorSpace
         self.outputCCTFEncoding = outputCCTFEncoding
+        self.preserveExtendedRange = preserveExtendedRange
     }
 
     private func updateCMYBlackWhiteReferences(inPrint: Bool = false) {
@@ -70,12 +73,16 @@ final class ColorReferenceService {
     }
 
     private func correctionFunction() -> (m: Double, q: Double, midgray: Double) {
+        // 引用（yBlack/yWhite）只在特定胶片/相纸组合下由 updateCMYBlackWhiteReferences
+        // 设置。当前档案库组合必然设到，但黑白场校正是宽动态输入的默认行为，
+        // 未来任何档案组合漏设引用都不该把全图乘成死白：缺失时显式退回恒等映射。
+        guard let yWhite, let yBlack else { return (1, 0, 0.184) }
         var white = whiteLevel
         var black = blackLevel
-        if blackCorrection && !whiteCorrection, let yWhite { white = yWhite }
-        if whiteCorrection && !blackCorrection, let yBlack { black = yBlack }
-        let m = (white - black) / ((yWhite ?? 0) - (yBlack ?? 0) + 1e-10)
-        let q = black - m * (yBlack ?? 0)
+        if blackCorrection && !whiteCorrection { white = yWhite }
+        if whiteCorrection && !blackCorrection { black = yBlack }
+        let m = (white - black) / (yWhite - yBlack + 1e-10)
+        let q = black - m * yBlack
         let midgray = (0.184 - q) / m
         return (m, q, midgray)
     }
@@ -146,13 +153,21 @@ final class ColorReferenceService {
             guard let base = buffer.baseAddress else { return }
             for p in 0..<count {
                 let y = Double(base[p * 3 + 1])
-                let corrected = min(max(m * y + q, 0), 1)
+                let corrected = Self.correctedLuminance(
+                    y, m: m, q: q, preserveExtendedRange: preserveExtendedRange)
                 let scale = corrected / (y + 1e-10)
                 base[p * 3] = Float(Double(base[p * 3]) * scale)
                 base[p * 3 + 1] = Float(corrected)
                 base[p * 3 + 2] = Float(Double(base[p * 3 + 2]) * scale)
             }
         }
+    }
+
+    /// 黑场仍不允许产生负亮度；只有显示分支把白场裁到 SDR 1.0。
+    static func correctedLuminance(_ y: Double, m: Double, q: Double,
+                                   preserveExtendedRange: Bool) -> Double {
+        let mapped = max(m * y + q, 0)
+        return preserveExtendedRange ? mapped : min(mapped, 1)
     }
 
     private func densityCurvesMax(_ curves: [[Double]]) -> [Double] {
@@ -165,13 +180,14 @@ final class ColorReferenceService {
         return result
     }
 
+    /// 逐曝光点求三通道均值，对齐 Python `np.nanmean(density_curves, axis=1)`。
+    /// 返回长度 = 曝光点数（与 logExposure 对齐）；旧实现按通道求均值只返回 3 个值，
+    /// 会让下游 interp(xp:) 与 fp 长度错配而返回 nan，最终把印相曝光乘成 nan。
     private func channelMean(_ curves: [[Double]]) -> [Double] {
-        var result = [Double](repeating: 0, count: 3)
-        for row in curves {
-            for c in 0..<3 { result[c] += row[c] }
+        curves.map { row in
+            let valid = row.filter(\.isFinite)
+            return valid.isEmpty ? 0 : valid.reduce(0, +) / Double(valid.count)
         }
-        let count = Double(curves.count)
-        return result.map { $0 / count }
     }
 
     private func mean(_ values: [Double]) -> Double {
