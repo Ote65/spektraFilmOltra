@@ -4,3 +4,5 @@
 2026-11-20 10:13(北京时间) | 清理 B 类 videoQuick 僵尸开关（MobileTokens.swift 删 5 行）+ F 类 .scratch 草稿（trash 可恢复，备份在 /tmp）；iOS17 typecheck EXIT=0 无 error
 2026-11-20 10:15(北京时间) | 修复已调色卡片预览形变起点（改为记录卡片真实 frame 显式插值）+ 相框卡纸边框，按钮改为形变后渐显；成品缓存覆盖直出成片
 2026-11-20 10:34(北京时间) | 形变中改为裸图、背景渐进模糊，完成后淡入白色相框；清掉旧直出成片回退、补无障碍关闭与取消竞态守卫，真机验收通过
+2026-11-25 15:10(北京时间) | 代码审查 a6b4e6b（相机 RAW/HDR 双格式）：修 rawFormat 跨线程读写、删死状态 hdrDimensions、maxPhotoDimensions 值不变不再写（避免运行中重配渲染管线）、HDR 模式不再把 Bayer 写进 rawFormat、补 24MP 交付条件注释、装机守则同步 build 41；提交 7fc3132 → 合并 iOS 支 17e5b4d → 推送 oltra main/iOS
+2026-11-25 15:50(北京时间) | 第二轮审查修正：格式徽标从顶栏右侧挪到左侧（原位置在 393pt 上整块盖住「直出」按钮）、转圈不再撑宽胶囊、HDR 档位请求与界面统一到 12MP 档、applyMaxPhotoDimensions 移到 commit 之后；提交 eee6f56 → 合并 iOS 支 03021bd → 推送 oltra main/iOS
