@@ -383,7 +383,9 @@ struct MobileRootView: View {
     /// 成功后清理相机临时文件；失败时只在仍停留拍摄页才退回主页，
     /// 避免异步失败回调把用户从其他页面拽走。
     private func importCaptured(_ url: URL, meta: MCameraCaptureMeta) async -> String? {
-        let report = await engine.importPhotos([url], captureMeta: meta)
+        // 相机是格式自己的生产者：RAW 模式给 DNG，HDR 模式给 HEIC。
+        // HEIC 必须无条件放行，不能受「允许导入编码图」这个浏览偏好拦截。
+        let report = await engine.importPhotos([url], fromCamera: true, captureMeta: meta)
         guard let photoID = report.firstID else {
             showToast(report.reason.isEmpty ? "拍摄的照片没能入库" : report.reason)
             if screen == .camera { closeCamera() }
