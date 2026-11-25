@@ -115,9 +115,12 @@ enum RawDecoder {
         filter.isLensCorrectionEnabled = options.lensCorrection
         // 手机横屏拍摄时 DNG 只有 EXIF orientation 记录方向；不设这一步输出会躺倒。
         filter.orientation = ImageLoader.exifOrientation(url: url)
-        filter.boostAmount = 0
-        filter.boostShadowAmount = 0
         if options.sceneLinear {
+            // boostAmount 是全局影调曲线，boostShadowAmount 是它的阴影分支：
+            // 场景线性下两者都要关，否则等于把已定影的 SDR 又套一遍曲线。
+            // 关掉之后这两个量的"恢复"就是不动它们——Apple 的默认即 as-shot。
+            filter.boostAmount = 0
+            filter.boostShadowAmount = 0
             // 只关 boostAmount 是不够的：它只对应"全局影调曲线"，
             // Apple 还有一条独立的"局部影调曲线"（localToneMapAmount），默认在 ProRAW 上就是满值。
             // 局部曲线一边压全局反差、一边抬暗部，是直出"很灰"的直接来源。
