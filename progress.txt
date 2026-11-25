@@ -6,3 +6,4 @@
 2026-11-20 10:34(北京时间) | 形变中改为裸图、背景渐进模糊，完成后淡入白色相框；清掉旧直出成片回退、补无障碍关闭与取消竞态守卫，真机验收通过
 2026-11-25 15:10(北京时间) | 代码审查 a6b4e6b（相机 RAW/HDR 双格式）：修 rawFormat 跨线程读写、删死状态 hdrDimensions、maxPhotoDimensions 值不变不再写（避免运行中重配渲染管线）、HDR 模式不再把 Bayer 写进 rawFormat、补 24MP 交付条件注释、装机守则同步 build 41；提交 7fc3132 → 合并 iOS 支 17e5b4d → 推送 oltra main/iOS
 2026-11-25 15:50(北京时间) | 第二轮审查修正：格式徽标从顶栏右侧挪到左侧（原位置在 393pt 上整块盖住「直出」按钮）、转圈不再撑宽胶囊、HDR 档位请求与界面统一到 12MP 档、applyMaxPhotoDimensions 移到 commit 之后；提交 eee6f56 → 合并 iOS 支 03021bd → 推送 oltra main/iOS
+2026-11-25 16:01(北京时间) | 装机 0.7.12(41) 到 iPhone 13 Pro Max（00008110-001C20523E04801E）：ARCHIVE/EXPORT SUCCEEDED（签名 profile 有效），devicectl install 第 1 次成功，启动后照片库截屏正常，无黑屏/裁切；ipa 归档 Spektrafilm-0.7.12(41)-ios-相机RAW_HDR双格式-20261125.ipa
